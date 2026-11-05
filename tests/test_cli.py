@@ -486,3 +486,12 @@ def test_sql_cannot_fetch_extensions_but_reads_local_files(env):
     direct = invoke("sql", f"SELECT count(*) AS n FROM read_parquet('{parquet}')")
     view = invoke("sql", "SELECT count(*) AS n FROM segments_named")
     assert direct.exit_code == 0 and direct.output == view.output and int(view.output.split()[-1]) > 0
+
+
+def test_start_with_interrupted_diarization_setup_records_nothing(env):
+    add_pyannote(env)
+    (env["models"] / pipeline.SETTINGS["diarization"]["dir"] / "config.yaml").write_text("segmentation: $model/segmentation\n")
+    result = start()
+    assert result.exit_code != 0 and "unvollstaendig" in result.output and "meetscribe setup" in result.output and "--no-diarize" in result.output
+    assert FakeRecorder.started == [] and not recordings(env)
+    assert start("--no-diarize", "--no-open").exit_code == 0

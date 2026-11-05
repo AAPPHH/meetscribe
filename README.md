@@ -67,7 +67,7 @@ Schlägt der Whisper-Download fehl, endet `setup` mit Fehler. Fehlt nur das Diar
 
 Ablauf:
 
-1. Vorprüfung vor jeder Aufnahme: ffmpeg, Whisper-Modell, Diarisierungsmodell (außer mit `--no-diarize`) und, wenn aufgenommen wird, der Audioeingang. Schlägt etwas fehl, bricht `start` mit einer deutschen Meldung ab und nichts wird aufgenommen.
+1. Vorprüfung vor jeder Aufnahme: ffmpeg, Whisper-Modell, Diarisierungsmodell (außer mit `--no-diarize`; geprüft wird `config.yaml` und jede darin mit `$model/` referenzierte lokale Datei, ein abgebrochener `setup` fällt also hier auf, mit dem Hinweis `setup` erneut auszuführen oder `--no-diarize` zu nutzen) und, wenn aufgenommen wird, der Audioeingang. Schlägt etwas fehl, bricht `start` mit einer deutschen Meldung ab und nichts wird aufgenommen.
 2. Aufnahme bis Strg+C. Der Eingang wird automatisch gewählt (DJI, sonst Laptopmikrofon) und als `Eingang: <Name> [API]` ausgegeben. Strg+C beendet nur die Aufnahme; die Verarbeitung läuft danach normal weiter.
 3. Transkription und Sprechertrennung. Wird keine Sprache erkannt (stummes Mikrofon, leere Datei), gibt es kein Protokoll und keine Besprechung im Archiv; `start` meldet das, nennt das erhaltene Audio und endet mit Exit-Code 1.
 4. Benennung der Sprecher, nur wenn die Eingabe ein Terminal ist: je Sprecherlabel wird der längste Satz gezeigt, Enter überspringt. Ohne Terminal entfällt das still. `UNKNOWN` wird nicht abgefragt.
@@ -221,6 +221,7 @@ Audio wird nicht automatisch gelöscht, auch nicht nach der Archivierung. `data\
 
 Nicht an echter Hardware oder echten Eingaben geprüft:
 
+- Die Vollständigkeitsprüfung des Diarisierungs-Snapshots (`$model/`-Verweise in `config.yaml`) ist nur mit handgeschriebenem YAML getestet; das echte Layout von `pyannote/speaker-diarization-community-1` wurde nicht bestätigt.
 - Sprechertrennung mit dem echten pyannote-Modell, auch ohne Token oder lokalen Snapshot: Alle echten Läufe liefen mit `--no-diarize`. Die Diarisierung ist nur in Tests (ohne echtes Modell) abgedeckt.
 - Der echte DJI-Empfänger: Die Namensmuster für den USB-Eingang (`dji`, `mic mini`, `mic 2`, `wireless mic`) sind Annahmen. Ebenso unbekannt: ob TX1 und TX2 als linker und rechter Kanal ankommen.
 - `--mic both` auf echter Hardware, einschließlich des streckenden Mixes.

@@ -45,6 +45,7 @@ SETTINGS = {
         "dir": "pyannote-speaker-diarization-community-1",
         "config": "config.yaml",
         "token_env": "HF_TOKEN",
+        "model_ref": r"\$model/([^\s'\",\]}#]+)",
     },
 }
 UMLAUTS = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"})
@@ -108,8 +109,21 @@ class Models:
     def whisper_ready(path):
         return path.is_dir() and any(path.glob("*.xml"))
 
+    def diarization_missing(self):
+        root = self.diarization_dir
+        config = root / SETTINGS["diarization"]["config"]
+        if not config.is_file():
+            return [config]
+        lines = (line for line in config.read_text(encoding="utf-8", errors="replace").splitlines() if not line.lstrip().startswith("#"))
+        found = dict.fromkeys(ref for line in lines for ref in re.findall(SETTINGS["diarization"]["model_ref"], line))
+        return [root / ref for ref in found if not self.present(root / ref)]
+
+    @staticmethod
+    def present(path):
+        return path.is_file() or (path.is_dir() and any(p.is_file() for p in path.rglob("*")))
+
     def diarization_ready(self):
-        return (self.diarization_dir / SETTINGS["diarization"]["config"]).is_file()
+        return not self.diarization_missing()
 
 
 class ModelSetup:
@@ -467,10 +481,11 @@ class TranscribeJob:
         return order[order.index(self.device):] if self.fallback else (self.device,)
 
     def check(self):
-        if self.diarize and not self.models.diarization_ready():
+        missing = self.models.diarization_missing() if self.diarize else []
+        if missing:
             diar = SETTINGS["diarization"]
             raise PipelineError(
-                f"Diarisierungsmodell fehlt ({self.models.diarization_dir}). Bitte {diar['token_env']} setzen "
+                f"Diarisierungsmodell fehlt oder ist unvollstaendig ({', '.join(str(p) for p in missing)}). Bitte {diar['token_env']} setzen "
                 f"(Zugriff auf {diar['repo']} bei huggingface.co akzeptieren) und 'meetscribe setup' ausfuehren, "
                 "oder mit --no-diarize ohne Sprechertrennung transkribieren."
             )

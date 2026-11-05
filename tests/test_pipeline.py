@@ -8,7 +8,7 @@ import soundfile as sf
 
 from meetscribe import pipeline
 from meetscribe.pipeline import (
-    ASRFailure, ASRRunner, Aligner, AudioError, AudioLoader, DeviceError, InputPicker, Interrupt, KeepAwake, Mixer, Models, Naming,
+    ASRFailure, ASRRunner, PipelineError, Aligner, AudioError, AudioLoader, DeviceError, InputPicker, Interrupt, KeepAwake, Mixer, Models, Naming,
     RecordingSession, TranscribeJob, Transcriber, Windows,
 )
 from meetscribe.store import HotFile, Query, ReportFile, Store, make_config
@@ -209,6 +209,53 @@ def test_model_paths(tmp_path):
     assert models.whisper_dir("cpu", "custom") == tmp_path / "custom"
     assert models.cache_dir == tmp_path / "ov_cache"
     assert not models.diarization_ready()
+
+
+def write_snapshot(models, config, files=()):
+    root = models.diarization_dir
+    root.mkdir(parents=True)
+    (root / "config.yaml").write_text(config, encoding="utf-8")
+    for name in files:
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_bytes(b"w")
+    return root
+
+
+SNAPSHOT_YAML = """pipeline:
+  name: pyannote.audio.pipelines.SpeakerDiarization
+  params:
+    segmentation: $model/segmentation
+    embedding: "$model/embedding/pytorch_model.bin"
+    # plda: $model/plda_old
+    clustering: AgglomerativeClustering
+"""
+
+
+def test_diarization_ready_checks_referenced_model_files(tmp_path):
+    models = Models(tmp_path)
+    write_snapshot(models, SNAPSHOT_YAML, ["segmentation/pytorch_model.bin"])
+    assert not models.diarization_ready()
+    assert models.diarization_missing() == [models.diarization_dir / "embedding/pytorch_model.bin"]
+    (models.diarization_dir / "embedding").mkdir()
+    (models.diarization_dir / "embedding/pytorch_model.bin").write_bytes(b"w")
+    assert models.diarization_ready() and models.diarization_missing() == []
+
+
+def test_diarization_ready_without_model_references_or_config(tmp_path):
+    models = Models(tmp_path)
+    assert not models.diarization_ready()
+    write_snapshot(models, "pipeline: {name: x}")
+    assert models.diarization_ready()
+
+
+def test_interrupted_diarization_setup_fails_preflight(tmp_path):
+    models = Models(tmp_path)
+    write_snapshot(models, SNAPSHOT_YAML)
+    (tmp_path / pipeline.MODELS["npu"]["dir"]).mkdir()
+    (tmp_path / pipeline.MODELS["npu"]["dir"] / "m.xml").write_text("x")
+    with pytest.raises(PipelineError, match="unvollstaendig.*segmentation.*--no-diarize"):
+        TranscribeJob(None, "a.wav", "npu", "de", models=models).check()
+    TranscribeJob(None, "a.wav", "npu", "de", models=models, diarize=False).check()
 
 
 def test_naming_slug_and_suffix(store):

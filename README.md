@@ -71,8 +71,8 @@ Ablauf:
 2. Aufnahme bis Strg+C. Der Eingang wird automatisch gewählt (DJI, sonst Laptopmikrofon) und als `Eingang: <Name> [API]` ausgegeben. Strg+C beendet nur die Aufnahme; die Verarbeitung läuft danach normal weiter.
 3. Transkription und Sprechertrennung. Wird keine Sprache erkannt (stummes Mikrofon, leere Datei), gibt es kein Protokoll und keine Besprechung im Archiv; `start` meldet das, nennt das erhaltene Audio und endet mit Exit-Code 1.
 4. Benennung der Sprecher, nur wenn die Eingabe ein Terminal ist: je Sprecherlabel wird der längste Satz gezeigt, Enter überspringt. Ohne Terminal entfällt das still. `UNKNOWN` wird nicht abgefragt.
-5. Protokoll nach `protokolle\<Datum>_<Titel>.md` (bei gleichem Namen `-2`, `-3`, ...; UTF-8). Es wird mit dem Standardprogramm geöffnet, wenn die Eingabe ein Terminal ist und `--no-open` fehlt.
-6. Zuletzt wird archiviert: Besprechungen, die älter als 30 Tage sind, wandern ins Parquet-Archiv. Schlägt das fehl, gibt es eine Warnzeile, der Lauf gilt trotzdem als erfolgreich.
+5. Protokoll nach `protokolle\<Datum>_<Titel>.md` (bei gleichem Namen `-2`, `-3`, ...; UTF-8). Es wird mit dem Standardprogramm geöffnet, wenn die Eingabe ein Terminal ist und `--no-open` fehlt. Schlägt das Öffnen fehl, gibt es eine Warnzeile mit dem Pfad des Protokolls; der Lauf geht weiter und endet mit Exit-Code 0.
+6. Zuletzt wird archiviert: Besprechungen, die älter als 30 Tage sind, wandern ins Parquet-Archiv. Schlägt das fehl, gibt es eine Warnzeile, der Lauf gilt trotzdem als erfolgreich; scheitert die Rotation einzelner Besprechungen, gibt es je Besprechung eine Warnzeile mit der ID und dem Grund. Unvollständige und leere Dateien werden dabei still übersprungen.
 
 Die Aufnahme liegt unter `data\aufnahmen\<JJJJ-MM-TT_HHMMSS>.flac` (bei Kollision `-2`) und wird nie gelöscht. Schlägt die Verarbeitung fehl oder wird sie mit Strg+C abgebrochen, gibt `start` `Audio erhalten: <Pfad>` und eine fertige Zeile `Erneut versuchen: meetscribe start <Pfad> ...` aus und endet mit Exit-Code 1 (bei Strg+C 130). Eine dabei halb geschriebene Besprechung wird wieder entfernt (auch bei `transcribe`), der erneute Versuch bekommt dieselbe ID.
 

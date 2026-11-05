@@ -495,3 +495,42 @@ def test_start_with_interrupted_diarization_setup_records_nothing(env):
     assert result.exit_code != 0 and "unvollstaendig" in result.output and "meetscribe setup" in result.output and "--no-diarize" in result.output
     assert FakeRecorder.started == [] and not recordings(env)
     assert start("--no-diarize", "--no-open").exit_code == 0
+
+
+def test_start_warns_once_per_real_rotation_error_and_stays_quiet_for_skips(env, monkeypatch):
+    monkeypatch.setitem(pipeline.START, "rotate_days", 0)
+    with pytest.raises(KeyError):
+        with env["store"].writer("broken", title="t", meeting_date="2026-03-04", language="de") as writer:
+            writer.append([{"start_s": 0.0, "end_s": 1.0, "speaker": "UNKNOWN", "text": "x"}])
+            raise KeyError
+    with env["store"].writer("hollow", title="t", meeting_date="2026-03-04", language="de"):
+        pass
+    quiet = start("--no-diarize", "--no-open")
+    assert quiet.exit_code == 0 and "Warnung" not in quiet.output
+
+    def failing(self, path, table):
+        raise OSError("disk voll")
+
+    monkeypatch.setattr(type(env["store"]), "_rotate_one", failing)
+    for number in (1, 2):
+        with env["store"].writer(f"ready-{number}", title="t", meeting_date="2026-03-04", language="de") as writer:
+            writer.append([{"start_s": 0.0, "end_s": 1.0, "speaker": "UNKNOWN", "text": "x"}])
+    result = start("--no-diarize", "--no-open")
+    warnings = [line for line in result.output.splitlines() if line.startswith("Warnung")]
+    assert result.exit_code == 0 and len(warnings) == 3 and all("disk voll" in line for line in warnings)
+    assert sum("ready-" in line for line in warnings) == 2 and not any("broken" in line or "hollow" in line for line in warnings)
+
+
+def test_start_open_failure_warns_with_path_and_still_rotates(env, monkeypatch):
+    rotated = []
+
+    def refuse(path):
+        raise OSError("keine Zuordnung")
+
+    monkeypatch.setattr(cli, "stdin_is_tty", lambda: True)
+    monkeypatch.setattr(os, "startfile", refuse, raising=False)
+    monkeypatch.setattr(type(env["store"]), "rotate", lambda self, older_than_days=0, force=False: rotated.append(older_than_days) or {"rotated": [], "skipped": []})
+    result = start("--no-diarize", input="\n")
+    assert result.exit_code == 0, result.output
+    assert f"Warnung: Protokoll konnte nicht geoeffnet werden ({reports(env)[0]}): OSError: keine Zuordnung" in result.output
+    assert rotated == [30] and len(reports(env)) == 1

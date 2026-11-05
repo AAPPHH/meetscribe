@@ -808,9 +808,21 @@ class StartFlow:
 
     def rotate(self):
         try:
-            self.store.rotate(older_than_days=START["rotate_days"])
+            result = self.store.rotate(older_than_days=START["rotate_days"])
         except Exception as exc:
             click.echo(f"Warnung: Rotation fehlgeschlagen: {Reason.of(exc)}", err=True)
+            return
+        for skipped in result["skipped"]:
+            if skipped["reason"].startswith("error:"):
+                click.echo(f"Warnung: Rotation von {skipped['meeting_id']} fehlgeschlagen: {skipped['reason'][len('error:'):].strip()}", err=True)
+
+    def show(self, path):
+        if not (self.open_report and self.tty and hasattr(os, "startfile")):
+            return
+        try:
+            os.startfile(path)
+        except Exception as exc:
+            click.echo(f"Warnung: Protokoll konnte nicht geoeffnet werden ({path}): {Reason.of(exc)}", err=True)
 
     def run(self):
         self.preflight()
@@ -818,8 +830,7 @@ class StartFlow:
         meeting_id = self.process(audio)
         self.name_speakers(meeting_id)
         path = self.write_report(meeting_id)
-        if self.open_report and self.tty and hasattr(os, "startfile"):
-            os.startfile(path)
+        self.show(path)
         self.rotate()
         return path
 

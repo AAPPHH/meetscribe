@@ -375,3 +375,29 @@ def test_append_validation(store):
         assert w.append([]) == 0
         assert w.append([{"start_s": 0, "end_s": 1, "speaker": "A", "text": "ok"}]) == 1
     assert rows(store, "SELECT seg_id FROM segments") == [(0,)]
+
+
+class FailingClose:
+    def __init__(self, inner, target):
+        self.inner, self.target = inner, target
+
+    def close(self):
+        if self.target == "stream":
+            raise OSError("disk full")
+        self.inner.close()
+        raise OSError("disk full")
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+@pytest.mark.parametrize("target", ["stream", "file"])
+@pytest.mark.parametrize("discard", [True, False])
+def test_close_failure_discards_only_when_requested(store, target, discard):
+    with pytest.raises(OSError, match="disk full"):
+        with store.writer("c1", title="t", meeting_date="2026-03-04", discard_on_error=discard) as w:
+            w.append(segs())
+            setattr(w, target, FailingClose(getattr(w, target), target))
+    assert store.hot_path("c1").exists() is not discard
+    if discard:
+        assert store.incomplete() == [] and not store.exists("c1")

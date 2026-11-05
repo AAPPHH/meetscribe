@@ -257,12 +257,18 @@ class TranscriptWriter:
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        failed = exc_type is not None
         try:
-            if exc_type is None:
-                self.stream.close()
+            try:
+                if not failed:
+                    self.stream.close()
+            finally:
+                self.file.close()
+        except BaseException:
+            failed = True
+            raise
         finally:
-            self.file.close()
-            if exc_type is not None and self.discard_on_error:
+            if failed and self.discard_on_error:
                 self.store.discard(self.meta["meeting_id"])
         return False
 

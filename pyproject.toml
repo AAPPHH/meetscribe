@@ -5,7 +5,14 @@ requires-python = ">=3.12"
 dependencies = [
     "click>=8.5.0",
     "duckdb>=2.0.0",
+    "huggingface_hub",
+    "numpy",
+    "openvino-genai==2026.4.*",
+    "pyannote.audio>=4,<5",
     "pyarrow>=26.0.1",
+    "sounddevice",
+    "soundfile",
+    "torch",
     "tzdata>=2026.6",
 ]
 
@@ -26,3 +33,12 @@ testpaths = ["tests"]
 dev = [
     "pytest>=9.2.0",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }

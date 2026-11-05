@@ -85,8 +85,8 @@ def test_happy_path_transcribe_search_speakers_report_rotate(env):
     assert HotFile(env["store"].hot_path("m1")).is_complete()
     first = invoke("search", "münchen")
     assert first.exit_code == 0 and "Grüße aus München" in first.output and "SPEAKER_00" in first.output
-    assert "SPEAKER_01" in invoke("speakers", "show", "m1").output
-    assert invoke("speakers", "set", "m1", "SPEAKER_00", "Anna").exit_code == 0
+    assert "SPEAKER_01" in invoke("speakers", "show", "--meeting", "m1").output
+    assert invoke("speakers", "set", "SPEAKER_00", "Anna", "--meeting", "m1").exit_code == 0
     named = invoke("search", "münchen", "--speaker", "Anna")
     assert "Anna" in named.output and "Grüße" in named.output
     report = invoke("report", "m1", "--out", env["tmp"] / "out" / "m1.md")
@@ -100,7 +100,7 @@ def test_happy_path_transcribe_search_speakers_report_rotate(env):
     assert "rotiert: m1" in rotated.output and not env["store"].hot_files()
     assert invoke("sql", "SELECT seg_id, speaker, text, device FROM segments ORDER BY seg_id").output == before
     assert invoke("search", "münchen", "--speaker", "Anna").output == named.output
-    assert invoke("speakers", "unset", "m1", "SPEAKER_00").exit_code == 0
+    assert invoke("speakers", "unset", "SPEAKER_00", "--meeting", "m1").exit_code == 0
     assert "Anna" not in invoke("report", "m1").output
 
 
@@ -167,7 +167,7 @@ def test_duplicate_and_unknown_meeting_errors(env):
     assert transcribe(env, "--no-diarize").exit_code == 0
     again = transcribe(env, "--no-diarize")
     assert again.exit_code != 0 and "existiert bereits" in again.output and "Traceback" not in again.output
-    for args in (("report", "nope"), ("speakers", "show", "nope"), ("speakers", "set", "m1", "SPEAKER_99", "X"), ("sql", "SELEC 1")):
+    for args in (("report", "nope"), ("speakers", "show", "--meeting", "nope"), ("speakers", "set", "SPEAKER_99", "X", "--meeting", "m1"), ("sql", "SELEC 1")):
         result = invoke(*args)
         assert result.exit_code != 0 and result.exception.__class__ is SystemExit, args
 
@@ -234,3 +234,15 @@ def test_setup_warm_failure_is_only_a_warning(env, monkeypatch):
     monkeypatch.setattr(pipeline.ModelSetup, "download", staticmethod(lambda repo, target, token=None: None))
     result = invoke("setup")
     assert result.exit_code == 0 and "Warnung: NPU-Cache nicht aufgewaermt" in result.output
+
+
+def test_last_meeting_is_default_for_report_and_speakers(env):
+    assert invoke("report").exit_code != 0 and "Keine Besprechung" in invoke("speakers", "show").output
+    assert transcribe(env, "--no-diarize", meeting_id="old").exit_code == 0
+    add_pyannote(env)
+    assert transcribe(env, "--speakers", "2", meeting_id="new").exit_code == 0
+    assert "SPEAKER_01" in invoke("speakers", "show").output
+    assert invoke("speakers", "set", "SPEAKER_00", "Anna").exit_code == 0
+    assert "Anna" in invoke("report").output and "Anna" not in invoke("report", "old").output
+    assert invoke("speakers", "unset", "SPEAKER_00").exit_code == 0
+    assert "Anna" not in invoke("report").output

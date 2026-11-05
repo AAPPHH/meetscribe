@@ -60,12 +60,18 @@ def get_store():
 
 
 def require_meeting(store, meeting_id):
+    if meeting_id is None:
+        meeting_id = Query(store).latest_meeting()
+        if meeting_id is None:
+            raise click.ClickException("Keine Besprechung vorhanden.")
+        return meeting_id
     try:
         known = store.exists(meeting_id)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
     if not known:
         raise click.ClickException(f"Unbekannte meeting_id: {meeting_id}")
+    return meeting_id
 
 
 @click.group(help="Lokale Besprechungsabschriften: Aufnahme, Transkription, Archiv und Protokoll.")
@@ -202,11 +208,14 @@ def speakers_group():
     pass
 
 
+MEETING_OPTION = click.option("--meeting", "meeting_id", default=None, help="Besprechung; Standard: die zuletzt erstellte.")
+
+
 @speakers_group.command(name="show")
-@click.argument("meeting_id")
+@MEETING_OPTION
 def speakers_show(meeting_id):
     store = get_store()
-    require_meeting(store, meeting_id)
+    meeting_id = require_meeting(store, meeting_id)
     columns, rows = Query(store).execute(
         "SELECT speaker AS label, any_value(display_name) AS name, sum(end_s - start_s) AS talk_s, count(*) AS segments "
         "FROM segments_named WHERE meeting_id = ? GROUP BY speaker ORDER BY speaker",
@@ -220,12 +229,12 @@ def known_labels(store, meeting_id):
 
 
 @speakers_group.command(name="set")
-@click.argument("meeting_id")
 @click.argument("label")
 @click.argument("name")
-def speakers_set(meeting_id, label, name):
+@MEETING_OPTION
+def speakers_set(label, name, meeting_id):
     store = get_store()
-    require_meeting(store, meeting_id)
+    meeting_id = require_meeting(store, meeting_id)
     labels = known_labels(store, meeting_id)
     if label not in labels:
         raise click.ClickException(f"Unbekanntes Label '{label}'. Vorhanden: {', '.join(labels)}")
@@ -237,22 +246,24 @@ def speakers_set(meeting_id, label, name):
 
 
 @speakers_group.command(name="unset")
-@click.argument("meeting_id")
 @click.argument("label")
-def speakers_unset(meeting_id, label):
+@MEETING_OPTION
+def speakers_unset(label, meeting_id):
     store = get_store()
-    require_meeting(store, meeting_id)
+    meeting_id = require_meeting(store, meeting_id)
     if not store.speakers.unset(meeting_id, label):
         raise click.ClickException(f"Keine Zuordnung fuer {label} in {meeting_id}.")
     click.echo(f"{meeting_id} {label} entfernt")
 
 
-@main.command(help="Markdown-Protokoll erzeugen.")
-@click.argument("meeting_id")
+@main.command(help="Markdown-Protokoll erzeugen (Standard: letzte Besprechung).")
+@click.argument("meeting_id", required=False)
 @click.option("--out", type=click.Path(dir_okay=False, path_type=Path), default=None, help="Zieldatei statt Ausgabe.")
 def report(meeting_id, out):
+    store = get_store()
+    meeting_id = require_meeting(store, meeting_id)
     try:
-        text = Report(Query(get_store())).render(meeting_id)
+        text = Report(Query(store)).render(meeting_id)
     except MeetingNotFound as exc:
         raise click.ClickException(str(exc)) from exc
     if out:

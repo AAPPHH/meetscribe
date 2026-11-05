@@ -364,6 +364,10 @@ class Query:
             "FROM segments GROUP BY meeting_id ORDER BY meeting_date DESC, meeting_id"
         )
 
+    def latest_meeting(self):
+        rows = self._records("SELECT meeting_id FROM segments GROUP BY meeting_id ORDER BY max(created_at) DESC, meeting_id DESC LIMIT 1")
+        return rows[0]["meeting_id"] if rows else None
+
     def speaker_stats(self, meeting_id=None):
         where, params = self._where(meeting_id=("meeting_id = ?", meeting_id))
         return self._records(

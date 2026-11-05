@@ -134,17 +134,6 @@ class ModelSetup:
             )
         return messages, failed
 
-    def warm(self, language=None):
-        language = language or SETTINGS["language"]
-        yield "NPU-Cache wird aufgewaermt (dauert einmalig mehrere Minuten) ..."
-        try:
-            engine = WhisperEngine("npu", self.models, language)
-            engine.transcribe(np.zeros(SETTINGS["sample_rate"], dtype="float32"))
-            del engine
-            gc.collect()
-        except Exception as exc:
-            yield f"Warnung: NPU-Cache nicht aufgewaermt: {Reason.of(exc)}"
-
     def warm(self, device="npu"):
         engine = WhisperEngine(device, self.models, SETTINGS["language"])
         engine.transcribe(np.zeros(SETTINGS["sample_rate"], dtype="float32"))

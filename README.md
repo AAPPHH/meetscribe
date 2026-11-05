@@ -98,7 +98,7 @@ meetscribe report 20261105-projektrunde --out C:\temp\protokoll.md
 
 | Befehl | Zweck |
 |---|---|
-| `meetscribe devices` | Audioeingänge (Index, Name, API, Kanäle, Rate) und OpenVINO-Geräte auflisten; prüft z. B. ob der DJI-Empfänger sichtbar ist |
+| `meetscribe devices` | Audioeingänge (Index, Name, API, Kanäle, Rate) und OpenVINO-Geräte auflisten; prüft z. B. ob der DJI-Empfänger sichtbar ist; mit `--json` als JSON |
 | `meetscribe record --out datei.flac [--mic ...] [--seconds N]` | nur aufnehmen, Standard-Mikrofon `laptop`; eine vorhandene Zieldatei wird nicht überschrieben, der Befehl bricht ab; gestörte Eingänge werden wie bei `start` sofort gemeldet, danach endet der Befehl mit Exit-Code 1 |
 | `meetscribe transcribe datei [...]` | nur transkribieren und ablegen, ohne Protokoll und ohne Sprecherabfrage |
 | `meetscribe rotate [--older-than-days N] [--force]` | heiße Dateien ins Archiv verschieben (Standard 0 Tage: alle vollständigen) |
@@ -107,6 +107,32 @@ meetscribe report 20261105-projektrunde --out C:\temp\protokoll.md
 | `meetscribe sql "..."` | beliebige SQL-Abfrage |
 
 `transcribe` kennt zusätzlich `--model`, `--language`, `--date`, `--meeting-id`, `--min-speakers`, `--max-speakers` und `--no-fallback`; `start` kennt diese nicht. `rotate` wird von `transcribe` nicht automatisch aufgerufen, nur von `start`.
+
+### Maschinenlesbare Ausgabe (für GUIs)
+
+Mit der globalen Option `--json` (vor dem Befehl: `meetscribe --json meetings`) geben `meetings`, `search`, `stats`, `speakers show`, `report`, `sql` und `devices` ein JSON-Dokument auf stdout aus. Ohne die Option bleibt die Ausgabe unverändert. Die Ausgabe ist reines ASCII (Umlaute als `\uXXXX`), Zahlen und Listen behalten ihren Typ, Daten und Zeiten sind ISO-Strings, NaN und Unendlich werden zu `null`. Fehler bleiben Text auf stderr mit Exit-Code 1.
+
+| Befehl | JSON |
+|---|---|
+| `meetings`, `search`, `stats`, `speakers show` | Liste von Objekten mit allen Spalten der Abfrage (`stats`: `share` als Bruchteil 0 bis 1, `labels` als Liste) |
+| `sql` | `{"columns": [...], "rows": [[...]]}` (Spaltennamen dürfen doppelt vorkommen) |
+| `report` | `{"meeting_id": ..., "path": <Zieldatei oder null>, "markdown": ...}` |
+| `devices` | `{"inputs": [{"index", "name", "api", "channels", "rate"}], "inputs_error": <Text oder null>, "openvino": [{"device", "name"}]}` |
+
+`meetscribe start --events` schreibt statt der Konsolenausgabe eine JSON-Zeile je Ereignis auf stdout (was Bibliotheken sonst auf stdout schreiben, geht nach stderr). Es gibt keine Sprecherabfrage und das Protokoll wird nicht geöffnet. `--stdin-stop` beendet die Aufnahme, sobald eine Zeile (mit Zeilenumbruch) auf stdin ankommt oder stdin geschlossen wird; die Aufnahme bleibt erhalten und die Verarbeitung läuft normal weiter. Das ersetzt Strg+C für Elternprozesse ohne Konsole. Beide Optionen sind unabhängig voneinander nutzbar.
+
+Ereignisse, ein Objekt je Zeile mit dem Schlüssel `event`:
+
+```
+{"event": "preflight"}
+{"event": "recording", "input": "DJI MIC MINI", "path": "C:\\...\\data\\aufnahmen\\2026-11-05_101500.flac"}
+{"event": "warning", "message": "Eingang 'DJI MIC MINI': kein Audio seit 6 s (...)"}
+{"event": "transcribing", "audio": "C:\\...\\data\\aufnahmen\\2026-11-05_101500.flac"}
+{"event": "done", "meeting_id": "20261105-projektrunde", "report": "C:\\...\\protokolle\\2026-11-05_projektrunde.md", "audio": "C:\\...", "segments": 42, "speakers": 2, "labels": [{"label": "SPEAKER_00", "sample": "Guten Morgen zusammen ..."}]}
+{"event": "error", "message": "Verarbeitung fehlgeschlagen: ...", "audio": "C:\\...\\2026-11-05_101500.flac", "meeting_id": null, "retry": "meetscribe start C:\\...flac --device npu --no-open --events", "exit_code": 1}
+```
+
+`recording` entfällt bei vorhandener Datei. Bei `--mic both` nennt `input` beide Geräte mit ` + ` und `path` den Mix. `warning` steht für Eingangsprobleme, Überläufe, unvollständige Aufnahme, Geräte-Rückfall und Rotationsfehler. `done` ist das letzte Ereignis eines erfolgreichen Laufs (Exit-Code 0); `labels` enthält je Sprecher (ohne `UNKNOWN`) den längsten Satz, höchstens 140 Zeichen; Namen setzt die GUI danach mit `speakers set`. `error` ist das letzte Ereignis bei Exit-Code 1 oder 130. Vor der Aufnahme (Vorprüfung) sind `audio`, `meeting_id` und `retry` `null`. Schlägt erst die Nachbearbeitung fehl, ist die Besprechung gespeichert: `meeting_id` ist gesetzt und `retry` ist `meetscribe report <ID>` (nicht erneut `start`).
 
 ### Gerätewahl und Fallback
 
@@ -233,5 +259,6 @@ Nicht an echter Hardware oder echten Eingaben geprüft:
 - Die WER stammt aus synthetischem Testaudio (siehe oben); echte Besprechungen sind nicht vermessen.
 - Messungen nur auf einem Gerät (Core Ultra 7 258V). Andere Core-Ultra-Generationen sind nicht geprüft.
 - Strg+C während der Aufnahme wurde mit einem simulierten Rekorder und einem echten Konsolen-Ereignis geprüft, nicht mit echter Aufnahme.
+- `--events` und `--stdin-stop`: mit simuliertem Rekorder und echten Pipes getestet, nicht mit echter Aufnahme und nicht aus einer echten GUI. Ausgaben nativer Bibliotheken direkt auf den Dateideskriptor 1 werden nicht nach stderr umgeleitet.
 
-Tests: `uv run pytest -q` (141 Tests, alle grün; sie prüfen Logik und Abläufe mit Ersatzobjekten, nicht die oben genannten Hardwarefälle).
+Tests: `uv run pytest -q` (157 Tests, alle grün; sie prüfen Logik und Abläufe mit Ersatzobjekten, nicht die oben genannten Hardwarefälle).

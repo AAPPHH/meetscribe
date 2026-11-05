@@ -243,6 +243,14 @@ def test_diarization_ready_checks_referenced_model_files(tmp_path):
     assert models.diarization_ready() and models.diarization_missing() == []
 
 
+def test_trailing_yaml_comment_is_not_a_model_reference(tmp_path):
+    models = Models(tmp_path)
+    write_snapshot(models, "params:\n  a: $model/a # frueher $model/b\n  c: [$model/c] #$model/d\n", ["a", "c"])
+    assert models.diarization_missing() == []
+    (models.diarization_dir / "a").unlink()
+    assert models.diarization_missing() == [models.diarization_dir / "a"]
+
+
 def test_diarization_ready_without_model_references_or_config(tmp_path):
     models = Models(tmp_path)
     assert not models.diarization_ready()

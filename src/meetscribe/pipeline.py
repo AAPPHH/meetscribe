@@ -46,6 +46,7 @@ SETTINGS = {
         "config": "config.yaml",
         "token_env": "HF_TOKEN",
         "model_ref": r"\$model/([^\s'\",\]}#]+)",
+        "comment": r"(?:^|\s)#.*",
     },
 }
 UMLAUTS = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"})
@@ -115,7 +116,7 @@ class Models:
         config = root / SETTINGS["diarization"]["config"]
         if not config.is_file():
             return [config]
-        lines = (line for line in config.read_text(encoding="utf-8", errors="replace").splitlines() if not line.lstrip().startswith("#"))
+        lines = (re.sub(SETTINGS["diarization"]["comment"], "", line) for line in config.read_text(encoding="utf-8", errors="replace").splitlines())
         found = dict.fromkeys(ref for line in lines for ref in re.findall(SETTINGS["diarization"]["model_ref"], line))
         return [root / ref for ref in found if not self.present(root / ref)]
 

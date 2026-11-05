@@ -1,6 +1,7 @@
 .venv/
 models/
 data/
+protokolle/
 *.wav
 *.flac
 *.mp3

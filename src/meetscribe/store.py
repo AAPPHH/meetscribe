@@ -438,3 +438,22 @@ class Report:
         for name, start, text in blocks:
             lines += [f"**[{self.clock(start)}] {name}:** {text}", ""]
         return "\n".join(lines).rstrip("\n") + "\n"
+
+
+class ReportFile:
+    def __init__(self, directory=None):
+        self.directory = Path(directory or os.environ.get("MEETSCRIBE_REPORTS") or PROJECT_ROOT / "protokolle")
+
+    def target(self, day, slug):
+        base = f"{as_date(day):%Y-%m-%d}_{slug}"
+        candidate, number = self.directory / f"{base}.md", 1
+        while candidate.exists():
+            number += 1
+            candidate = self.directory / f"{base}-{number}.md"
+        return candidate
+
+    def write(self, day, slug, text):
+        path = self.target(day, slug)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path

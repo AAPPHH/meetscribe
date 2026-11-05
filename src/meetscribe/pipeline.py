@@ -3,20 +3,22 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import threading
 import time
 import unicodedata
 from bisect import bisect_left
 from contextlib import ExitStack
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import click
 import numpy as np
 import soundfile as sf
 
-from meetscribe.store import PROJECT_ROOT, as_date
+from meetscribe.store import PROJECT_ROOT, Query, Report, ReportFile, as_date
 
 DEVICES = ("npu", "gpu", "cpu")
 WHISPER_INT8 = {"repo": "OpenVINO/whisper-large-v3-turbo-int8-ov", "dir": "whisper-large-v3-turbo-int8-ov"}
@@ -55,7 +57,17 @@ RECORDING = {
     "flush_s": 2.0,
     "mix_block_s": 30.0,
     "default_suffix": ".flac",
+    "poll_s": 0.2,
+    "lid_notice": "Hinweis: Deckel offen lassen, sonst kann der Rechner trotz Wachhalten in den Ruhezustand gehen.",
 }
+START = {
+    "audio_subdir": "aufnahmen",
+    "stamp": "%Y-%m-%d_%H%M%S",
+    "rotate_days": 30,
+    "sentence_chars": 140,
+    "program": "meetscribe",
+}
+AWAKE_FLAGS = {"continuous": 0x80000000, "system_required": 0x00000001}
 
 
 class PipelineError(click.ClickException):
@@ -139,6 +151,57 @@ class ModelSetup:
         engine.transcribe(np.zeros(SETTINGS["sample_rate"], dtype="float32"))
 
 
+class KeepAwake:
+    def __init__(self, call=None):
+        self.call = call or self.native()
+
+    @staticmethod
+    def native():
+        if sys.platform != "win32":
+            return None
+        import ctypes
+        function = ctypes.windll.kernel32.SetThreadExecutionState
+        function.argtypes = [ctypes.c_uint32]
+        function.restype = ctypes.c_uint32
+        return function
+
+    def __enter__(self):
+        if self.call:
+            self.call(AWAKE_FLAGS["continuous"] | AWAKE_FLAGS["system_required"])
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.call:
+            self.call(AWAKE_FLAGS["continuous"])
+        return False
+
+
+class Interrupt:
+    def __init__(self):
+        self.event = threading.Event()
+        self.previous = None
+        self.installed = False
+
+    def _handler(self, signum, frame):
+        self.event.set()
+
+    def __enter__(self):
+        try:
+            self.previous = signal.signal(signal.SIGINT, self._handler)
+            self.installed = True
+        except ValueError:
+            pass
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.installed:
+            signal.signal(signal.SIGINT, self.previous if self.previous is not None else signal.default_int_handler)
+        return False
+
+    def wait(self, timeout):
+        return self.event.wait(timeout)
+
+
 class Reason:
     @staticmethod
     def of(exc):
@@ -150,10 +213,14 @@ class Reason:
 
 class AudioLoader:
     @staticmethod
-    def load(path, rate=None):
-        rate = rate or SETTINGS["sample_rate"]
+    def require():
         if shutil.which("ffmpeg") is None:
             raise AudioError("ffmpeg nicht gefunden. Bitte ffmpeg installieren und in den PATH aufnehmen.")
+
+    @classmethod
+    def load(cls, path, rate=None):
+        rate = rate or SETTINGS["sample_rate"]
+        cls.require()
         cmd = ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-vn", "-f", "f32le", "-ac", "1", "-ar", str(rate), "-"]
         proc = subprocess.run(cmd, capture_output=True)
         if proc.returncode != 0:
@@ -445,6 +512,15 @@ class InputPicker:
     def listing(self):
         return [f"{d['name']} [{self.hostapis[d['hostapi']]}]" for d in self.inputs()]
 
+    def auto(self):
+        for spec in RECORDING["patterns"]:
+            try:
+                self.pick(spec)
+                return spec
+            except DeviceError:
+                continue
+        return "laptop"
+
     def pick(self, spec):
         patterns = RECORDING["patterns"].get(spec.lower()) or [re.escape(spec)]
         found = [d for d in self.inputs() if any(re.search(p, d["name"], re.I) for p in patterns)]
@@ -572,21 +648,147 @@ class RecordingSession:
         paths = self.paths()
         recorders = self.recorders or self.prepare()
         started = []
-        try:
-            for recorder in recorders:
-                recorder.start()
-                started.append(recorder)
-            deadline = time.monotonic() + seconds if seconds else None
+        with Interrupt() as interrupt:
             try:
-                while deadline is None or time.monotonic() < deadline:
-                    time.sleep(0.2)
-            except KeyboardInterrupt:
-                pass
-        finally:
-            reports = [r.stop() for r in started]
-        if "mix" in paths and len(started) == len(recorders):
-            Mixer.mix([r.path for r in recorders], paths["mix"])
+                for recorder in recorders:
+                    recorder.start()
+                    started.append(recorder)
+                deadline = time.monotonic() + seconds if seconds else None
+                try:
+                    while not interrupt.wait(RECORDING["poll_s"]) and (deadline is None or time.monotonic() < deadline):
+                        pass
+                except KeyboardInterrupt:
+                    pass
+            finally:
+                reports = [r.stop() for r in started]
+            if "mix" in paths and len(started) == len(recorders):
+                Mixer.mix([r.path for r in recorders], paths["mix"])
         return reports
+
+
+class StartFlow:
+    def __init__(self, store, audio=None, mic=None, device="npu", title=None, speakers=None, diarize=True,
+                 open_report=True, tty=False, models=None, picker=None):
+        self.store = store
+        self.audio = Path(audio) if audio else None
+        self.mic = mic
+        self.device = device.lower()
+        self.title = title
+        self.speakers = speakers
+        self.diarize = diarize
+        self.open_report = open_report
+        self.tty = tty
+        self.models = models or Models()
+        self.picker = picker
+        self.session = None
+        self.job = None
+
+    def retry_command(self, audio):
+        parts = [START["program"], "start", str(audio), "--device", self.device]
+        for flag, value in (("--title", self.title), ("--speakers", self.speakers)):
+            if value is not None:
+                parts += [flag, str(value)]
+        parts += [flag for flag, active in (("--no-diarize", not self.diarize), ("--no-open", not self.open_report)) if active]
+        return subprocess.list2cmdline(parts)
+
+    def recording_path(self):
+        folder = self.store.config["data_dir"] / START["audio_subdir"]
+        stem = datetime.now().strftime(START["stamp"])
+        candidate, number = folder / f"{stem}{RECORDING['default_suffix']}", 1
+        while candidate.exists():
+            number += 1
+            candidate = folder / f"{stem}-{number}{RECORDING['default_suffix']}"
+        return candidate
+
+    def preflight(self):
+        AudioLoader.require()
+        planned = self.audio or self.recording_path()
+        self.job = TranscribeJob(
+            self.store, planned, self.device, SETTINGS["language"], models=self.models, title=self.title,
+            diarize=self.diarize, speakers=self.speakers,
+        )
+        self.job.check()
+        if self.audio is not None:
+            return
+        try:
+            picker = self.picker or AudioDevices.sounddevice_picker()
+        except Exception as exc:
+            raise DeviceError(f"Audio-Eingaenge nicht lesbar: {Reason.of(exc)}") from exc
+        self.session = RecordingSession(self.mic or picker.auto(), planned, picker)
+        for recorder in self.session.prepare():
+            click.echo(f"Eingang: {recorder.device['name']} [{recorder.hostapi}]")
+
+    def record(self):
+        click.echo(RECORDING["lid_notice"])
+        click.echo("Aufnahme laeuft, Ende mit Strg+C.")
+        reports = self.session.run()
+        path = self.session.paths().get("mix") or self.session.out
+        click.echo(f"Aufnahme gespeichert: {path} ({max(r['seconds'] for r in reports):.0f} s)")
+        errors = [str(r["error"]) for r in reports if r["error"]]
+        if errors:
+            raise PipelineError(f"Schreibfehler waehrend der Aufnahme ({path}): " + "; ".join(errors))
+        return path
+
+    def fail(self, audio, exc):
+        interrupted = isinstance(exc, KeyboardInterrupt)
+        click.echo("Verarbeitung abgebrochen." if interrupted else f"Verarbeitung fehlgeschlagen: {Reason.of(exc)}", err=True)
+        click.echo(f"Audio erhalten: {audio}", err=True)
+        click.echo(f"Erneut versuchen: {self.retry_command(audio)}", err=True)
+        raise click.exceptions.Exit(130 if interrupted else 1)
+
+    def process(self, audio):
+        self.job.audio = Path(audio)
+        self.job.requested_id = Naming.meeting_id(self.store, self.job.day, self.title or self.job.audio.stem)
+        started = time.monotonic()
+        try:
+            result = self.job.run()
+        except (Exception, KeyboardInterrupt) as exc:
+            self.fail(audio, exc)
+        click.echo(
+            f"{result['meeting_id']}: {result['segments']} Segmente, {result['speakers']} Sprecher, "
+            f"Geraet: {' -> '.join(result['used']) or '-'}, {time.monotonic() - started:.0f} s"
+        )
+        return result["meeting_id"]
+
+    def name_speakers(self, meeting_id):
+        if not self.tty:
+            return
+        _, rows = Query(self.store).execute(
+            "SELECT speaker, arg_max(text, end_s - start_s) FROM segments WHERE meeting_id = ? AND speaker <> ? "
+            "GROUP BY speaker ORDER BY speaker",
+            [meeting_id, SETTINGS["unknown_speaker"]],
+        )
+        try:
+            for label, text in rows:
+                click.echo(f"{label}: \"{' '.join(text.split())[: START['sentence_chars']]}\"")
+                name = click.prompt(f"Name fuer {label} (Enter = ueberspringen)", default="", show_default=False).strip()
+                if name:
+                    self.store.speakers.set(meeting_id, label, name)
+        except click.Abort:
+            click.echo()
+
+    def write_report(self, meeting_id):
+        text = Report(Query(self.store)).render(meeting_id)
+        path = ReportFile().write(self.job.day, Naming.slug(self.title or self.job.audio.stem), text)
+        click.echo(f"Protokoll: {path}")
+        return path
+
+    def rotate(self):
+        try:
+            self.store.rotate(older_than_days=START["rotate_days"])
+        except Exception as exc:
+            click.echo(f"Warnung: Rotation fehlgeschlagen: {Reason.of(exc)}", err=True)
+
+    def run(self):
+        self.preflight()
+        audio = self.record() if self.audio is None else self.audio
+        meeting_id = self.process(audio)
+        self.name_speakers(meeting_id)
+        path = self.write_report(meeting_id)
+        if self.open_report and self.tty and hasattr(os, "startfile"):
+            os.startfile(path)
+        self.rotate()
+        return path
 
 
 class AudioDevices:

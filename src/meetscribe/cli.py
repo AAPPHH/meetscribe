@@ -55,6 +55,10 @@ def echo_records(records, columns=None, clip=TABLE["clip"]):
     Table(columns, [[r[c] for c in columns] for r in records], clip).echo()
 
 
+def stdin_is_tty():
+    return sys.stdin.isatty()
+
+
 def get_store():
     return Store(make_config())
 
@@ -95,7 +99,8 @@ def setup():
     if pipeline.Models.whisper_ready(models.whisper_dir("npu")):
         click.echo("NPU-Compile-Cache wird aufgewaermt; das dauert einmalig mehrere Minuten.")
         try:
-            setup_job.warm("npu")
+            with pipeline.KeepAwake():
+                setup_job.warm("npu")
         except Exception as exc:
             click.echo(f"Warnung: NPU-Cache nicht aufgewaermt: {pipeline.Reason.of(exc)}", err=True)
     if failed:
@@ -128,7 +133,9 @@ def record(mic, out, seconds):
     for recorder in session.prepare():
         click.echo(f"{recorder.device['name']} [{recorder.hostapi}], {recorder.device['max_input_channels']} Kanaele, {recorder.rate} Hz")
     click.echo("Aufnahme laeuft, Ende mit Strg+C." if seconds is None else f"Aufnahme laeuft {seconds:g} s.")
-    reports = session.run(seconds)
+    click.echo(pipeline.RECORDING["lid_notice"])
+    with pipeline.KeepAwake():
+        reports = session.run(seconds)
     for report in reports:
         click.echo(f"{report['path']}: {report['seconds']:.1f} s, Ueberlaeufe: {report['overruns']}")
     if "mix" in session.paths():
@@ -160,13 +167,33 @@ def transcribe(audio, device, model, language, title, day, meeting_id, no_diariz
         speakers=speakers, min_speakers=min_speakers, max_speakers=max_speakers,
     )
     try:
-        result = job.run()
+        with pipeline.KeepAwake():
+            result = job.run()
     except DuplicateMeetingError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(
         f"{result['meeting_id']}: {result['segments']} Segmente, {result['speakers']} Sprecher, "
         f"Geraet angefordert: {result['requested']}, genutzt: {' -> '.join(result['used']) or '-'}"
     )
+
+
+@main.command(help="Aufnehmen (oder AUDIOFILE nehmen), transkribieren, Sprecher benennen, Protokoll schreiben.")
+@click.argument("audio", required=False, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--title", default=None)
+@click.option("--mic", default=None, help="dji, laptop, both oder Namensteil; Standard: DJI, sonst Laptop.")
+@click.option("--device", type=click.Choice(DEVICE_CHOICES, case_sensitive=False), envvar="MEETSCRIBE_DEVICE",
+              default="npu", show_default=True, help="Gewuenschtes Geraet; Fallback npu -> gpu -> cpu.")
+@click.option("--speakers", type=int, default=None)
+@click.option("--no-diarize", is_flag=True, help="Keine Sprechertrennung (Sprecher UNKNOWN).")
+@click.option("--no-open", is_flag=True, help="Protokoll nicht oeffnen.")
+def start(audio, title, mic, device, speakers, no_diarize, no_open):
+    from meetscribe import pipeline
+    flow = pipeline.StartFlow(
+        get_store(), audio=audio, mic=mic, device=device, title=title, speakers=speakers,
+        diarize=not no_diarize, open_report=not no_open, tty=stdin_is_tty(),
+    )
+    with pipeline.KeepAwake():
+        flow.run()
 
 
 @main.command(help="Heisse Dateien ins Parquet-Archiv verschieben.")

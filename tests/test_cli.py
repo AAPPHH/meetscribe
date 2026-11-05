@@ -1,7 +1,11 @@
 import os
+import signal
+import threading
+from datetime import date
 
 import numpy as np
 import pytest
+import soundfile as sf
 from click.testing import CliRunner
 
 from meetscribe import cli, pipeline
@@ -13,6 +17,9 @@ WORDS = [
 ]
 TURNS = [{"start": 0.0, "end": 1.5, "speaker": "SPEAKER_00"}, {"start": 1.5, "end": 3.0, "speaker": "SPEAKER_01"}]
 OFFLINE = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+LAPTOP = {"name": "Mikrofonarray (Intel Smart Sound)", "hostapi": 0, "max_input_channels": 2, "default_samplerate": 16000.0}
+DJI = {"name": "DJI MIC MINI", "hostapi": 0, "max_input_channels": 2, "default_samplerate": 16000.0}
+ES_CONTINUOUS_SYSTEM = pipeline.AWAKE_FLAGS["continuous"] | pipeline.AWAKE_FLAGS["system_required"]
 
 
 class FakeEngine:
@@ -40,6 +47,24 @@ class FakeDiarizer:
         return TURNS
 
 
+class FakeRecorder:
+    started = []
+    interrupt_with = "signal"
+
+    def __init__(self, device, path, hostapis=()):
+        self.device, self.path, self.rate, self.hostapi = device, path, 16000, hostapis[device["hostapi"]]
+
+    def start(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(self.path, np.full(16000, 0.1, dtype="float32"), 16000)
+        FakeRecorder.started.append(self.path)
+        if FakeRecorder.interrupt_with == "signal":
+            threading.Timer(0.05, signal.raise_signal, [signal.SIGINT]).start()
+
+    def stop(self):
+        return {"path": str(self.path), "seconds": 1.0, "overruns": 0, "error": None}
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     models = tmp_path / "models"
@@ -55,6 +80,11 @@ def env(tmp_path, monkeypatch):
     loaded = []
     monkeypatch.setattr(pipeline, "WhisperEngine", FakeEngine)
     monkeypatch.setattr(pipeline, "Diarizer", FakeDiarizer)
+    monkeypatch.setattr(pipeline, "Recorder", FakeRecorder)
+    FakeRecorder.started, FakeRecorder.interrupt_with = [], "signal"
+    monkeypatch.setattr(pipeline.AudioDevices, "sounddevice_picker", staticmethod(lambda: pipeline.InputPicker([LAPTOP, DJI], ["MME"])))
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: "ffmpeg")
+    monkeypatch.setenv("MEETSCRIBE_REPORTS", str(tmp_path / "protokolle"))
     monkeypatch.setattr(pipeline.AudioLoader, "load", staticmethod(lambda path, rate=None: loaded.append(path) or np.full(48000, 0.1, dtype="float32")))
     audio = tmp_path / "Besprechung März.wav"
     audio.write_bytes(b"x")
@@ -246,3 +276,161 @@ def test_last_meeting_is_default_for_report_and_speakers(env):
     assert "Anna" in invoke("report").output and "Anna" not in invoke("report", "old").output
     assert invoke("speakers", "unset", "SPEAKER_00").exit_code == 0
     assert "Anna" not in invoke("report").output
+
+
+def start(*extra, **kwargs):
+    return invoke("start", "--title", "Wochenplanung", *extra, **kwargs)
+
+
+def reports(env):
+    return sorted((env["tmp"] / "protokolle").glob("*.md"))
+
+
+def recordings(env):
+    return sorted((env["tmp"] / "data" / "aufnahmen").glob("*.flac"))
+
+
+def test_start_preflight_failure_records_nothing(env, monkeypatch):
+    result = start()
+    assert result.exit_code != 0 and "Diarisierungsmodell fehlt" in result.output
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: None)
+    missing = start("--no-diarize")
+    assert missing.exit_code != 0 and "ffmpeg nicht gefunden" in missing.output
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: "ffmpeg")
+    monkeypatch.setattr(pipeline.AudioDevices, "sounddevice_picker", staticmethod(lambda: pipeline.InputPicker([DJI], ["MME"])))
+    nomic = start("--no-diarize", "--mic", "laptop")
+    assert nomic.exit_code != 0 and "Kein Audio-Eingang" in nomic.output
+    for path in (env["models"] / pipeline.MODELS["npu"]["dir"]).iterdir():
+        path.unlink()
+    nomodel = start("--no-diarize")
+    assert nomodel.exit_code != 0 and "meetscribe setup" in nomodel.output
+    assert FakeRecorder.started == [] and not recordings(env) and env["loaded"] == [] and not reports(env)
+
+
+def test_start_auto_mic_prefers_dji_else_laptop(env, monkeypatch):
+    result = start("--no-diarize", "--no-open")
+    assert result.exit_code == 0, result.output
+    assert "Eingang: DJI MIC MINI [MME]" in result.output
+    monkeypatch.setattr(pipeline.AudioDevices, "sounddevice_picker", staticmethod(lambda: pipeline.InputPicker([LAPTOP], ["MME"])))
+    result = start("--no-diarize", "--no-open")
+    assert result.exit_code == 0, result.output
+    assert "Eingang: Mikrofonarray" in result.output
+    explicit = start("--no-diarize", "--no-open", "--mic", "mikrofonarray")
+    assert "Eingang: Mikrofonarray" in explicit.output
+
+
+@pytest.mark.parametrize("mode", ["signal", "keyboard"])
+def test_start_ctrl_c_ends_recording_and_continues(env, monkeypatch, mode):
+    FakeRecorder.interrupt_with = mode
+    if mode == "keyboard":
+        def interrupted(self, timeout):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(pipeline.Interrupt, "wait", interrupted)
+    before = signal.getsignal(signal.SIGINT)
+    result = start("--no-diarize", "--no-open")
+    assert result.exit_code == 0, result.output
+    assert "Traceback" not in result.output and "Aborted" not in result.output
+    assert pipeline.RECORDING["lid_notice"] in result.output and "Aufnahme gespeichert" in result.output
+    assert len(recordings(env)) == 1 and len(reports(env)) == 1
+    assert signal.getsignal(signal.SIGINT) is before
+    assert "UNKNOWN" in reports(env)[0].read_text(encoding="utf-8")
+
+
+def test_start_failure_after_recording_prints_retry_and_keeps_audio(env):
+    FakeEngine.fail_devices = ("npu", "gpu", "cpu")
+    result = start("--no-diarize", "--speakers", "2")
+    assert result.exit_code == 1
+    audio = recordings(env)[0]
+    assert f"Audio erhalten: {audio}" in result.output
+    retry = [line for line in result.output.splitlines() if line.startswith("Erneut versuchen:")][0]
+    assert "meetscribe start" in retry and str(audio) in retry and "--title Wochenplanung --speakers 2 --no-diarize" in retry
+    assert audio.exists() and not reports(env)
+    FakeEngine.fail_devices = ()
+    ok = invoke("start", audio, "--no-diarize", "--no-open", "--title", "Wochenplanung", "--speakers", "2")
+    assert ok.exit_code == 0, ok.output
+    assert audio.exists() and len(recordings(env)) == 1 and len(reports(env)) == 1
+
+
+def test_start_failure_with_spaces_quotes_retry(env):
+    FakeEngine.fail_devices = ("npu", "gpu", "cpu")
+    result = invoke("start", env["audio"], "--no-diarize", "--title", "Mein Treffen")
+    assert result.exit_code == 1 and '--title "Mein Treffen"' in result.output and f'"{env["audio"]}"' in result.output
+    assert env["audio"].exists() and FakeRecorder.started == []
+
+
+def test_start_tty_names_speakers_and_opens_report(env, monkeypatch):
+    add_pyannote(env)
+    opened = []
+    monkeypatch.setattr(cli, "stdin_is_tty", lambda: True)
+    monkeypatch.setattr(os, "startfile", opened.append, raising=False)
+    result = start("--speakers", "2", input="Anna\n\n")
+    assert result.exit_code == 0, result.output
+    assert 'SPEAKER_00: "Grüße aus München"' in result.output and 'SPEAKER_01: "Schön dass Sie da"' in result.output
+    text = reports(env)[0].read_text(encoding="utf-8")
+    assert "Anna" in text and "SPEAKER_01" in text and "München" in text
+    assert opened == [reports(env)[0]]
+    assert invoke("speakers", "set", "SPEAKER_01", "Bert").exit_code == 0
+    final = invoke("report").output
+    assert "Anna" in final and "Bert" in final and "SPEAKER_0" not in final
+    opened.clear()
+    assert start("--no-open", "--speakers", "2", input="\n\n").exit_code == 0
+    assert opened == []
+
+
+def test_start_non_tty_skips_naming_and_opening(env, monkeypatch):
+    add_pyannote(env)
+    opened = []
+    monkeypatch.setattr(os, "startfile", opened.append, raising=False)
+    result = start("--speakers", "2")
+    assert result.exit_code == 0, result.output
+    assert "Name fuer" not in result.output and opened == []
+    assert "SPEAKER_00" in reports(env)[0].read_text(encoding="utf-8")
+
+
+def test_start_report_name_collision_gets_suffix(env):
+    for _ in range(3):
+        assert start("--no-diarize", "--no-open").exit_code == 0
+    stamp = f"{date.today():%Y-%m-%d}_wochenplanung"
+    assert sorted(p.name for p in reports(env)) == sorted([f"{stamp}.md", f"{stamp}-2.md", f"{stamp}-3.md"])
+    assert len(recordings(env)) == 3
+
+
+def test_start_with_audiofile_does_not_record(env):
+    result = invoke("start", env["audio"], "--no-diarize", "--no-open")
+    assert result.exit_code == 0, result.output
+    assert FakeRecorder.started == [] and not recordings(env) and len(reports(env)) == 1
+    assert "besprechung-maerz" in reports(env)[0].name
+    assert "Grüße aus München" in reports(env)[0].read_bytes().decode("utf-8")
+
+
+def test_start_rotate_failure_is_only_a_warning(env, monkeypatch):
+    calls = []
+
+    def failing(self, older_than_days=0, force=False):
+        calls.append(older_than_days)
+        raise OSError("disk")
+
+    monkeypatch.setattr(type(env["store"]), "rotate", failing)
+    result = start("--no-diarize", "--no-open")
+    assert result.exit_code == 0 and calls == [30]
+    assert result.output.count("Warnung: Rotation fehlgeschlagen: OSError: disk") == 1 and len(reports(env)) == 1
+
+
+def test_keep_awake_wraps_start_transcribe_and_setup(env, monkeypatch):
+    calls = []
+    released = [ES_CONTINUOUS_SYSTEM, pipeline.AWAKE_FLAGS["continuous"]]
+    monkeypatch.setattr(pipeline.KeepAwake, "native", staticmethod(lambda: calls.append))
+    assert start("--no-diarize", "--no-open").exit_code == 0
+    assert calls == released
+    calls.clear()
+    assert transcribe(env, "--no-diarize").exit_code == 0
+    assert calls == released
+    calls.clear()
+    monkeypatch.setattr(pipeline.ModelSetup, "download", staticmethod(lambda repo, target, token=None: None))
+    assert invoke("setup").exit_code == 0
+    assert calls == released
+    calls.clear()
+    FakeEngine.fail_devices = ("npu", "gpu", "cpu")
+    assert start("--no-diarize").exit_code == 1
+    assert calls == released

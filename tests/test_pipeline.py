@@ -1,4 +1,6 @@
 import shutil
+import signal
+import threading
 
 import numpy as np
 import pytest
@@ -6,10 +8,10 @@ import soundfile as sf
 
 from meetscribe import pipeline
 from meetscribe.pipeline import (
-    ASRFailure, ASRRunner, Aligner, AudioError, AudioLoader, DeviceError, InputPicker, Mixer, Models, Naming,
+    ASRFailure, ASRRunner, Aligner, AudioError, AudioLoader, DeviceError, InputPicker, Interrupt, KeepAwake, Mixer, Models, Naming,
     RecordingSession, TranscribeJob, Transcriber, Windows,
 )
-from meetscribe.store import HotFile, Query, Store, make_config
+from meetscribe.store import HotFile, Query, ReportFile, Store, make_config
 
 RATE = 16000
 DEVICES = [
@@ -274,3 +276,55 @@ def test_audio_loader_without_ffmpeg(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline.shutil, "which", lambda name: None)
     with pytest.raises(AudioError, match="ffmpeg"):
         AudioLoader.load(tmp_path / "x.wav")
+
+
+def test_keep_awake_sets_and_releases_flags():
+    calls = []
+    with KeepAwake(calls.append):
+        assert calls == [pipeline.AWAKE_FLAGS["continuous"] | pipeline.AWAKE_FLAGS["system_required"]]
+    assert calls[-1] == pipeline.AWAKE_FLAGS["continuous"] and len(calls) == 2
+
+
+@pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt])
+def test_keep_awake_released_on_exceptions(error):
+    calls = []
+    with pytest.raises(error):
+        with KeepAwake(calls.append):
+            raise error("boom")
+    assert calls[-1] == pipeline.AWAKE_FLAGS["continuous"] and len(calls) == 2
+
+
+def test_keep_awake_is_noop_without_windows(monkeypatch):
+    monkeypatch.setattr(pipeline.sys, "platform", "linux")
+    assert KeepAwake.native() is None
+    with KeepAwake():
+        pass
+
+
+def test_interrupt_sets_flag_and_restores_handler():
+    before = signal.getsignal(signal.SIGINT)
+    with Interrupt() as interrupt:
+        assert not interrupt.wait(0)
+        threading.Timer(0.02, signal.raise_signal, [signal.SIGINT]).start()
+        assert any(interrupt.wait(0.05) for _ in range(40))
+    assert signal.getsignal(signal.SIGINT) is before
+
+
+def test_interrupt_outside_main_thread_is_tolerated():
+    seen = []
+    thread = threading.Thread(target=lambda: seen.append(Interrupt().__enter__().installed))
+    thread.start()
+    thread.join()
+    assert seen == [False]
+
+
+def test_auto_picks_dji_else_laptop():
+    assert InputPicker(DEVICES, HOSTAPIS).auto() == "dji"
+    assert InputPicker([d for d in DEVICES if "DJI" not in d["name"]], HOSTAPIS).auto() == "laptop"
+
+
+def test_report_file_suffix_on_collision(tmp_path):
+    files = ReportFile(tmp_path / "p")
+    paths = [files.write("2026-03-04", "x", "ä") for _ in range(3)]
+    assert [p.name for p in paths] == ["2026-03-04_x.md", "2026-03-04_x-2.md", "2026-03-04_x-3.md"]
+    assert paths[0].read_bytes() == "ä".encode("utf-8")

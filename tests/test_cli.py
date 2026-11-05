@@ -457,6 +457,45 @@ def test_start_rotate_failure_is_only_a_warning(env, monkeypatch):
     assert result.output.count("Warnung: Rotation fehlgeschlagen: OSError: disk") == 1 and len(reports(env)) == 1
 
 
+def assert_saved_and_recoverable(env, result, code):
+    meeting = f"{date.today():%Y%m%d}-wochenplanung"
+    assert result.exit_code == code and "Traceback" not in result.output and "Aborted" not in result.output
+    assert f"Audio erhalten: {recordings(env)[0]}" in result.output
+    assert f"Besprechung gespeichert: {meeting}" in result.output and f"meetscribe report {meeting}" in result.output
+    assert env["store"].exists(meeting) and invoke("report", meeting).exit_code == 0
+
+
+def test_start_report_write_oserror_keeps_meeting_and_explains_recovery(env):
+    blocker = env["tmp"] / "protokolle"
+    blocker.write_text("im Weg")
+    result = start("--no-diarize", "--no-open")
+    assert_saved_and_recoverable(env, result, 1)
+    assert "Nachbearbeitung fehlgeschlagen" in result.output and not reports(env)
+
+
+def test_start_speaker_name_oserror_keeps_meeting_and_explains_recovery(env, monkeypatch):
+    def locked(self, meeting_id, label, name):
+        raise PermissionError("speakers.parquet gesperrt")
+
+    add_pyannote(env)
+    monkeypatch.setattr(cli, "stdin_is_tty", lambda: True)
+    monkeypatch.setattr(type(env["store"].speakers), "set", locked)
+    result = start("--speakers", "2", "--no-open", input="Anna\n")
+    assert_saved_and_recoverable(env, result, 1)
+    assert "PermissionError: speakers.parquet gesperrt" in result.output
+
+
+@pytest.mark.parametrize("stage", ["write_report", "rotate"])
+def test_start_ctrl_c_after_transcription_exits_130_and_keeps_meeting(env, monkeypatch, stage):
+    def interrupted(self, *args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pipeline.StartFlow, stage, interrupted)
+    result = start("--no-diarize", "--no-open")
+    assert_saved_and_recoverable(env, result, 130)
+    assert "Nachbearbeitung abgebrochen" in result.output
+
+
 def test_keep_awake_wraps_start_transcribe_and_setup(env, monkeypatch):
     calls = []
     released = [ES_CONTINUOUS_SYSTEM, pipeline.AWAKE_FLAGS["continuous"]]

@@ -854,11 +854,16 @@ class StartFlow:
             click.echo(f"Warnung: Aufnahme unvollstaendig, transkribiert wird nur {path}.", err=True)
         return path
 
-    def fail(self, audio, exc):
+    def fail(self, audio, exc, saved=None):
         interrupted = isinstance(exc, KeyboardInterrupt)
-        click.echo("Verarbeitung abgebrochen." if interrupted else f"Verarbeitung fehlgeschlagen: {Reason.of(exc)}", err=True)
+        stage = "Nachbearbeitung" if saved else "Verarbeitung"
+        click.echo(f"{stage} abgebrochen." if interrupted else f"{stage} fehlgeschlagen: {Reason.of(exc)}", err=True)
         click.echo(f"Audio erhalten: {audio}", err=True)
-        click.echo(f"Erneut versuchen: {self.retry_command(audio)}", err=True)
+        if saved:
+            click.echo(f"Besprechung gespeichert: {saved}", err=True)
+            click.echo(f"Protokoll erneut erzeugen: {START['program']} report {saved} (nicht erneut start, das legt eine zweite Besprechung an)", err=True)
+        else:
+            click.echo(f"Erneut versuchen: {self.retry_command(audio)}", err=True)
         raise click.exceptions.Exit(130 if interrupted else 1)
 
     def process(self, audio):
@@ -922,10 +927,13 @@ class StartFlow:
         self.preflight()
         audio = self.record() if self.audio is None else self.audio
         meeting_id = self.process(audio)
-        self.name_speakers(meeting_id)
-        path = self.write_report(meeting_id)
-        self.show(path)
-        self.rotate()
+        try:
+            self.name_speakers(meeting_id)
+            path = self.write_report(meeting_id)
+            self.show(path)
+            self.rotate()
+        except (Exception, KeyboardInterrupt) as exc:
+            self.fail(audio, exc, saved=meeting_id)
         return path
 
 

@@ -25,6 +25,7 @@ ES_CONTINUOUS_SYSTEM = pipeline.AWAKE_FLAGS["continuous"] | pipeline.AWAKE_FLAGS
 class FakeEngine:
     fail_devices = ()
     constructed = []
+    silent = False
 
     def __init__(self, device, models, language, override=None):
         self.device, self.model = device, "fake-model"
@@ -33,6 +34,8 @@ class FakeEngine:
     def transcribe(self, audio):
         if self.device in FakeEngine.fail_devices:
             raise RuntimeError("DEVICE_LOST")
+        if FakeEngine.silent:
+            return {"words": [], "chunks": []}
         return {"words": [{"text": t, "start_s": s, "end_s": e} for t, s, e in WORDS], "chunks": []}
 
 
@@ -76,7 +79,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.delenv("MEETSCRIBE_DEVICE", raising=False)
     for name in (*OFFLINE, "HF_TOKEN"):
         monkeypatch.delenv(name, raising=False)
-    FakeEngine.fail_devices, FakeEngine.constructed, FakeDiarizer.calls = (), [], []
+    FakeEngine.fail_devices, FakeEngine.constructed, FakeEngine.silent, FakeDiarizer.calls = (), [], False, []
     loaded = []
     monkeypatch.setattr(pipeline, "WhisperEngine", FakeEngine)
     monkeypatch.setattr(pipeline, "Diarizer", FakeDiarizer)
@@ -169,14 +172,14 @@ def test_no_fallback_flag_fails(env):
     result = transcribe(env, "--no-diarize", "--no-fallback")
     assert result.exit_code != 0 and "--no-fallback" in result.output
     assert FakeEngine.constructed == ["npu"]
-    assert not HotFile(env["store"].hot_path("m1")).is_complete()
+    assert not env["store"].hot_path("m1").exists()
 
 
 def test_all_devices_failing_exits_nonzero_without_eos(env):
     FakeEngine.fail_devices = ("npu", "gpu", "cpu")
     result = transcribe(env, "--no-diarize")
     assert result.exit_code != 0 and "Alle Geraete fehlgeschlagen" in result.output
-    assert not HotFile(env["store"].hot_path("m1")).is_complete()
+    assert not env["store"].hot_path("m1").exists()
 
 
 def test_device_from_env_and_flag(env):
@@ -253,8 +256,10 @@ def test_umlauts_survive_piped_output(env):
 
 
 def test_rotate_skips_incomplete_unless_forced(env):
-    FakeEngine.fail_devices = ("npu",)
-    transcribe(env, "--no-diarize", "--no-fallback")
+    with pytest.raises(KeyError):
+        with env["store"].writer("m1", title="t", meeting_date="2026-03-04", language="de") as writer:
+            writer.append([{"start_s": 0.0, "end_s": 1.0, "speaker": "UNKNOWN", "text": "x"}])
+            raise KeyError
     assert "incomplete" in invoke("rotate").output
     assert "rotiert: m1" not in invoke("rotate").output
 
@@ -350,6 +355,27 @@ def test_start_failure_after_recording_prints_retry_and_keeps_audio(env):
     ok = invoke("start", audio, "--no-diarize", "--no-open", "--title", "Wochenplanung", "--speakers", "2")
     assert ok.exit_code == 0, ok.output
     assert audio.exists() and len(recordings(env)) == 1 and len(reports(env)) == 1
+
+
+def test_start_abort_leaves_no_partial_meeting(env):
+    FakeEngine.fail_devices = ("npu", "gpu", "cpu")
+    assert start("--no-diarize").exit_code == 1
+    assert not env["store"].hot_files()
+    FakeEngine.fail_devices = ()
+    audio = recordings(env)[0]
+    assert invoke("start", audio, "--no-diarize", "--no-open", "--title", "Wochenplanung").exit_code == 0
+    ids = [line.split()[0] for line in invoke("meetings").output.splitlines()[2:]]
+    assert ids == [f"{date.today():%Y%m%d}-wochenplanung"]
+
+
+def test_start_without_speech_explains_and_keeps_audio(env):
+    FakeEngine.silent = True
+    result = start("--no-diarize", "--no-open")
+    assert result.exit_code == 1 and "Traceback" not in result.output and "Keine Sprache erkannt" in result.output
+    assert f"Audio erhalten: {recordings(env)[0]}" in result.output
+    assert not env["store"].hot_files() and not reports(env)
+    transcribed = transcribe(env, "--no-diarize")
+    assert transcribed.exit_code == 1 and "Keine Sprache erkannt" in transcribed.output and not env["store"].hot_files()
 
 
 def test_start_failure_with_spaces_quotes_retry(env):

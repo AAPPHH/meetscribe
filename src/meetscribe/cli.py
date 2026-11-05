@@ -171,6 +171,8 @@ def transcribe(audio, device, model, language, title, day, meeting_id, no_diariz
             result = job.run()
     except DuplicateMeetingError as exc:
         raise click.ClickException(str(exc)) from exc
+    if not result["segments"]:
+        raise click.ClickException("Keine Sprache erkannt, nichts gespeichert.")
     click.echo(
         f"{result['meeting_id']}: {result['segments']} Segmente, {result['speakers']} Sprecher, "
         f"Geraet angefordert: {result['requested']}, genutzt: {' -> '.join(result['used']) or '-'}"

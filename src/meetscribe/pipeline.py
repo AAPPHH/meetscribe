@@ -491,8 +491,10 @@ class TranscribeJob:
         turns = Diarizer(self.models).diarize(audio, **self.speaker_options) if self.diarize else []
         gc.collect()
         runner = ASRRunner(self.chain, lambda d: WhisperEngine(d, self.models, self.language, self.model), self.fallback)
-        with self.store.writer(meeting_id, title=self.title, meeting_date=self.day, language=self.language) as writer:
+        with self.store.writer(meeting_id, title=self.title, meeting_date=self.day, language=self.language, discard_on_error=True) as writer:
             summary = Transcriber(runner).run(audio, turns, writer)
+        if not summary["segments"]:
+            self.store.discard(meeting_id)
         return {**summary, "meeting_id": meeting_id, "requested": self.device.upper(), "speakers": len({t["speaker"] for t in turns})}
 
 
@@ -742,6 +744,8 @@ class StartFlow:
         started = time.monotonic()
         try:
             result = self.job.run()
+            if not result["segments"]:
+                raise PipelineError("Keine Sprache erkannt, kein Protokoll erstellt")
         except (Exception, KeyboardInterrupt) as exc:
             self.fail(audio, exc)
         click.echo(

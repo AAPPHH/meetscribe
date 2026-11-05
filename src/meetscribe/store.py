@@ -178,6 +178,9 @@ class Store:
     def writer(self, meeting_id, **meta):
         return TranscriptWriter(meeting_id, store=self, **meta)
 
+    def discard(self, meeting_id):
+        self.hot_path(meeting_id).unlink(missing_ok=True)
+
     def incomplete(self):
         return [p.stem for p in self.hot_files() if not HotFile(p).is_complete()]
 
@@ -218,8 +221,10 @@ class Store:
 
 
 class TranscriptWriter:
-    def __init__(self, meeting_id, title="", meeting_date=None, language=None, model=None, device=None, store=None):
+    def __init__(self, meeting_id, title="", meeting_date=None, language=None, model=None, device=None, store=None,
+                 discard_on_error=False):
         self.store = store or Store()
+        self.discard_on_error = discard_on_error
         self.path = self.store.hot_path(meeting_id)
         self.meta = {
             "meeting_id": meeting_id,
@@ -251,6 +256,8 @@ class TranscriptWriter:
                 self.stream.close()
         finally:
             self.file.close()
+            if exc_type is not None and self.discard_on_error:
+                self.store.discard(self.meta["meeting_id"])
         return False
 
     def _row(self, seg, now):

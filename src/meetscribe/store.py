@@ -61,6 +61,10 @@ class MeetingNotFound(LookupError):
     pass
 
 
+class ExtensionBlocked(duckdb.Error):
+    pass
+
+
 class VerifyError(RuntimeError):
     pass
 
@@ -340,7 +344,16 @@ class Query:
             self.con.execute(sql)
         self._signature = state
 
+    def _guard(self, sql):
+        try:
+            blocked = any(s.type == duckdb.StatementType.LOAD for s in self.con.extract_statements(sql))
+        except ValueError:
+            blocked = True
+        if blocked:
+            raise ExtensionBlocked("Erweiterungen installieren, laden oder aktualisieren ist gesperrt (meetscribe greift nur mit setup auf das Netz zu).")
+
     def execute(self, sql, params=None):
+        self._guard(sql)
         self.refresh()
         relation = self.con.sql(sql, params=params or [])
         if relation is None:

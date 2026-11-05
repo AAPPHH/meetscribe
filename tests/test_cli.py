@@ -6,6 +6,7 @@ import sys
 import threading
 import types
 from datetime import date
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
@@ -523,6 +524,30 @@ def test_gitignore_covers_media_and_keeps_project_files():
     assert sorted(ignored) == sorted(names)
     kept = subprocess.run(["git", "check-ignore", "README.md", "pyproject.toml"], cwd=root, capture_output=True, text=True)
     assert kept.returncode == 1 and kept.stdout == ""
+
+
+@pytest.mark.parametrize("statement", [
+    "INSTALL tpch FROM '{url}'", "FORCE INSTALL tpch FROM '{url}'", "LOAD httpfs", "SELECT 1; LOAD httpfs", "UPDATE EXTENSIONS",
+])
+def test_sql_refuses_extension_statements_without_any_request(env, statement):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_error(404)
+
+        log_message = lambda *args: None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        result = invoke("sql", statement.format(url=f"http://127.0.0.1:{server.server_port}"))
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert result.exit_code == 1 and "Traceback" not in result.output and "gesperrt" in result.output and requests == []
+    assert invoke("sql", "SELECT 1 AS n").exit_code == 0
 
 
 def test_sql_cannot_fetch_extensions_but_reads_local_files(env):

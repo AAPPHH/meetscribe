@@ -49,7 +49,7 @@ $env:HF_TOKEN = "hf_..."
 meetscribe setup
 ```
 
-`setup` ist der einzige Befehl mit Netzzugriff. Er lädt:
+`setup` ist der einzige Befehl, der selbst das Netz nutzt (`sql` lehnt `INSTALL` und `LOAD` ab, siehe dort). Er lädt:
 
 - `OpenVINO/whisper-large-v3-turbo-fp16-ov` (NPU) und `OpenVINO/whisper-large-v3-turbo-int8-ov` (GPU/CPU) nach `models\`,
 - bei gesetztem `HF_TOKEN` das Diarisierungsmodell `pyannote/speaker-diarization-community-1`,
@@ -150,7 +150,7 @@ Schema von `segments`:
 
 `speakers`: `meeting_id`, `label`, `name`.
 
-DuckDB-Erweiterungen werden weder automatisch installiert noch automatisch geladen (`autoinstall_known_extensions` und `autoload_known_extensions` sind aus) und die Konfiguration ist gesperrt, `SET` auf diese Einstellungen schlägt also fehl. Ein Aufruf wie `read_parquet('https://...')` bricht deshalb ohne Netzzugriff mit der DuckDB-Fehlermeldung ab (`requires the extension httpfs`, Exit-Code 1, kein Traceback). Lokale Dateien, etwa `read_parquet('C:/pfad/datei.parquet')`, und die Sichten funktionieren weiter. Ein ausdrückliches `INSTALL ...` in der Abfrage wurde nicht geprüft und ist nicht eigens gesperrt.
+DuckDB-Erweiterungen werden weder automatisch installiert noch automatisch geladen (`autoinstall_known_extensions` und `autoload_known_extensions` sind aus) und die Konfiguration ist gesperrt, `SET` auf diese Einstellungen schlägt also fehl. Ein Aufruf wie `read_parquet('https://...')` bricht deshalb ohne Netzzugriff mit der DuckDB-Fehlermeldung ab (`requires the extension httpfs`, Exit-Code 1, kein Traceback). Lokale Dateien, etwa `read_parquet('C:/pfad/datei.parquet')`, und die Sichten funktionieren weiter. Zusätzlich lehnt `sql` jede Anweisung `INSTALL`, `FORCE INSTALL` und `LOAD` sowie `UPDATE EXTENSIONS` ab (Meldung `... gesperrt`, Exit-Code 1), bevor DuckDB etwas ausführt; ein Test mit lokalem HTTP-Server bestätigt, dass dabei keine Anfrage entsteht. Nicht geprüft ist, ob DuckDB außerhalb dieser Anweisungen Erweiterungen nachladen kann (`load_extension` gibt es in DuckDB 2.0.0 nicht). Schon auf dem Rechner liegende Erweiterungen (`%USERPROFILE%\.duckdb\extensions`) werden von `sql` nicht geladen.
 
 ## Mikrofone
 
@@ -209,7 +209,7 @@ Audio wird nicht automatisch gelöscht, auch nicht nach der Archivierung. `data\
 
 ## Hinweise
 
-- Offline: Nur `setup` greift auf das Netz zu. Alle anderen Befehle setzen die Hugging-Face-Offline-Variablen und senden nichts. Es gibt keine Cloud-Dienste.
+- Offline: Nur `setup` greift auf das Netz zu. Alle anderen Befehle setzen die Hugging-Face-Offline-Variablen und senden nichts; `sql` startet keine Erweiterungsinstallation und lädt keine Erweiterung (siehe `sql`). Es gibt keine Cloud-Dienste.
 - Aufnahme und Einwilligung: In Deutschland ist das heimliche Aufnehmen des nichtöffentlich gesprochenen Wortes strafbar (§ 201 StGB). Vor der Aufnahme sollten alle Beteiligten zustimmen. Das ist keine Rechtsberatung.
 - Personenbezogene Daten liegen unverschlüsselt auf der Platte: Aufnahmen, Transkripte, Protokolle, Sprecherzuordnung. Wer das braucht, muss das Laufwerk verschlüsseln.
 - Kein Sprachmodell im Einsatz: Das Protokoll enthält Transkript und Redezeiten, aber keine Zusammenfassung, keine Beschlüsse und keine Aufgaben.

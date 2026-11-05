@@ -47,6 +47,8 @@ SETTINGS = {
         "token_env": "HF_TOKEN",
         "model_ref": r"\$model/([^\s'\",\]}#]+)",
         "comment": r"(?:^|\s)#.*",
+        "default_files": ["pytorch_model.bin"],
+        "ref_files": {"plda": ["plda.npz", "xvec_transform.npz"]},
     },
 }
 UMLAUTS = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"})
@@ -112,17 +114,24 @@ class Models:
         return path.is_dir() and any(path.glob("*.xml"))
 
     def diarization_missing(self):
+        diar = SETTINGS["diarization"]
         root = self.diarization_dir
-        config = root / SETTINGS["diarization"]["config"]
+        config = root / diar["config"]
         if not config.is_file():
             return [config]
-        lines = (re.sub(SETTINGS["diarization"]["comment"], "", line) for line in config.read_text(encoding="utf-8", errors="replace").splitlines())
-        found = dict.fromkeys(ref for line in lines for ref in re.findall(SETTINGS["diarization"]["model_ref"], line))
-        return [root / ref for ref in found if not self.present(root / ref)]
+        lines = (re.sub(diar["comment"], "", line) for line in config.read_text(encoding="utf-8", errors="replace").splitlines())
+        found = dict.fromkeys(ref for line in lines for ref in re.findall(diar["model_ref"], line))
+        return [path for ref in found for path in self.absent(root, ref)]
 
     @staticmethod
-    def present(path):
-        return path.is_file() or (path.is_dir() and any(p.is_file() for p in path.rglob("*")))
+    def absent(root, ref):
+        diar = SETTINGS["diarization"]
+        path = root / ref
+        if path.is_file():
+            return []
+        if not path.is_dir():
+            return [path]
+        return [path / name for name in diar["ref_files"].get(ref, diar["default_files"]) if not (path / name).is_file()]
 
     def diarization_ready(self):
         return not self.diarization_missing()

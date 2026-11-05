@@ -221,7 +221,7 @@ Audio wird nicht automatisch gelöscht, auch nicht nach der Archivierung. `data\
 
 Nicht an echter Hardware oder echten Eingaben geprüft:
 
-- Die Vollständigkeitsprüfung des Diarisierungs-Snapshots (`$model/`-Verweise in `config.yaml`) ist nur mit handgeschriebenem YAML getestet; das echte Layout von `pyannote/speaker-diarization-community-1` wurde nicht bestätigt.
+- Die Vollständigkeitsprüfung des Diarisierungs-Snapshots ist nur mit handgeschriebenem YAML getestet; das echte Layout von `pyannote/speaker-diarization-community-1` wurde nicht bestätigt. Geprüft werden die `$model/`-Verweise in `config.yaml` (Kommentare werden ignoriert): Ein Verweis auf eine Datei muss existieren, ein Verweis auf einen Ordner muss `pytorch_model.bin` enthalten, `plda` zusätzlich `plda.npz` und `xvec_transform.npz` (so lädt pyannote 4.0.7 diese Ordner). Weitere Ordnernamen werden wie Modellordner (`pytorch_model.bin`) behandelt.
 - Sprechertrennung mit dem echten pyannote-Modell, auch ohne Token oder lokalen Snapshot: Alle echten Läufe liefen mit `--no-diarize`. Die Diarisierung ist nur in Tests (ohne echtes Modell) abgedeckt.
 - Der echte DJI-Empfänger: Die Namensmuster für den USB-Eingang (`dji`, `mic mini`, `mic 2`, `wireless mic`) sind Annahmen. Ebenso unbekannt: ob TX1 und TX2 als linker und rechter Kanal ankommen.
 - `--mic both` auf echter Hardware, einschließlich des streckenden Mixes.

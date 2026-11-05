@@ -243,6 +243,18 @@ def test_diarization_ready_checks_referenced_model_files(tmp_path):
     assert models.diarization_ready() and models.diarization_missing() == []
 
 
+def test_partial_snapshot_directories_are_flagged(tmp_path):
+    models = Models(tmp_path)
+    root = write_snapshot(
+        models, "segmentation: $model/segmentation\nembedding: $model/embedding\nplda: $model/plda\n",
+        ["segmentation/README.md", "embedding/pytorch_model.bin", "plda/plda.npz"],
+    )
+    assert models.diarization_missing() == [root / "segmentation/pytorch_model.bin", root / "plda/xvec_transform.npz"]
+    (root / "segmentation/pytorch_model.bin").write_bytes(b"w")
+    (root / "plda/xvec_transform.npz").write_bytes(b"w")
+    assert models.diarization_ready()
+
+
 def test_trailing_yaml_comment_is_not_a_model_reference(tmp_path):
     models = Models(tmp_path)
     write_snapshot(models, "params:\n  a: $model/a # frueher $model/b\n  c: [$model/c] #$model/d\n", ["a", "c"])

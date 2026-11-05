@@ -540,6 +540,7 @@ class RecordingSession:
         self.mic = mic
         self.out = Path(out) if Path(out).suffix else Path(out).with_suffix(RECORDING["default_suffix"])
         self.picker = picker
+        self.recorders = None
 
     @property
     def specs(self):
@@ -551,9 +552,14 @@ class RecordingSession:
         stem, suffix = self.out.with_suffix(""), self.out.suffix
         return {**{spec: Path(f"{stem}.{spec}{suffix}") for spec in self.specs}, "mix": Path(f"{stem}.mix{suffix}")}
 
+    def prepare(self):
+        paths = self.paths()
+        self.recorders = [Recorder(self.picker.pick(spec), paths[spec], self.picker.hostapis) for spec in self.specs]
+        return self.recorders
+
     def run(self, seconds=None):
         paths = self.paths()
-        recorders = [Recorder(self.picker.pick(spec), paths[spec], self.picker.hostapis) for spec in self.specs]
+        recorders = self.recorders or self.prepare()
         started = []
         try:
             for recorder in recorders:

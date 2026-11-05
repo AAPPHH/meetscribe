@@ -1,5 +1,6 @@
 import shutil
 import signal
+import sys
 import threading
 import time
 import types
@@ -387,6 +388,57 @@ def test_recording_keeps_healthy_input_and_uses_its_file_when_mix_is_impossible(
     assert warnings == ["Warnung: Eingang 'DJI': kein Audio seit 6 s"]
     assert session.final == tmp_path / "rec.laptop.flac" and not session.mix_path.exists()
     assert [r["problem"] for r in reports] == ["kein Audio seit 6 s", None]
+
+
+def test_recording_prefers_the_healthy_input_even_when_the_broken_one_is_longer(tmp_path, monkeypatch):
+    session = scripted_session(
+        tmp_path, monkeypatch,
+        lambda path: ScriptedRecorder("DJI", path, 3.0, fails_after=0.05),
+        lambda path: ScriptedRecorder("Laptop", path, 1.0),
+    )
+    session.run(seconds=0.4)
+    assert session.final == tmp_path / "rec.laptop.flac"
+
+
+class SilentStream:
+    instances = []
+
+    def __init__(self, **options):
+        self.callback, self.running = options["callback"], False
+        self.thread = threading.Thread(target=self.feed, daemon=True)
+        SilentStream.instances.append(self)
+
+    def feed(self):
+        while self.running:
+            self.callback(np.zeros((160, 1), dtype="float32"), 160, None, types.SimpleNamespace(input_overflow=False))
+            time.sleep(0.01)
+
+    def start(self):
+        self.running = True
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+
+    def close(self):
+        pass
+
+
+def test_digital_silence_counts_as_audio_and_only_missing_callbacks_are_a_dead_stream(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(InputStream=SilentStream, WasapiSettings=lambda **kw: kw))
+    monkeypatch.setitem(pipeline.RECORDING, "stall_s", 0.15)
+    recorder = pipeline.Recorder({"name": "Laptop", "index": 0, "max_input_channels": 1, "default_samplerate": 16000.0, "hostapi": 0}, tmp_path / "s.flac", ["MME"])
+    recorder.start()
+    try:
+        end = time.monotonic() + 0.5
+        while time.monotonic() < end:
+            assert recorder.problem() is None
+            time.sleep(0.02)
+        SilentStream.instances[-1].running = False
+        time.sleep(0.3)
+        assert "kein Audio" in recorder.problem()
+    finally:
+        recorder.stop()
 
 
 def test_recording_stops_when_no_input_is_healthy_and_keeps_longest_file(tmp_path, monkeypatch, capsys):

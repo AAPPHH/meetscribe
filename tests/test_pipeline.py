@@ -125,6 +125,13 @@ def test_aligner_splits_on_long_gap_and_keeps_words():
     assert all(len(s["words"]) == len(s["text"].split()) for s in segments)
 
 
+def test_aligner_splits_after_sentence_end_once_long_enough():
+    words = [word("Eins.", 0, 3), word("Zwei.", 3, 6), word("Drei", 6, 9), word("vier.", 9, 11), word("Fuenf.", 11, 12)]
+    segments = Aligner(min_segment_s=8.0).align(words, [])
+    assert [s["text"] for s in segments] == ["Eins. Zwei. Drei vier.", "Fuenf."]
+    assert [s["text"] for s in Aligner(min_segment_s=1000).align(words, [])] == ["Eins. Zwei. Drei vier. Fuenf."]
+
+
 def test_aligner_overlapping_turns_sum_per_speaker():
     turns = [turn(0, 3, "A"), turn(1, 4, "B"), turn(2, 4, "B")]
     assert Aligner().align([word("x", 1.0, 4.0)], turns)[0]["speaker"] == "B"

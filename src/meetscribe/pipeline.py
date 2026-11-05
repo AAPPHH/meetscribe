@@ -30,6 +30,8 @@ SETTINGS = {
     "search_s": 5.0,
     "frame_s": 0.05,
     "max_gap_s": 1.5,
+    "min_segment_s": 8.0,
+    "sentence_end": ".!?",
     "silence_peak": 1e-4,
     "unknown_speaker": "UNKNOWN",
     "models_env": "MEETSCRIBE_MODELS",
@@ -185,8 +187,9 @@ class Windows:
 
 
 class Aligner:
-    def __init__(self, max_gap_s=None, unknown=None):
+    def __init__(self, max_gap_s=None, unknown=None, min_segment_s=None):
         self.max_gap_s = SETTINGS["max_gap_s"] if max_gap_s is None else max_gap_s
+        self.min_segment_s = SETTINGS["min_segment_s"] if min_segment_s is None else min_segment_s
         self.unknown = unknown or SETTINGS["unknown_speaker"]
 
     @staticmethod
@@ -215,13 +218,16 @@ class Aligner:
             return max(overlap, key=overlap.get)
         return min(ordered, key=lambda t: max(t["start"] - end, start - t["end"], 0.0))["speaker"]
 
+    def closed(self, segment):
+        return segment["end_s"] - segment["start_s"] >= self.min_segment_s and segment["words"][-1]["text"].endswith(tuple(SETTINGS["sentence_end"]))
+
     def align(self, words, turns):
         index = self.index(turns)
         segments = []
         for word in sorted(words, key=lambda w: (w["start_s"], w["end_s"])):
             speaker = self.speaker(word, index)
             current = segments[-1] if segments else None
-            if current and current["speaker"] == speaker and word["start_s"] - current["end_s"] <= self.max_gap_s:
+            if current and current["speaker"] == speaker and word["start_s"] - current["end_s"] <= self.max_gap_s and not self.closed(current):
                 current["words"].append(dict(word))
                 current["end_s"] = max(current["end_s"], word["end_s"])
             else:

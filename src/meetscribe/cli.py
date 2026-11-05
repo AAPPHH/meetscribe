@@ -132,16 +132,20 @@ def record(mic, out, seconds):
     session = pipeline.RecordingSession(mic, out, pipeline.AudioDevices.sounddevice_picker())
     for recorder in session.prepare():
         click.echo(f"{recorder.device['name']} [{recorder.hostapi}], {recorder.device['max_input_channels']} Kanaele, {recorder.rate} Hz")
-    click.echo("Aufnahme laeuft, Ende mit Strg+C." if seconds is None else f"Aufnahme laeuft {seconds:g} s.")
-    click.echo(pipeline.RECORDING["lid_notice"])
+
+    def announce():
+        click.echo("Aufnahme laeuft, Ende mit Strg+C." if seconds is None else f"Aufnahme laeuft {seconds:g} s.")
+        click.echo(pipeline.RECORDING["lid_notice"])
+
     with pipeline.KeepAwake():
-        reports = session.run(seconds)
+        reports = session.run(seconds, announce)
     for report in reports:
         click.echo(f"{report['path']}: {report['seconds']:.1f} s, Ueberlaeufe: {report['overruns']}")
-    if session.mixing:
+    if session.final == session.mix_path:
         click.echo(f"{session.mix_path}: Mix")
-    if any(r["error"] for r in reports):
-        raise click.ClickException("Schreibfehler waehrend der Aufnahme: " + "; ".join(str(r["error"]) for r in reports if r["error"]))
+    problems = [f"{r['path']}: {r['problem']}" for r in reports if r["problem"]]
+    if problems:
+        raise click.ClickException("Probleme waehrend der Aufnahme: " + "; ".join(problems))
 
 
 @main.command(help="Audio transkribieren und im Archiv ablegen.")

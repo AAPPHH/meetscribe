@@ -10,7 +10,7 @@ import threading
 import time
 import unicodedata
 from bisect import bisect_left
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from datetime import date, datetime
 from pathlib import Path
 
@@ -59,6 +59,7 @@ RECORDING = {
     "mix_block_s": 30.0,
     "default_suffix": ".flac",
     "poll_s": 0.2,
+    "stall_s": 5.0,
     "lid_notice": "Hinweis: Deckel offen lassen, sonst kann der Rechner trotz Wachhalten in den Ruhezustand gehen.",
 }
 START = {
@@ -560,8 +561,15 @@ class Recorder:
         self.stream = None
         self.file = None
         self.thread = None
+        self.last_audio = time.monotonic()
+        self.stopped = False
+
+    @property
+    def name(self):
+        return self.device["name"]
 
     def _callback(self, indata, frames, time_info, status):
+        self.last_audio = time.monotonic()
         if status.input_overflow:
             self.overruns += 1
         self.queue.put(indata.copy())
@@ -572,6 +580,8 @@ class Recorder:
             block = self.queue.get()
             if block is None:
                 return
+            if self.error is not None:
+                continue
             try:
                 self.file.write(block)
                 self.frames += len(block)
@@ -579,35 +589,65 @@ class Recorder:
                     self.file.flush()
                     last = time.monotonic()
             except Exception as exc:
-                self.error = self.error or exc
+                self.error = exc
+
+    def problem(self):
+        if self.error is not None:
+            return f"Schreibfehler, dieser Eingang wird nicht weiter aufgezeichnet ({Reason.of(self.error)})"
+        silent = time.monotonic() - self.last_audio
+        if not self.stopped and silent > RECORDING["stall_s"]:
+            return f"kein Audio seit {silent:.0f} s (Geraet getrennt oder blockiert)"
+        return None
+
+    def open_error(self, exc):
+        return AudioError(
+            f"Audioeingang '{self.name}' konnte nicht geoeffnet werden: {Reason.of(exc)}. Bitte in den Windows-Einstellungen unter "
+            "Datenschutz und Sicherheit > Mikrofon den Zugriff fuer Apps und Desktop-Apps erlauben und pruefen, ob ein anderes "
+            "Programm das Geraet belegt."
+        )
 
     def start(self):
         import sounddevice as sd
-        rate, channels = self.rate, int(self.device["max_input_channels"])
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = sf.SoundFile(self.path, "w", samplerate=rate, channels=channels)
+        channels = int(self.device["max_input_channels"])
         extra = sd.WasapiSettings(auto_convert=True) if "WASAPI" in self.hostapi else None
         try:
             self.stream = sd.InputStream(
-                device=self.device["index"], channels=channels, samplerate=rate, dtype="float32",
+                device=self.device["index"], channels=channels, samplerate=self.rate, dtype="float32",
                 callback=self._callback, extra_settings=extra,
             )
+        except Exception as exc:
+            raise self.open_error(exc) from exc
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.file = sf.SoundFile(self.path, "w", samplerate=self.rate, channels=channels)
+        except Exception as exc:
+            self.stream.close()
+            raise AudioError(f"Aufnahmedatei konnte nicht angelegt werden ({self.path}): {Reason.of(exc)}") from exc
+        try:
+            self.last_audio = time.monotonic()
             self.stream.start()
-        except Exception:
+        except Exception as exc:
+            self.stream.close()
             self.file.close()
-            raise
+            self.path.unlink(missing_ok=True)
+            raise self.open_error(exc) from exc
         self.thread = threading.Thread(target=self._drain, daemon=True)
         self.thread.start()
 
     def stop(self):
+        self.stopped = True
         if self.stream is not None:
-            self.stream.stop()
-            self.stream.close()
+            for step in (self.stream.stop, self.stream.close):
+                with suppress(Exception):
+                    step()
         if self.thread is not None:
             self.queue.put(None)
             self.thread.join()
         if self.file is not None:
-            self.file.close()
+            try:
+                self.file.close()
+            except Exception as exc:
+                self.error = self.error or exc
         return {"path": str(self.path), "seconds": self.frames / self.rate, "overruns": self.overruns, "error": self.error}
 
 
@@ -645,6 +685,8 @@ class RecordingSession:
         self.out = Path(out) if Path(out).suffix else Path(out).with_suffix(RECORDING["default_suffix"])
         self.picker = picker
         self.recorders = None
+        self.problems = {}
+        self.final = None
 
     @property
     def mixing(self):
@@ -657,10 +699,6 @@ class RecordingSession:
     @property
     def mix_path(self):
         return Path(f"{self.out.with_suffix('')}.mix{self.out.suffix}")
-
-    @property
-    def final(self):
-        return self.mix_path if self.mixing else self.out
 
     def paths(self):
         if not self.mixing:
@@ -676,25 +714,63 @@ class RecordingSession:
         self.recorders = [Recorder(self.picker.pick(spec), paths[spec], self.picker.hostapis) for spec in self.specs]
         return self.recorders
 
-    def run(self, seconds=None):
-        recorders = self.recorders or self.prepare()
+    def begin(self, recorders):
         started = []
-        with Interrupt() as interrupt:
+        try:
+            for recorder in recorders:
+                recorder.start()
+                started.append(recorder)
+        except BaseException:
+            for recorder in started:
+                recorder.stop()
+                recorder.path.unlink(missing_ok=True)
+            raise
+        return started
+
+    def check(self, started):
+        healthy = []
+        for recorder in started:
+            problem = recorder.problem()
+            if problem is not None and recorder not in self.problems:
+                self.problems[recorder] = problem
+                click.echo(f"Warnung: Eingang '{recorder.device['name']}': {problem}", err=True)
+            if problem is None:
+                healthy.append(recorder)
+        return [r for r in healthy if r not in self.problems]
+
+    def settle(self, started, reports):
+        usable = [(r, rep) for r, rep in zip(started, reports) if rep["seconds"] > 0 and r.path.exists()]
+        if self.mixing and len(usable) == len(self.recorders) and not self.problems:
             try:
-                for recorder in recorders:
-                    recorder.start()
-                    started.append(recorder)
+                Mixer.mix([r.path for r, _ in usable], self.mix_path)
+                return self.mix_path
+            except Exception as exc:
+                self.mix_path.unlink(missing_ok=True)
+                click.echo(f"Warnung: Mix nicht moeglich ({Reason.of(exc)}), es wird eine Einzelaufnahme verwendet.", err=True)
+        best = max(usable, key=lambda pair: (pair[0] not in self.problems, pair[1]["seconds"]), default=None)
+        return best[0].path if best else None
+
+    def run(self, seconds=None, announce=None):
+        recorders = self.recorders or self.prepare()
+        self.problems, self.final = {}, None
+        with Interrupt() as interrupt:
+            started = self.begin(recorders)
+            try:
+                if announce:
+                    announce()
                 deadline = time.monotonic() + seconds if seconds else None
                 try:
                     while not interrupt.wait(RECORDING["poll_s"]) and (deadline is None or time.monotonic() < deadline):
-                        pass
+                        if not self.check(started):
+                            break
                 except KeyboardInterrupt:
                     pass
             finally:
+                self.check(started)
                 reports = [r.stop() for r in started]
-            if self.mixing and len(started) == len(recorders):
-                Mixer.mix([r.path for r in recorders], self.mix_path)
-        return reports
+                self.check(started)
+            self.final = self.settle(started, reports)
+        return [{**report, "problem": self.problems.get(r)} for r, report in zip(started, reports)]
 
 
 class StartFlow:
@@ -749,15 +825,23 @@ class StartFlow:
         for recorder in self.session.prepare():
             click.echo(f"Eingang: {recorder.device['name']} [{recorder.hostapi}]")
 
-    def record(self):
+    def announce(self):
         click.echo(RECORDING["lid_notice"])
         click.echo("Aufnahme laeuft, Ende mit Strg+C.")
-        reports = self.session.run()
+
+    def record(self):
+        reports = self.session.run(announce=self.announce)
+        for report in reports:
+            if report["overruns"]:
+                click.echo(f"Ueberlaeufe: {report['overruns']} ({report['path']})")
         path = self.session.final
-        click.echo(f"Aufnahme gespeichert: {path} ({max(r['seconds'] for r in reports):.0f} s)")
-        errors = [str(r["error"]) for r in reports if r["error"]]
-        if errors:
-            raise PipelineError(f"Schreibfehler waehrend der Aufnahme ({path}): " + "; ".join(errors))
+        if path is None:
+            details = "; ".join(f"{r['path']}: {r['problem'] or 'leer'}" for r in reports)
+            raise PipelineError(f"Keine brauchbare Aufnahme gespeichert ({details}). Vorhandene Dateien bleiben erhalten.")
+        used = reports if path == self.session.mix_path else [r for r in reports if Path(r["path"]) == path]
+        click.echo(f"Aufnahme gespeichert: {path} ({max(r['seconds'] for r in used):.0f} s)")
+        if self.session.problems:
+            click.echo(f"Warnung: Aufnahme unvollstaendig, transkribiert wird nur {path}.", err=True)
         return path
 
     def fail(self, audio, exc):

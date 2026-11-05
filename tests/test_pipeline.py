@@ -1,6 +1,8 @@
 import shutil
 import signal
 import threading
+import time
+import types
 
 import numpy as np
 import pytest
@@ -297,6 +299,9 @@ class StubRecorder:
     def start(self):
         sf.write(self.path, noise(1.0), RATE)
 
+    def problem(self):
+        return None
+
     def stop(self):
         return {"path": str(self.path), "seconds": 1.0, "overruns": 0, "error": None}
 
@@ -305,8 +310,9 @@ def test_single_mic_named_mix_is_not_mixed(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "Recorder", StubRecorder)
     picker = InputPicker([{"name": "Stereomix", "hostapi": 0, "max_input_channels": 2, "default_samplerate": 16000.0}], ["MME"])
     session = RecordingSession("mix", tmp_path / "rec.flac", picker)
-    assert not session.mixing and session.final == tmp_path / "rec.flac"
+    assert not session.mixing
     session.run(seconds=0.05)
+    assert session.final == tmp_path / "rec.flac"
     assert sf.info(tmp_path / "rec.flac").frames == RATE
 
 
@@ -319,6 +325,125 @@ def test_recording_refuses_to_overwrite(tmp_path):
     with pytest.raises(AudioError):
         RecordingSession("both", tmp_path / "both.flac", picker).prepare()
     assert (tmp_path / "rec.flac").read_bytes() == b"audio"
+
+
+class ScriptedRecorder:
+    def __init__(self, name, path, seconds, fails_after=None, fails_to_start=False):
+        self.device, self.path, self.seconds, self.fails_after, self.fails_to_start = {"name": name}, path, seconds, fails_after, fails_to_start
+        self.began = None
+
+    def start(self):
+        if self.fails_to_start:
+            raise AudioError("Eingang belegt")
+        sf.write(self.path, noise(self.seconds), RATE)
+        self.began = time.monotonic()
+
+    def problem(self):
+        broken = self.fails_after is not None and time.monotonic() - self.began > self.fails_after
+        return "kein Audio seit 6 s" if broken else None
+
+    def stop(self):
+        return {"path": str(self.path), "seconds": self.seconds, "overruns": 0, "error": None}
+
+
+def scripted_session(tmp_path, monkeypatch, *recorders):
+    monkeypatch.setitem(pipeline.RECORDING, "poll_s", 0.02)
+    session = RecordingSession("both", tmp_path / "rec.flac", InputPicker(DEVICES, HOSTAPIS))
+    paths = session.paths()
+    session.recorders = [rec(paths[name]) for name, rec in zip(("dji", "laptop"), recorders)]
+    return session
+
+
+def test_recording_keeps_healthy_input_and_uses_its_file_when_mix_is_impossible(tmp_path, monkeypatch, capsys):
+    session = scripted_session(
+        tmp_path, monkeypatch,
+        lambda path: ScriptedRecorder("DJI", path, 1.0, fails_after=0.05),
+        lambda path: ScriptedRecorder("Laptop", path, 3.0),
+    )
+    started = time.monotonic()
+    reports = session.run(seconds=0.5)
+    assert time.monotonic() - started >= 0.5
+    warnings = [line for line in capsys.readouterr().err.splitlines() if line.startswith("Warnung")]
+    assert warnings == ["Warnung: Eingang 'DJI': kein Audio seit 6 s"]
+    assert session.final == tmp_path / "rec.laptop.flac" and not session.mix_path.exists()
+    assert [r["problem"] for r in reports] == ["kein Audio seit 6 s", None]
+
+
+def test_recording_stops_when_no_input_is_healthy_and_keeps_longest_file(tmp_path, monkeypatch, capsys):
+    session = scripted_session(
+        tmp_path, monkeypatch,
+        lambda path: ScriptedRecorder("DJI", path, 1.0, fails_after=0.05),
+        lambda path: ScriptedRecorder("Laptop", path, 3.0, fails_after=0.05),
+    )
+    started = time.monotonic()
+    session.run(seconds=30)
+    assert time.monotonic() - started < 5
+    assert capsys.readouterr().err.count("Warnung: Eingang") == 2
+    assert session.final == tmp_path / "rec.laptop.flac"
+
+
+def test_recording_mixes_when_all_inputs_are_healthy_and_announces_after_start(tmp_path, monkeypatch, capsys):
+    session = scripted_session(
+        tmp_path, monkeypatch, lambda path: ScriptedRecorder("DJI", path, 1.0), lambda path: ScriptedRecorder("Laptop", path, 1.0),
+    )
+    seen = []
+    session.run(seconds=0.1, announce=lambda: seen.append([r.path.exists() for r in session.recorders]))
+    assert seen == [[True, True]] and session.final == session.mix_path and session.mix_path.exists()
+    assert "Warnung" not in capsys.readouterr().err
+
+
+def test_recording_start_failure_removes_files_of_already_started_inputs(tmp_path, monkeypatch):
+    session = scripted_session(
+        tmp_path, monkeypatch, lambda path: ScriptedRecorder("DJI", path, 1.0), lambda path: ScriptedRecorder("Laptop", path, 1.0, fails_to_start=True),
+    )
+    seen = []
+    with pytest.raises(AudioError, match="belegt"):
+        session.run(seconds=0.1, announce=lambda: seen.append(1))
+    assert seen == [] and list(tmp_path.iterdir()) == []
+
+
+def test_recording_without_usable_audio_has_no_final_file(tmp_path, monkeypatch):
+    session = scripted_session(tmp_path, monkeypatch, lambda path: ScriptedRecorder("DJI", path, 0.0), lambda path: ScriptedRecorder("Laptop", path, 0.0))
+    session.run(seconds=0.05)
+    assert session.final is None
+
+
+MIC = {"name": "Testmikro", "hostapi": 0, "max_input_channels": 1, "default_samplerate": 16000.0}
+
+
+def block():
+    return np.full((160, 1), 0.1, dtype="float32")
+
+
+def test_recorder_reports_write_errors_and_stops_writing(tmp_path):
+    class Broken:
+        writes = 0
+
+        def write(self, data):
+            Broken.writes += 1
+            raise OSError("Datentraeger voll")
+
+        def close(self):
+            pass
+
+    recorder = pipeline.Recorder(MIC, tmp_path / "a.flac")
+    recorder.file, recorder.thread = Broken(), threading.Thread(target=recorder._drain)
+    recorder.thread.start()
+    for _ in range(5):
+        recorder._callback(block(), 160, None, types.SimpleNamespace(input_overflow=False))
+    report = recorder.stop()
+    assert Broken.writes == 1 and report["seconds"] == 0
+    assert "Schreibfehler" in recorder.problem() and "Datentraeger voll" in recorder.problem() and report["error"] is not None
+
+
+def test_recorder_flags_missing_callbacks_after_threshold(tmp_path, monkeypatch):
+    monkeypatch.setitem(pipeline.RECORDING, "stall_s", 0.05)
+    recorder = pipeline.Recorder(MIC, tmp_path / "a.flac")
+    assert recorder.problem() is None
+    time.sleep(0.1)
+    assert "kein Audio seit" in recorder.problem()
+    recorder._callback(block(), 160, None, types.SimpleNamespace(input_overflow=False))
+    assert recorder.problem() is None
 
 
 def test_mixer_stretches_to_equal_length(tmp_path):

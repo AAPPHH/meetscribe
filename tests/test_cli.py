@@ -2,7 +2,9 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import threading
+import types
 from datetime import date
 from pathlib import Path
 
@@ -13,6 +15,8 @@ from click.testing import CliRunner
 
 from meetscribe import cli, pipeline
 from meetscribe.store import HotFile, Store, make_config
+
+REAL_RECORDER = pipeline.Recorder
 
 WORDS = [
     ("Grüße", 0.2, 0.6), ("aus", 0.6, 0.8), ("München", 0.8, 1.2),
@@ -56,6 +60,9 @@ class FakeDiarizer:
 class FakeRecorder:
     started = []
     interrupt_with = "signal"
+    problem_text = None
+    seconds = 1.0
+    overruns = 0
 
     def __init__(self, device, path, hostapis=()):
         self.device, self.path, self.rate, self.hostapi = device, path, 16000, hostapis[device["hostapi"]]
@@ -67,8 +74,11 @@ class FakeRecorder:
         if FakeRecorder.interrupt_with == "signal":
             threading.Timer(0.05, signal.raise_signal, [signal.SIGINT]).start()
 
+    def problem(self):
+        return FakeRecorder.problem_text
+
     def stop(self):
-        return {"path": str(self.path), "seconds": 1.0, "overruns": 0, "error": None}
+        return {"path": str(self.path), "seconds": FakeRecorder.seconds, "overruns": FakeRecorder.overruns, "error": None}
 
 
 @pytest.fixture
@@ -88,6 +98,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "Diarizer", FakeDiarizer)
     monkeypatch.setattr(pipeline, "Recorder", FakeRecorder)
     FakeRecorder.started, FakeRecorder.interrupt_with = [], "signal"
+    FakeRecorder.problem_text, FakeRecorder.seconds, FakeRecorder.overruns = None, 1.0, 0
     monkeypatch.setattr(pipeline.AudioDevices, "sounddevice_picker", staticmethod(lambda: pipeline.InputPicker([LAPTOP, DJI], ["MME"])))
     monkeypatch.setattr(pipeline.shutil, "which", lambda name: "ffmpeg")
     monkeypatch.setenv("MEETSCRIBE_REPORTS", str(tmp_path / "protokolle"))
@@ -534,3 +545,91 @@ def test_start_open_failure_warns_with_path_and_still_rotates(env, monkeypatch):
     assert result.exit_code == 0, result.output
     assert f"Warnung: Protokoll konnte nicht geoeffnet werden ({reports(env)[0]}): OSError: keine Zuordnung" in result.output
     assert rotated == [30] and len(reports(env)) == 1
+
+
+def test_start_transcribes_partial_recording_with_warning(env):
+    FakeRecorder.problem_text = "kein Audio seit 6 s (Geraet getrennt oder blockiert)"
+    result = start("--no-diarize", "--no-open")
+    assert result.exit_code == 0, result.output
+    assert result.output.count("Warnung: Eingang") == 1 and "Warnung: Aufnahme unvollstaendig" in result.output
+    assert len(recordings(env)) == 1 and len(reports(env)) == 1
+
+
+def test_start_without_usable_recording_fails_and_keeps_audio(env):
+    FakeRecorder.problem_text, FakeRecorder.seconds = "Schreibfehler, dieser Eingang wird nicht weiter aufgezeichnet (OSError: disk)", 0.0
+    result = start("--no-diarize", "--no-open")
+    assert result.exit_code == 1 and "Traceback" not in result.output and "Keine brauchbare Aufnahme gespeichert" in result.output
+    assert len(recordings(env)) == 1 and not reports(env) and not env["store"].hot_files() and env["loaded"] == []
+
+
+def test_start_prints_overruns_only_when_present(env):
+    assert "Ueberlaeufe" not in start("--no-diarize", "--no-open").output
+    FakeRecorder.overruns = 3
+    result = start("--no-diarize", "--no-open")
+    assert result.exit_code == 0 and any(f"Ueberlaeufe: 3 ({path})" in result.output for path in recordings(env))
+
+
+def test_record_reports_problems_after_live_warning(env):
+    FakeRecorder.problem_text = "kein Audio seit 6 s (Geraet getrennt oder blockiert)"
+    result = invoke("record", "--out", env["tmp"] / "r.flac", "--seconds", "5")
+    assert result.exit_code == 1 and result.output.count("kein Audio seit 6 s") == 2 and "Probleme waehrend der Aufnahme" in result.output
+
+
+class FakeStream:
+    fail = None
+    instances = []
+
+    def __init__(self, **options):
+        if FakeStream.fail == "open":
+            raise OSError("Error opening InputStream: Invalid device [PaErrorCode -9996]")
+        self.callback = options["callback"]
+        self.timer = threading.Timer(0, int)
+        FakeStream.instances.append(self)
+
+    def start(self):
+        if FakeStream.fail == "start":
+            raise OSError("Error starting stream: Device unavailable [PaErrorCode -9985]")
+        for _ in range(3):
+            self.callback(np.full((1600, 2), 0.1, dtype="float32"), 1600, None, types.SimpleNamespace(input_overflow=False))
+        self.timer = threading.Timer(0.3, signal.raise_signal, [signal.SIGINT])
+        self.timer.start()
+
+    def stop(self):
+        self.timer.cancel()
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def real_recorder(env, monkeypatch):
+    FakeStream.fail, FakeStream.instances = None, []
+    monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(InputStream=FakeStream, WasapiSettings=lambda **kw: kw))
+    monkeypatch.setattr(pipeline, "Recorder", REAL_RECORDER)
+    monkeypatch.setattr(pipeline.AudioDevices, "sounddevice_picker", staticmethod(lambda: pipeline.InputPicker([{**LAPTOP, "index": 0}], ["MME"])))
+    return env
+
+
+@pytest.mark.parametrize("stage", ["open", "start"])
+def test_start_stream_open_failure_aborts_cleanly_and_a_later_start_works(real_recorder, stage):
+    env = real_recorder
+    FakeStream.fail = stage
+    result = start("--no-diarize", "--no-open")
+    assert result.exit_code == 1 and "Traceback" not in result.output
+    assert "Datenschutz" in result.output and "Mikrofon" in result.output and "belegt" in result.output
+    assert "Aufnahme laeuft" not in result.output and "Aufnahme gespeichert" not in result.output
+    assert not list((env["tmp"] / "data" / "aufnahmen").glob("*")) and not reports(env)
+    FakeStream.fail = None
+    again = start("--no-diarize", "--no-open")
+    assert again.exit_code == 0, again.output
+    assert again.output.index("Aufnahme laeuft") < again.output.index("Aufnahme gespeichert")
+    assert len(recordings(env)) == 1 and sf.info(recordings(env)[0]).frames == 4800 and len(reports(env)) == 1
+
+
+def test_record_stream_open_failure_leaves_no_file(real_recorder):
+    FakeStream.fail = "start"
+    out = real_recorder["tmp"] / "r.flac"
+    result = invoke("record", "--out", out, "--seconds", "1")
+    assert result.exit_code == 1 and "Datenschutz" in result.output and "Aufnahme laeuft" not in result.output and not out.exists()
+    FakeStream.fail = None
+    assert invoke("record", "--out", out, "--seconds", "5").exit_code == 0 and out.exists()

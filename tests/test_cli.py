@@ -759,3 +759,151 @@ def test_json_devices_lists_inputs_and_openvino(env, monkeypatch):
     monkeypatch.setattr(pipeline.AudioDevices, "sounddevice_picker", staticmethod(broken))
     data = parsed(invoke("--json", "devices"))
     assert data["inputs"] == [] and "kein Treiber" in data["inputs_error"] and data["openvino"]
+
+
+def events_of(result):
+    return [json.loads(line) for line in result.stdout.splitlines()]
+
+
+def names(events):
+    return [e["event"] for e in events]
+
+
+class StdinFeed:
+    def __init__(self, monkeypatch, payload, close):
+        self.read_end, self.write_end = os.pipe()
+        self.payload, self.close = payload, close
+        self.fired = []
+        monkeypatch.setitem(pipeline.START, "stdin_fd", self.read_end)
+        FakeRecorder.interrupt_with = "none"
+        self.watchdog = threading.Timer(8, lambda: (self.fired.append(True), signal.raise_signal(signal.SIGINT)))
+        self.writer = threading.Thread(target=self.feed, daemon=True)
+
+    def feed(self):
+        deadline = time.monotonic() + 8
+        while not FakeRecorder.started and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.3)
+        if self.payload:
+            os.write(self.write_end, self.payload)
+        if self.close:
+            os.close(self.write_end)
+
+    def __enter__(self):
+        self.watchdog.start()
+        self.writer.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.watchdog.cancel()
+        self.writer.join()
+        for fd in (self.read_end, *([] if self.close else [self.write_end])):
+            os.close(fd)
+        assert not self.fired
+        return False
+
+
+def test_start_events_with_audiofile_emit_stage_events_without_prompts(env, monkeypatch):
+    add_pyannote(env)
+    opened = []
+    monkeypatch.setattr(cli, "stdin_is_tty", lambda: True)
+    monkeypatch.setattr(os, "startfile", opened.append, raising=False)
+    result = start("--events", "--speakers", "2", env["audio"], input="Anna\n\n")
+    assert result.exit_code == 0, result.output
+    events = events_of(result)
+    assert names(events) == ["preflight", "transcribing", "done"]
+    assert events[1]["audio"] == str(env["audio"])
+    done = events[2]
+    assert done["meeting_id"].endswith("-wochenplanung")
+    assert done["report"] == str(reports(env)[0]) and done["audio"] == str(env["audio"]) and done["segments"] == 2 and done["speakers"] == 2
+    assert done["labels"] == [{"label": "SPEAKER_00", "sample": "Grüße aus München"}, {"label": "SPEAKER_01", "sample": "Schön dass Sie da"}]
+    assert opened == [] and "Name fuer" not in result.output
+    assert "Anna" not in reports(env)[0].read_text(encoding="utf-8")
+
+
+def test_start_events_recording_event_names_input_and_path(env):
+    result = start("--events", "--no-diarize")
+    assert result.exit_code == 0, result.output
+    events = events_of(result)
+    assert names(events) == ["preflight", "recording", "transcribing", "done"]
+    assert events[1]["input"] == DJI["name"] and events[1]["path"] == str(recordings(env)[0])
+    assert events[2]["audio"] == str(recordings(env)[0]) and events[3]["audio"] == str(recordings(env)[0]) and events[3]["labels"] == []
+    assert all(line.isascii() for line in result.stdout.splitlines())
+    both = events_of(start("--events", "--no-diarize", "--mic", "both"))
+    assert both[1]["input"] == f"{DJI['name']} + {LAPTOP['name']}" and both[1]["path"].endswith(".mix.flac")
+
+
+def test_start_stdin_stop_ends_recording_on_line(env, monkeypatch):
+    with StdinFeed(monkeypatch, b"stop\n", close=False):
+        result = start("--events", "--stdin-stop", "--no-diarize")
+    assert result.exit_code == 0, result.output
+    assert names(events_of(result)) == ["preflight", "recording", "transcribing", "done"]
+    assert len(recordings(env)) == 1 and len(reports(env)) == 1
+
+
+def test_start_stdin_stop_ends_recording_when_stdin_closes_and_keeps_audio(env, monkeypatch):
+    with StdinFeed(monkeypatch, b"", close=True):
+        result = start("--events", "--stdin-stop", "--no-diarize")
+    assert result.exit_code == 0, result.output
+    assert names(events_of(result)) == ["preflight", "recording", "transcribing", "done"]
+    assert len(recordings(env)) == 1 and sf.info(recordings(env)[0]).frames > 0
+
+
+def test_start_stdin_stop_keeps_audio_when_processing_fails(env, monkeypatch):
+    FakeEngine.fail_devices = ("npu", "gpu", "cpu")
+    with StdinFeed(monkeypatch, b"", close=True):
+        result = start("--events", "--stdin-stop", "--no-diarize")
+    assert result.exit_code == 1
+    error = events_of(result)[-1]
+    assert error["event"] == "error" and error["audio"] == str(recordings(env)[0]) and error["meeting_id"] is None and error["exit_code"] == 1
+    assert error["retry"].startswith("meetscribe start ") and str(recordings(env)[0]) in error["retry"] and "--events" in error["retry"]
+    assert recordings(env)[0].exists() and not reports(env)
+
+
+def test_start_stdin_stop_works_without_events_and_prints_no_json(env, monkeypatch):
+    with StdinFeed(monkeypatch, b"x\n", close=False):
+        result = start("--stdin-stop", "--no-diarize", "--no-open")
+    assert result.exit_code == 0 and "Aufnahme gespeichert" in result.output and not result.stdout.lstrip().startswith("{")
+
+
+def test_start_events_preflight_failure_is_an_error_event_without_audio(env):
+    result = start("--events")
+    assert result.exit_code == 1 and names(events_of(result)) == ["preflight", "error"]
+    error = events_of(result)[-1]
+    assert "Diarisierungsmodell fehlt" in error["message"] and error["audio"] is None and error["retry"] is None and error["exit_code"] == 1
+    assert FakeRecorder.started == [] and not recordings(env)
+
+
+def test_start_events_post_processing_failure_names_saved_meeting(env, monkeypatch):
+    def broken(self, meeting_id):
+        raise OSError("gesperrt")
+
+    monkeypatch.setattr(pipeline.StartFlow, "write_report", broken)
+    result = start("--events", "--no-diarize", env["audio"])
+    assert result.exit_code == 1 and names(events_of(result))[-1] == "error"
+    error = events_of(result)[-1]
+    assert error["meeting_id"] and error["retry"] == f"meetscribe report {error['meeting_id']}" and error["audio"] == str(env["audio"])
+
+
+def test_start_events_warnings_for_fallback_and_input_problems(env):
+    FakeEngine.fail_devices = ("npu",)
+    FakeRecorder.problem_text = "kein Audio seit 6 s (Geraet getrennt oder blockiert)"
+    FakeRecorder.overruns = 2
+    result = start("--events", "--no-diarize")
+    assert result.exit_code == 0, result.output
+    warnings = [e["message"] for e in events_of(result) if e["event"] == "warning"]
+    assert any(m.startswith("Eingang") for m in warnings) and any(m.startswith("NPU fehlgeschlagen") for m in warnings)
+    assert any(m.startswith("Aufnahme unvollstaendig") for m in warnings) and any(m.startswith("Ueberlaeufe: 2") for m in warnings)
+    assert all(not m.startswith("Warnung") for m in warnings)
+
+
+def test_start_events_keep_stdout_clean_of_foreign_prints(env, monkeypatch):
+    original = pipeline.StartFlow.process
+
+    def noisy(self, audio):
+        print("Fremdausgabe einer Bibliothek")
+        return original(self, audio)
+
+    monkeypatch.setattr(pipeline.StartFlow, "process", noisy)
+    result = start("--events", "--no-diarize", env["audio"])
+    assert result.exit_code == 0 and all(line.startswith("{") for line in result.stdout.splitlines())

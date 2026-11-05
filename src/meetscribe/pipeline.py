@@ -18,7 +18,7 @@ import click
 import numpy as np
 import soundfile as sf
 
-from meetscribe.store import PROJECT_ROOT, Query, Report, ReportFile, as_date
+from meetscribe.store import PROJECT_ROOT, Json, Query, Report, ReportFile, as_date
 
 DEVICES = ("npu", "gpu", "cpu")
 WHISPER_INT8 = {"repo": "OpenVINO/whisper-large-v3-turbo-int8-ov", "dir": "whisper-large-v3-turbo-int8-ov"}
@@ -71,6 +71,7 @@ START = {
     "rotate_days": 30,
     "sentence_chars": 140,
     "program": "meetscribe",
+    "stdin_fd": 0,
 }
 AWAKE_FLAGS = {"continuous": 0x80000000, "system_required": 0x00000001}
 
@@ -199,6 +200,56 @@ class KeepAwake:
         if self.call:
             self.call(AWAKE_FLAGS["continuous"])
         return False
+
+
+class Reporter:
+    machine = False
+
+    def say(self, text="", err=False):
+        click.echo(text, err=err)
+
+    def warn(self, text, prefix="Warnung: "):
+        click.echo(prefix + text, err=True)
+
+    def event(self, name, **data):
+        pass
+
+
+class EventReporter(Reporter):
+    machine = True
+
+    def __init__(self, stream=None):
+        self.stream = stream or sys.stdout
+
+    def say(self, text="", err=False):
+        pass
+
+    def warn(self, text, prefix=None):
+        self.event("warning", message=text)
+
+    def event(self, name, **data):
+        click.echo(Json.dumps({"event": name, **data}), file=self.stream)
+
+
+class StdinWatcher:
+    def __init__(self, fd=None):
+        self.fd = START["stdin_fd"] if fd is None else fd
+        self.event = threading.Event()
+
+    def _read(self):
+        try:
+            while (chunk := os.read(self.fd, 4096)) and b"\n" not in chunk:
+                pass
+        except OSError:
+            pass
+        self.event.set()
+
+    def start(self):
+        threading.Thread(target=self._read, daemon=True).start()
+        return self
+
+    def is_set(self):
+        return self.event.is_set()
 
 
 class Interrupt:
@@ -356,7 +407,8 @@ class WhisperEngine:
 
 
 class ASRRunner:
-    def __init__(self, devices, factory, fallback=True):
+    def __init__(self, devices, factory, fallback=True, reporter=None):
+        self.reporter = reporter or Reporter()
         self.devices = list(devices)
         self.factory = factory
         self.fallback = fallback
@@ -374,7 +426,7 @@ class ASRRunner:
             except Exception as exc:
                 self.engine = None
                 gc.collect()
-                click.echo(f"{device.upper()} fehlgeschlagen: {Reason.of(exc)}", err=True)
+                self.reporter.warn(f"{device.upper()} fehlgeschlagen: {Reason.of(exc)}", prefix="")
                 self.index += 1
                 if not self.fallback:
                     raise ASRFailure(f"Transkription auf {device.upper()} fehlgeschlagen (--no-fallback).") from exc
@@ -472,7 +524,8 @@ class Naming:
 
 class TranscribeJob:
     def __init__(self, store, audio, device, language, models=None, model=None, title=None, day=None, meeting_id=None,
-                 diarize=True, fallback=True, speakers=None, min_speakers=None, max_speakers=None):
+                 diarize=True, fallback=True, speakers=None, min_speakers=None, max_speakers=None, reporter=None):
+        self.reporter = reporter
         self.store = store
         self.audio = Path(audio)
         self.device = device.lower()
@@ -516,7 +569,7 @@ class TranscribeJob:
         audio = AudioLoader.load(self.audio)
         turns = Diarizer(self.models).diarize(audio, **self.speaker_options) if self.diarize else []
         gc.collect()
-        runner = ASRRunner(self.chain, lambda d: WhisperEngine(d, self.models, self.language, self.model), self.fallback)
+        runner = ASRRunner(self.chain, lambda d: WhisperEngine(d, self.models, self.language, self.model), self.fallback, self.reporter)
         with self.store.writer(meeting_id, title=self.title, meeting_date=self.day, language=self.language, discard_on_error=True) as writer:
             summary = Transcriber(runner).run(audio, turns, writer)
         if not summary["segments"]:
@@ -690,7 +743,8 @@ class Mixer:
 
 
 class RecordingSession:
-    def __init__(self, mic, out, picker):
+    def __init__(self, mic, out, picker, reporter=None):
+        self.reporter = reporter or Reporter()
         self.mic = mic
         self.out = Path(out) if Path(out).suffix else Path(out).with_suffix(RECORDING["default_suffix"])
         self.picker = picker
@@ -743,7 +797,7 @@ class RecordingSession:
             problem = recorder.problem()
             if problem is not None and recorder not in self.problems:
                 self.problems[recorder] = problem
-                click.echo(f"Warnung: Eingang '{recorder.device['name']}': {problem}", err=True)
+                self.reporter.warn(f"Eingang '{recorder.device['name']}': {problem}")
             if problem is None:
                 healthy.append(recorder)
         return [r for r in healthy if r not in self.problems]
@@ -756,11 +810,11 @@ class RecordingSession:
                 return self.mix_path
             except Exception as exc:
                 self.mix_path.unlink(missing_ok=True)
-                click.echo(f"Warnung: Mix nicht moeglich ({Reason.of(exc)}), es wird eine Einzelaufnahme verwendet.", err=True)
+                self.reporter.warn(f"Mix nicht moeglich ({Reason.of(exc)}), es wird eine Einzelaufnahme verwendet.")
         best = max(usable, key=lambda pair: (pair[0] not in self.problems, pair[1]["seconds"]), default=None)
         return best[0].path if best else None
 
-    def run(self, seconds=None, announce=None):
+    def run(self, seconds=None, announce=None, stop=None):
         recorders = self.recorders or self.prepare()
         self.problems, self.final = {}, None
         with Interrupt() as interrupt:
@@ -770,7 +824,7 @@ class RecordingSession:
                     announce()
                 deadline = time.monotonic() + seconds if seconds else None
                 try:
-                    while not interrupt.wait(RECORDING["poll_s"]) and (deadline is None or time.monotonic() < deadline):
+                    while not interrupt.wait(RECORDING["poll_s"]) and not (stop and stop.is_set()) and (deadline is None or time.monotonic() < deadline):
                         if not self.check(started):
                             break
                 except KeyboardInterrupt:
@@ -785,7 +839,8 @@ class RecordingSession:
 
 class StartFlow:
     def __init__(self, store, audio=None, mic=None, device="npu", title=None, speakers=None, diarize=True,
-                 open_report=True, tty=False, models=None, picker=None):
+                 open_report=True, tty=False, models=None, picker=None, reporter=None, stdin_stop=False):
+        self.reporter = reporter or Reporter()
         self.store = store
         self.audio = Path(audio) if audio else None
         self.mic = mic
@@ -793,19 +848,21 @@ class StartFlow:
         self.title = title
         self.speakers = speakers
         self.diarize = diarize
-        self.open_report = open_report
-        self.tty = tty
+        self.open_report = open_report and not self.reporter.machine
+        self.tty = tty and not self.reporter.machine
         self.models = models or Models()
         self.picker = picker
+        self.watcher = StdinWatcher() if stdin_stop else None
         self.session = None
         self.job = None
+        self.result = None
 
     def retry_command(self, audio):
         parts = [START["program"], "start", str(audio), "--device", self.device]
         for flag, value in (("--title", self.title), ("--speakers", self.speakers)):
             if value is not None:
                 parts += [flag, str(value)]
-        parts += [flag for flag, active in (("--no-diarize", not self.diarize), ("--no-open", not self.open_report)) if active]
+        parts += [flag for flag, active in (("--no-diarize", not self.diarize), ("--no-open", not self.open_report), ("--events", self.reporter.machine)) if active]
         return subprocess.list2cmdline(parts)
 
     def recording_path(self):
@@ -818,11 +875,12 @@ class StartFlow:
         return candidate
 
     def preflight(self):
+        self.reporter.event("preflight")
         AudioLoader.require()
         planned = self.audio or self.recording_path()
         self.job = TranscribeJob(
             self.store, planned, self.device, SETTINGS["language"], models=self.models, title=self.title,
-            diarize=self.diarize, speakers=self.speakers,
+            diarize=self.diarize, speakers=self.speakers, reporter=self.reporter,
         )
         self.job.check()
         if self.audio is not None:
@@ -831,68 +889,82 @@ class StartFlow:
             picker = self.picker or AudioDevices.sounddevice_picker()
         except Exception as exc:
             raise DeviceError(f"Audio-Eingaenge nicht lesbar: {Reason.of(exc)}") from exc
-        self.session = RecordingSession(self.mic or picker.auto(), planned, picker)
+        self.session = RecordingSession(self.mic or picker.auto(), planned, picker, self.reporter)
         for recorder in self.session.prepare():
-            click.echo(f"Eingang: {recorder.device['name']} [{recorder.hostapi}]")
+            self.reporter.say(f"Eingang: {recorder.device['name']} [{recorder.hostapi}]")
 
     def announce(self):
-        click.echo(RECORDING["lid_notice"])
-        click.echo("Aufnahme laeuft, Ende mit Strg+C.")
+        self.reporter.say(RECORDING["lid_notice"])
+        self.reporter.say("Aufnahme laeuft, Ende mit Strg+C.")
+        names = " + ".join(r.device["name"] for r in self.session.recorders)
+        self.reporter.event("recording", input=names, path=str(self.session.mix_path if self.session.mixing else self.session.out))
+        if self.watcher:
+            self.watcher.start()
 
     def record(self):
-        reports = self.session.run(announce=self.announce)
+        reports = self.session.run(announce=self.announce, stop=self.watcher)
         for report in reports:
             if report["overruns"]:
-                click.echo(f"Ueberlaeufe: {report['overruns']} ({report['path']})")
+                self.reporter.say(f"Ueberlaeufe: {report['overruns']} ({report['path']})")
+                self.reporter.event("warning", message=f"Ueberlaeufe: {report['overruns']} ({report['path']})")
         path = self.session.final
         if path is None:
             details = "; ".join(f"{r['path']}: {r['problem'] or 'leer'}" for r in reports)
             raise PipelineError(f"Keine brauchbare Aufnahme gespeichert ({details}). Vorhandene Dateien bleiben erhalten.")
         used = reports if path == self.session.mix_path else [r for r in reports if Path(r["path"]) == path]
-        click.echo(f"Aufnahme gespeichert: {path} ({max(r['seconds'] for r in used):.0f} s)")
+        self.reporter.say(f"Aufnahme gespeichert: {path} ({max(r['seconds'] for r in used):.0f} s)")
         if self.session.problems:
-            click.echo(f"Warnung: Aufnahme unvollstaendig, transkribiert wird nur {path}.", err=True)
+            self.reporter.warn(f"Aufnahme unvollstaendig, transkribiert wird nur {path}.")
         return path
 
     def fail(self, audio, exc, saved=None):
         interrupted = isinstance(exc, KeyboardInterrupt)
         stage = "Nachbearbeitung" if saved else "Verarbeitung"
-        click.echo(f"{stage} abgebrochen." if interrupted else f"{stage} fehlgeschlagen: {Reason.of(exc)}", err=True)
-        click.echo(f"Audio erhalten: {audio}", err=True)
+        message = f"{stage} abgebrochen." if interrupted else f"{stage} fehlgeschlagen: {Reason.of(exc)}"
+        retry = f"{START['program']} report {saved}" if saved else self.retry_command(audio)
+        self.reporter.say(message, err=True)
+        self.reporter.say(f"Audio erhalten: {audio}", err=True)
         if saved:
-            click.echo(f"Besprechung gespeichert: {saved}", err=True)
-            click.echo(f"Protokoll erneut erzeugen: {START['program']} report {saved} (nicht erneut start, das legt eine zweite Besprechung an)", err=True)
+            self.reporter.say(f"Besprechung gespeichert: {saved}", err=True)
+            self.reporter.say(f"Protokoll erneut erzeugen: {retry} (nicht erneut start, das legt eine zweite Besprechung an)", err=True)
         else:
-            click.echo(f"Erneut versuchen: {self.retry_command(audio)}", err=True)
-        raise click.exceptions.Exit(130 if interrupted else 1)
+            self.reporter.say(f"Erneut versuchen: {retry}", err=True)
+        code = 130 if interrupted else 1
+        self.reporter.event("error", message=message, audio=str(audio), meeting_id=saved, retry=retry, exit_code=code)
+        raise click.exceptions.Exit(code)
 
     def process(self, audio):
         self.job.audio = Path(audio)
         self.job.requested_id = Naming.meeting_id(self.store, self.job.day, self.title or self.job.audio.stem)
         started = time.monotonic()
+        self.reporter.event("transcribing", audio=str(audio))
         try:
-            result = self.job.run()
-            if not result["segments"]:
+            self.result = self.job.run()
+            if not self.result["segments"]:
                 raise PipelineError("Keine Sprache erkannt, kein Protokoll erstellt")
         except (Exception, KeyboardInterrupt) as exc:
             self.fail(audio, exc)
-        click.echo(
+        result = self.result
+        self.reporter.say(
             f"{result['meeting_id']}: {result['segments']} Segmente, {result['speakers']} Sprecher, "
             f"Geraet: {' -> '.join(result['used']) or '-'}, {time.monotonic() - started:.0f} s"
         )
         return result["meeting_id"]
 
-    def name_speakers(self, meeting_id):
-        if not self.tty:
-            return
+    def samples(self, meeting_id):
         _, rows = Query(self.store).execute(
             "SELECT speaker, arg_max(text, end_s - start_s) FROM segments WHERE meeting_id = ? AND speaker <> ? "
             "GROUP BY speaker ORDER BY speaker",
             [meeting_id, SETTINGS["unknown_speaker"]],
         )
+        return [(label, " ".join(text.split())[: START["sentence_chars"]]) for label, text in rows]
+
+    def name_speakers(self, meeting_id):
+        if not self.tty:
+            return
         try:
-            for label, text in rows:
-                click.echo(f"{label}: \"{' '.join(text.split())[: START['sentence_chars']]}\"")
+            for label, text in self.samples(meeting_id):
+                click.echo(f"{label}: \"{text}\"")
                 name = click.prompt(f"Name fuer {label} (Enter = ueberspringen)", default="", show_default=False).strip()
                 if name:
                     self.store.speakers.set(meeting_id, label, name)
@@ -902,18 +974,18 @@ class StartFlow:
     def write_report(self, meeting_id):
         text = Report(Query(self.store)).render(meeting_id)
         path = ReportFile().write(self.job.day, Naming.slug(self.title or self.job.audio.stem), text)
-        click.echo(f"Protokoll: {path}")
+        self.reporter.say(f"Protokoll: {path}")
         return path
 
     def rotate(self):
         try:
             result = self.store.rotate(older_than_days=START["rotate_days"])
         except Exception as exc:
-            click.echo(f"Warnung: Rotation fehlgeschlagen: {Reason.of(exc)}", err=True)
+            self.reporter.warn(f"Rotation fehlgeschlagen: {Reason.of(exc)}")
             return
         for skipped in result["skipped"]:
             if skipped["reason"].startswith("error:"):
-                click.echo(f"Warnung: Rotation von {skipped['meeting_id']} fehlgeschlagen: {skipped['reason'][len('error:'):].strip()}", err=True)
+                self.reporter.warn(f"Rotation von {skipped['meeting_id']} fehlgeschlagen: {skipped['reason'][len('error:'):].strip()}")
 
     def show(self, path):
         if not (self.open_report and self.tty and hasattr(os, "startfile")):
@@ -921,9 +993,9 @@ class StartFlow:
         try:
             os.startfile(path)
         except Exception as exc:
-            click.echo(f"Warnung: Protokoll konnte nicht geoeffnet werden ({path}): {Reason.of(exc)}", err=True)
+            self.reporter.warn(f"Protokoll konnte nicht geoeffnet werden ({path}): {Reason.of(exc)}")
 
-    def run(self):
+    def execute(self):
         self.preflight()
         audio = self.record() if self.audio is None else self.audio
         meeting_id = self.process(audio)
@@ -932,9 +1004,26 @@ class StartFlow:
             path = self.write_report(meeting_id)
             self.show(path)
             self.rotate()
+            self.reporter.event(
+                "done", meeting_id=meeting_id, report=str(path), audio=str(audio), segments=self.result["segments"],
+                speakers=self.result["speakers"], labels=[{"label": l, "sample": t} for l, t in self.samples(meeting_id)],
+            )
         except (Exception, KeyboardInterrupt) as exc:
             self.fail(audio, exc, saved=meeting_id)
         return path
+
+    def run(self):
+        try:
+            return self.execute()
+        except click.exceptions.Exit:
+            raise
+        except (Exception, KeyboardInterrupt) as exc:
+            if not self.reporter.machine:
+                raise
+            code = 130 if isinstance(exc, KeyboardInterrupt) else getattr(exc, "exit_code", 1)
+            message = exc.format_message() if isinstance(exc, click.ClickException) else Reason.of(exc)
+            self.reporter.event("error", message=message, audio=None, meeting_id=None, retry=None, exit_code=code)
+            raise click.exceptions.Exit(code) from exc
 
 
 class AudioDevices:

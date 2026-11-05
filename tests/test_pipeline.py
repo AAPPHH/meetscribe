@@ -1,3 +1,4 @@
+import os
 import shutil
 import signal
 import sys
@@ -12,7 +13,7 @@ import soundfile as sf
 from meetscribe import pipeline
 from meetscribe.pipeline import (
     ASRFailure, ASRRunner, PipelineError, Aligner, AudioError, AudioLoader, DeviceError, InputPicker, Interrupt, KeepAwake, Mixer, Models, Naming,
-    RecordingSession, TranscribeJob, Transcriber, Windows,
+    RecordingSession, StdinWatcher, TranscribeJob, Transcriber, Windows,
 )
 from meetscribe.store import HotFile, Query, ReportFile, Store, make_config
 
@@ -603,3 +604,50 @@ def test_report_file_suffix_on_collision(tmp_path):
     paths = [files.write("2026-03-04", "x", "ä") for _ in range(3)]
     assert [p.name for p in paths] == ["2026-03-04_x.md", "2026-03-04_x-2.md", "2026-03-04_x-3.md"]
     assert paths[0].read_bytes() == "ä".encode("utf-8")
+
+
+def test_stdin_watcher_fires_on_line_or_eof_but_not_on_partial_text():
+    for payload, close, fires in ((b"stop\n", False, True), (b"", True, True), (b"ohne Zeilenende", False, False), (b"a", True, True)):
+        read_end, write_end = os.pipe()
+        watcher = StdinWatcher(read_end).start()
+        if payload:
+            os.write(write_end, payload)
+        if close:
+            os.close(write_end)
+        watcher.event.wait(0.5)
+        assert watcher.is_set() is fires
+        if not close:
+            os.close(write_end)
+        assert watcher.event.wait(1)
+        os.close(read_end)
+
+
+def test_stdin_watcher_treats_invalid_descriptor_as_closed():
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    os.close(write_end)
+    watcher = StdinWatcher(read_end).start()
+    assert watcher.event.wait(1) and watcher.is_set()
+
+
+def test_recording_session_stops_when_stop_signal_is_set(tmp_path, monkeypatch):
+    class Recorder:
+        def __init__(self, device, path, hostapis=()):
+            self.device, self.path, self.rate, self.hostapi = device, path, 16000, "MME"
+
+        def start(self):
+            sf.write(self.path, np.zeros(1600, dtype="float32"), 16000)
+
+        def problem(self):
+            return None
+
+        def stop(self):
+            return {"path": str(self.path), "seconds": 0.1, "overruns": 0, "error": None}
+
+    monkeypatch.setattr(pipeline, "Recorder", Recorder)
+    stop = threading.Event()
+    threading.Timer(0.3, stop.set).start()
+    session = RecordingSession("dji", tmp_path / "rec.flac", InputPicker(DEVICES, HOSTAPIS))
+    started = time.monotonic()
+    reports = session.run(stop=stop)
+    assert time.monotonic() - started < 5 and session.final == tmp_path / "rec.flac" and reports[0]["seconds"] == 0.1

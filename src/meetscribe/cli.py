@@ -1,3 +1,4 @@
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -222,13 +223,16 @@ def transcribe(audio, device, model, language, title, day, meeting_id, no_diariz
 @click.option("--speakers", type=int, default=None)
 @click.option("--no-diarize", is_flag=True, help="Keine Sprechertrennung (Sprecher UNKNOWN).")
 @click.option("--no-open", is_flag=True, help="Protokoll nicht oeffnen.")
-def start(audio, title, mic, device, speakers, no_diarize, no_open):
+@click.option("--events", is_flag=True, help="Ereignisse als JSON-Zeilen auf stdout, ohne Rueckfragen und ohne Oeffnen des Protokolls.")
+@click.option("--stdin-stop", is_flag=True, help="Aufnahme beenden, sobald eine Zeile auf stdin ankommt oder stdin geschlossen wird.")
+def start(audio, title, mic, device, speakers, no_diarize, no_open, events, stdin_stop):
     from meetscribe import pipeline
+    reporter = pipeline.EventReporter() if events else None
     flow = pipeline.StartFlow(
         get_store(), audio=audio, mic=mic, device=device, title=title, speakers=speakers,
-        diarize=not no_diarize, open_report=not no_open, tty=stdin_is_tty(),
+        diarize=not no_diarize, open_report=not no_open, tty=stdin_is_tty(), reporter=reporter, stdin_stop=stdin_stop,
     )
-    with pipeline.KeepAwake():
+    with contextlib.redirect_stdout(sys.stderr) if events else contextlib.nullcontext(), pipeline.KeepAwake():
         flow.run()
 
 

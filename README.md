@@ -99,6 +99,7 @@ meetscribe report 20261105-projektrunde --out C:\temp\protokoll.md
 | Befehl | Zweck |
 |---|---|
 | `meetscribe devices` | Audioeingänge (Index, Name, API, Kanäle, Rate) und OpenVINO-Geräte auflisten; prüft z. B. ob der DJI-Empfänger sichtbar ist; mit `--json` als JSON |
+| `meetscribe check` | ffmpeg, Whisper-Modelle, pyannote-Modell und `HF_TOKEN` prüfen, mit Lösung je fehlendem Punkt (Exit-Code 1, wenn etwas fehlt); mit `--json` eine Liste `{"id", "label", "ok", "fix"}` (Exit-Code 0) |
 | `meetscribe record --out datei.flac [--mic ...] [--seconds N]` | nur aufnehmen, Standard-Mikrofon `laptop`; eine vorhandene Zieldatei wird nicht überschrieben, der Befehl bricht ab; gestörte Eingänge werden wie bei `start` sofort gemeldet, danach endet der Befehl mit Exit-Code 1 |
 | `meetscribe transcribe datei [...]` | nur transkribieren und ablegen, ohne Protokoll und ohne Sprecherabfrage |
 | `meetscribe rotate [--older-than-days N] [--force]` | heiße Dateien ins Archiv verschieben (Standard 0 Tage: alle vollständigen) |

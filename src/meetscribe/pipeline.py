@@ -1026,6 +1026,30 @@ class StartFlow:
             raise click.exceptions.Exit(code) from exc
 
 
+class SetupCheck:
+    def __init__(self, models=None, token=None):
+        self.models = models or Models()
+        self.token = os.environ.get(SETTINGS["diarization"]["token_env"]) if token is None else token
+
+    @staticmethod
+    def row(key, label, ok, fix):
+        return {"id": key, "label": label, "ok": bool(ok), "fix": None if ok else fix}
+
+    def run(self):
+        diar = SETTINGS["diarization"]
+        rows = [self.row("ffmpeg", "ffmpeg", shutil.which("ffmpeg"), "ffmpeg installieren und in den PATH aufnehmen.")]
+        dirs = {}
+        for device in DEVICES:
+            dirs.setdefault(MODELS[device]["dir"], []).append(device.upper())
+        for name, devices in dirs.items():
+            ready = Models.whisper_ready(self.models.root / name)
+            rows.append(self.row(f"whisper:{name}", f"Whisper-Modell ({'/'.join(devices)})", ready, f"'meetscribe setup' ausfuehren; es laedt {name} nach {self.models.root}."))
+        ready = self.models.diarization_ready()
+        rows.append(self.row("pyannote", "pyannote-Modell (Sprechertrennung)", ready, f"{diar['token_env']} setzen und 'meetscribe setup' erneut ausfuehren; bis dahin ohne Sprechertrennung arbeiten."))
+        rows.append(self.row("hf_token", f"{diar['token_env']} (nur fuer 'meetscribe setup')", ready or self.token, f"{diar['token_env']} setzen (Zugriff auf huggingface.co/{diar['repo']} freischalten)."))
+        return rows
+
+
 class AudioDevices:
     @staticmethod
     def sounddevice_picker():

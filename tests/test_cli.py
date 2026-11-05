@@ -761,6 +761,21 @@ def test_json_devices_lists_inputs_and_openvino(env, monkeypatch):
     assert data["inputs"] == [] and "kein Treiber" in data["inputs_error"] and data["openvino"]
 
 
+def test_check_reports_missing_pieces_with_fixes(env, monkeypatch):
+    rows = {r["id"]: r for r in parsed(invoke("--json", "check"))}
+    assert rows["ffmpeg"]["ok"] and rows["pyannote"]["ok"] is False and "meetscribe setup" in rows["pyannote"]["fix"]
+    assert rows["hf_token"]["ok"] is False and "HF_TOKEN" in rows["hf_token"]["fix"]
+    assert all(r["ok"] and r["fix"] is None for k, r in rows.items() if k.startswith("whisper:"))
+    human = invoke("check")
+    assert human.exit_code == 1 and "NEIN" in human.output
+    add_pyannote(env)
+    (env["models"] / pipeline.MODELS["npu"]["dir"] / "openvino_model.xml").unlink()
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: None)
+    rows = {r["id"]: r for r in parsed(invoke("--json", "check"))}
+    assert rows["pyannote"]["ok"] and rows["hf_token"]["ok"] and not rows["ffmpeg"]["ok"] and "PATH" in rows["ffmpeg"]["fix"]
+    assert rows[f"whisper:{pipeline.MODELS['npu']['dir']}"]["ok"] is False
+
+
 def events_of(result):
     return [json.loads(line) for line in result.stdout.splitlines()]
 

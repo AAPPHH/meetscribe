@@ -154,6 +154,17 @@ def devices():
     Table(["openvino", "name"], [[r["device"], r["name"]] for r in openvino]).echo()
 
 
+@main.command(name="check", help="Voraussetzungen pruefen (ffmpeg, Modelle, HF_TOKEN).")
+def check_setup():
+    from meetscribe import pipeline
+    rows = pipeline.SetupCheck().run()
+    if out().machine:
+        return out().dump(rows)
+    Table(["pruefung", "ok", "loesung"], [[r["label"], "ja" if r["ok"] else "NEIN", r["fix"]] for r in rows]).echo()
+    if not all(r["ok"] for r in rows):
+        raise click.exceptions.Exit(1)
+
+
 @main.command(help="Aufnahme bis Strg+C oder --seconds.")
 @click.option("--mic", default="laptop", show_default=True, help="dji, laptop, both oder Namensteil des Geraets.")
 @click.option("--out", "out", required=True, type=click.Path(dir_okay=False, path_type=Path), help="Zieldatei (.flac).")

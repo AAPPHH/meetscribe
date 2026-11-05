@@ -243,6 +243,37 @@ def test_recording_paths(tmp_path):
     assert both == {"dji": tmp_path / "m.dji.flac", "laptop": tmp_path / "m.laptop.flac", "mix": tmp_path / "m.mix.flac"}
 
 
+class StubRecorder:
+    def __init__(self, device, path, hostapis=()):
+        self.device, self.path, self.hostapi = device, path, ""
+
+    def start(self):
+        sf.write(self.path, noise(1.0), RATE)
+
+    def stop(self):
+        return {"path": str(self.path), "seconds": 1.0, "overruns": 0, "error": None}
+
+
+def test_single_mic_named_mix_is_not_mixed(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "Recorder", StubRecorder)
+    picker = InputPicker([{"name": "Stereomix", "hostapi": 0, "max_input_channels": 2, "default_samplerate": 16000.0}], ["MME"])
+    session = RecordingSession("mix", tmp_path / "rec.flac", picker)
+    assert not session.mixing and session.final == tmp_path / "rec.flac"
+    session.run(seconds=0.05)
+    assert sf.info(tmp_path / "rec.flac").frames == RATE
+
+
+def test_recording_refuses_to_overwrite(tmp_path):
+    picker = InputPicker(DEVICES, HOSTAPIS)
+    (tmp_path / "rec.flac").write_bytes(b"audio")
+    with pytest.raises(AudioError, match="existiert bereits"):
+        RecordingSession("dji", tmp_path / "rec", picker).prepare()
+    (tmp_path / "both.mix.flac").write_bytes(b"audio")
+    with pytest.raises(AudioError):
+        RecordingSession("both", tmp_path / "both.flac", picker).prepare()
+    assert (tmp_path / "rec.flac").read_bytes() == b"audio"
+
+
 def test_mixer_stretches_to_equal_length(tmp_path):
     a, b = tmp_path / "a.flac", tmp_path / "b.flac"
 

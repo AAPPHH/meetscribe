@@ -632,22 +632,36 @@ class RecordingSession:
         self.recorders = None
 
     @property
+    def mixing(self):
+        return self.mic.lower() == "both"
+
+    @property
     def specs(self):
-        return list(RECORDING["patterns"]) if self.mic.lower() == "both" else [self.mic]
+        return list(RECORDING["patterns"]) if self.mixing else [self.mic]
+
+    @property
+    def mix_path(self):
+        return Path(f"{self.out.with_suffix('')}.mix{self.out.suffix}")
+
+    @property
+    def final(self):
+        return self.mix_path if self.mixing else self.out
 
     def paths(self):
-        if self.mic.lower() != "both":
+        if not self.mixing:
             return {self.mic: self.out}
         stem, suffix = self.out.with_suffix(""), self.out.suffix
-        return {**{spec: Path(f"{stem}.{spec}{suffix}") for spec in self.specs}, "mix": Path(f"{stem}.mix{suffix}")}
+        return {**{spec: Path(f"{stem}.{spec}{suffix}") for spec in self.specs}, "mix": self.mix_path}
 
     def prepare(self):
         paths = self.paths()
+        for path in paths.values():
+            if path.exists():
+                raise AudioError(f"Zieldatei existiert bereits und wird nicht ueberschrieben: {path}")
         self.recorders = [Recorder(self.picker.pick(spec), paths[spec], self.picker.hostapis) for spec in self.specs]
         return self.recorders
 
     def run(self, seconds=None):
-        paths = self.paths()
         recorders = self.recorders or self.prepare()
         started = []
         with Interrupt() as interrupt:
@@ -663,8 +677,8 @@ class RecordingSession:
                     pass
             finally:
                 reports = [r.stop() for r in started]
-            if "mix" in paths and len(started) == len(recorders):
-                Mixer.mix([r.path for r in recorders], paths["mix"])
+            if self.mixing and len(started) == len(recorders):
+                Mixer.mix([r.path for r in recorders], self.mix_path)
         return reports
 
 
@@ -724,7 +738,7 @@ class StartFlow:
         click.echo(RECORDING["lid_notice"])
         click.echo("Aufnahme laeuft, Ende mit Strg+C.")
         reports = self.session.run()
-        path = self.session.paths().get("mix") or self.session.out
+        path = self.session.final
         click.echo(f"Aufnahme gespeichert: {path} ({max(r['seconds'] for r in reports):.0f} s)")
         errors = [str(r["error"]) for r in reports if r["error"]]
         if errors:

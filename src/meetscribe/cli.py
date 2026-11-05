@@ -138,8 +138,8 @@ def record(mic, out, seconds):
         reports = session.run(seconds)
     for report in reports:
         click.echo(f"{report['path']}: {report['seconds']:.1f} s, Ueberlaeufe: {report['overruns']}")
-    if "mix" in session.paths():
-        click.echo(f"{session.paths()['mix']}: Mix")
+    if session.mixing:
+        click.echo(f"{session.mix_path}: Mix")
     if any(r["error"] for r in reports):
         raise click.ClickException("Schreibfehler waehrend der Aufnahme: " + "; ".join(str(r["error"]) for r in reports if r["error"]))
 

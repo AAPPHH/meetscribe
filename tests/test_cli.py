@@ -473,3 +473,16 @@ def test_gitignore_covers_media_and_keeps_project_files():
     assert sorted(ignored) == sorted(names)
     kept = subprocess.run(["git", "check-ignore", "README.md", "pyproject.toml"], cwd=root, capture_output=True, text=True)
     assert kept.returncode == 1 and kept.stdout == ""
+
+
+def test_sql_cannot_fetch_extensions_but_reads_local_files(env):
+    assert transcribe(env, "--no-diarize").exit_code == 0
+    assert invoke("rotate").exit_code == 0
+    remote = invoke("sql", "SELECT * FROM read_parquet('https://example.invalid/x.parquet')")
+    assert remote.exit_code == 1 and "Traceback" not in remote.output and "requires the extension httpfs" in remote.output
+    relock = invoke("sql", "SET autoload_known_extensions=true")
+    assert relock.exit_code == 1 and "Traceback" not in relock.output
+    parquet = next((env["tmp"] / "data" / "cold").rglob("*.parquet")).as_posix()
+    direct = invoke("sql", f"SELECT count(*) AS n FROM read_parquet('{parquet}')")
+    view = invoke("sql", "SELECT count(*) AS n FROM segments_named")
+    assert direct.exit_code == 0 and direct.output == view.output and int(view.output.split()[-1]) > 0

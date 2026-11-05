@@ -150,6 +150,8 @@ Schema von `segments`:
 
 `speakers`: `meeting_id`, `label`, `name`.
 
+DuckDB-Erweiterungen werden weder automatisch installiert noch automatisch geladen (`autoinstall_known_extensions` und `autoload_known_extensions` sind aus) und die Konfiguration ist gesperrt, `SET` auf diese Einstellungen schlägt also fehl. Ein Aufruf wie `read_parquet('https://...')` bricht deshalb ohne Netzzugriff mit der DuckDB-Fehlermeldung ab (`requires the extension httpfs`, Exit-Code 1, kein Traceback). Lokale Dateien, etwa `read_parquet('C:/pfad/datei.parquet')`, und die Sichten funktionieren weiter. Ein ausdrückliches `INSTALL ...` in der Abfrage wurde nicht geprüft und ist nicht eigens gesperrt.
+
 ## Mikrofone
 
 - DJI Mic Mini 2: der Empfänger wird per USB-C angeschlossen und erscheint als Audioeingang. `--mic dji` und die automatische Wahl suchen im Gerätenamen nach `dji`, `mic mini`, `mic 2` oder `wireless mic`. Heißt der Empfänger anders, mit `meetscribe devices` den Namen nachsehen und `--mic <Namensteil>` verwenden.

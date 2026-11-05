@@ -31,6 +31,12 @@ SCHEMA = pa.schema([
 SPEAKER_SCHEMA = pa.schema([("meeting_id", pa.string()), ("label", pa.string()), ("name", pa.string())])
 COLUMNS = ", ".join(SCHEMA.names)
 REQUIRED = ("start_s", "end_s", "speaker", "text")
+DUCKDB_SETTINGS = {
+    "TimeZone": "'UTC'",
+    "autoinstall_known_extensions": "false",
+    "autoload_known_extensions": "false",
+    "lock_configuration": "true",
+}
 
 
 def make_config(data_dir=None):
@@ -289,7 +295,8 @@ class Query:
     def __init__(self, store=None):
         self.store = store or Store()
         self.con = duckdb.connect(":memory:")
-        self.con.execute("SET TimeZone='UTC'")
+        for setting, value in DUCKDB_SETTINGS.items():
+            self.con.execute(f"SET {setting}={value}")
         self.con.register("empty_segments", SCHEMA.empty_table())
         self._signature = None
         self.refresh()

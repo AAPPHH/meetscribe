@@ -1,7 +1,10 @@
 import os
+import shutil
 import signal
+import subprocess
 import threading
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -460,3 +463,13 @@ def test_keep_awake_wraps_start_transcribe_and_setup(env, monkeypatch):
     FakeEngine.fail_devices = ("npu", "gpu", "cpu")
     assert start("--no-diarize").exit_code == 1
     assert calls == released
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git fehlt")
+def test_gitignore_covers_media_and_keeps_project_files():
+    root = Path(__file__).resolve().parent.parent
+    names = ["a.ogg", "a.opus", "a.aac", "a.mp4", "a.wma", "a.webm", "a.mov", "a.mkv", ".env.local", "protokoll-x.md", "data/x.arrow"]
+    ignored = subprocess.run(["git", "check-ignore", *names], cwd=root, capture_output=True, text=True).stdout.split()
+    assert sorted(ignored) == sorted(names)
+    kept = subprocess.run(["git", "check-ignore", "README.md", "pyproject.toml"], cwd=root, capture_output=True, text=True)
+    assert kept.returncode == 1 and kept.stdout == ""

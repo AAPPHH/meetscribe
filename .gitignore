@@ -12,3 +12,13 @@ protokolle/
 __pycache__/
 .pytest_cache/
 *.egg-info/
+*.ogg
+*.opus
+*.aac
+*.mp4
+*.wma
+*.webm
+*.mov
+*.mkv
+.env.*
+/protokoll*.md

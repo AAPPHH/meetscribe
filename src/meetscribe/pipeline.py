@@ -19,8 +19,9 @@ import soundfile as sf
 from meetscribe.store import PROJECT_ROOT, as_date
 
 DEVICES = ("npu", "gpu", "cpu")
-WHISPER_REPO = {"repo": "OpenVINO/whisper-large-v3-turbo-int8-ov", "dir": "whisper-large-v3-turbo-int8-ov"}
-MODELS = {device: dict(WHISPER_REPO) for device in DEVICES}
+WHISPER_INT8 = {"repo": "OpenVINO/whisper-large-v3-turbo-int8-ov", "dir": "whisper-large-v3-turbo-int8-ov"}
+WHISPER_FP16 = {"repo": "OpenVINO/whisper-large-v3-turbo-fp16-ov", "dir": "whisper-large-v3-turbo-fp16-ov"}
+MODELS = {"npu": dict(WHISPER_FP16), "gpu": dict(WHISPER_INT8), "cpu": dict(WHISPER_INT8)}
 SETTINGS = {
     "default_device": "npu",
     "device_order": DEVICES,
@@ -132,6 +133,21 @@ class ModelSetup:
                 "freischalten) und 'meetscribe setup' erneut ausfuehren; ohne Modell nur mit --no-diarize."
             )
         return messages, failed
+
+    def warm(self, language=None):
+        language = language or SETTINGS["language"]
+        yield "NPU-Cache wird aufgewaermt (dauert einmalig mehrere Minuten) ..."
+        try:
+            engine = WhisperEngine("npu", self.models, language)
+            engine.transcribe(np.zeros(SETTINGS["sample_rate"], dtype="float32"))
+            del engine
+            gc.collect()
+        except Exception as exc:
+            yield f"Warnung: NPU-Cache nicht aufgewaermt: {Reason.of(exc)}"
+
+    def warm(self, device="npu"):
+        engine = WhisperEngine(device, self.models, SETTINGS["language"])
+        engine.transcribe(np.zeros(SETTINGS["sample_rate"], dtype="float32"))
 
 
 class Reason:

@@ -81,9 +81,17 @@ def setup():
     for name in OFFLINE_ENV:
         os.environ.pop(name, None)
     from meetscribe import pipeline
-    messages, failed = pipeline.ModelSetup(pipeline.Models(), os.environ.get("HF_TOKEN")).run()
+    models = pipeline.Models()
+    setup_job = pipeline.ModelSetup(models, os.environ.get("HF_TOKEN"))
+    messages, failed = setup_job.run()
     for message in messages:
         click.echo(message)
+    if pipeline.Models.whisper_ready(models.whisper_dir("npu")):
+        click.echo("NPU-Compile-Cache wird aufgewaermt; das dauert einmalig mehrere Minuten.")
+        try:
+            setup_job.warm("npu")
+        except Exception as exc:
+            click.echo(f"Warnung: NPU-Cache nicht aufgewaermt: {pipeline.Reason.of(exc)}", err=True)
     if failed:
         raise click.ClickException("Whisper-Download fehlgeschlagen.")
 

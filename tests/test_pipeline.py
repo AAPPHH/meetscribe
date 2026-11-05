@@ -203,6 +203,7 @@ def test_device_chain(tmp_path, device, fallback, expected):
 def test_model_paths(tmp_path):
     models = Models(tmp_path)
     assert models.whisper_dir("npu") == tmp_path / pipeline.MODELS["npu"]["dir"]
+    assert "fp16" in pipeline.MODELS["npu"]["dir"] and "int8" in pipeline.MODELS["gpu"]["dir"] == pipeline.MODELS["cpu"]["dir"]
     assert models.whisper_dir("cpu", "custom") == tmp_path / "custom"
     assert models.cache_dir == tmp_path / "ov_cache"
     assert not models.diarization_ready()

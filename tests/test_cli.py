@@ -43,8 +43,9 @@ class FakeDiarizer:
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     models = tmp_path / "models"
-    (models / pipeline.MODELS["npu"]["dir"]).mkdir(parents=True)
-    (models / pipeline.MODELS["npu"]["dir"] / "openvino_model.xml").write_text("x")
+    for spec in pipeline.MODELS.values():
+        (models / spec["dir"]).mkdir(parents=True, exist_ok=True)
+        (models / spec["dir"] / "openvino_model.xml").write_text("x")
     monkeypatch.setenv("MEETSCRIBE_DATA", str(tmp_path / "data"))
     monkeypatch.setenv("MEETSCRIBE_MODELS", str(models))
     monkeypatch.delenv("MEETSCRIBE_DEVICE", raising=False)
@@ -182,9 +183,10 @@ def test_offline_env_set_for_commands_except_setup(env, monkeypatch):
         seen[repo] = (token, {name: os.environ.get(name) for name in OFFLINE})
 
     monkeypatch.setattr(pipeline.ModelSetup, "download", staticmethod(fake_download))
+    monkeypatch.setattr(pipeline.ModelSetup, "warm", lambda self, device="npu": None)
     result = invoke("setup")
     assert result.exit_code == 0, result.output
-    assert set(seen) == {pipeline.MODELS["npu"]["repo"]}
+    assert set(seen) == {spec["repo"] for spec in pipeline.MODELS.values()} and len(seen) == 2
     assert seen[pipeline.MODELS["npu"]["repo"]] == (None, {name: None for name in OFFLINE})
     assert "pyannote" in result.output and "fehlt" in result.output
 
@@ -195,6 +197,15 @@ def test_setup_with_token_downloads_pyannote(env, monkeypatch):
     result = invoke("setup", env={"HF_TOKEN": "tok"})
     assert result.exit_code == 0
     assert (pipeline.SETTINGS["diarization"]["repo"], "tok") in calls
+
+
+def test_setup_warms_npu_and_tolerates_failure(env, monkeypatch):
+    monkeypatch.setattr(pipeline.ModelSetup, "download", staticmethod(lambda repo, target, token=None: None))
+    ok = invoke("setup")
+    assert ok.exit_code == 0 and "Compile-Cache" in ok.output and FakeEngine.constructed == ["npu"]
+    FakeEngine.fail_devices = ("npu",)
+    bad = invoke("setup")
+    assert bad.exit_code == 0 and bad.output.count("Warnung: NPU-Cache nicht aufgewaermt") == 1
 
 
 def test_setup_whisper_failure_is_error(env, monkeypatch):
@@ -216,3 +227,10 @@ def test_rotate_skips_incomplete_unless_forced(env):
     transcribe(env, "--no-diarize", "--no-fallback")
     assert "incomplete" in invoke("rotate").output
     assert "rotiert: m1" not in invoke("rotate").output
+
+
+def test_setup_warm_failure_is_only_a_warning(env, monkeypatch):
+    FakeEngine.fail_devices = ("npu",)
+    monkeypatch.setattr(pipeline.ModelSetup, "download", staticmethod(lambda repo, target, token=None: None))
+    result = invoke("setup")
+    assert result.exit_code == 0 and "Warnung: NPU-Cache nicht aufgewaermt" in result.output

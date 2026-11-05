@@ -633,3 +633,8 @@ def test_record_stream_open_failure_leaves_no_file(real_recorder):
     assert result.exit_code == 1 and "Datenschutz" in result.output and "Aufnahme laeuft" not in result.output and not out.exists()
     FakeStream.fail = None
     assert invoke("record", "--out", out, "--seconds", "5").exit_code == 0 and out.exists()
+
+
+def test_search_help_does_not_promise_full_text_search():
+    text = invoke("search", "--help").output
+    assert "Volltext" not in text and "Teilstring" in text

@@ -212,7 +212,7 @@ def rotate(older_than_days, force):
         click.echo(f"uebersprungen: {skipped['meeting_id']} ({skipped['reason']})")
 
 
-@main.command(help="Volltextsuche in den Segmenten.")
+@main.command(help="Teilstring-Suche (ohne Gross-/Kleinschreibung) in den Segmenten.")
 @click.argument("term")
 @click.option("--meeting", default=None)
 @click.option("--speaker", default=None)

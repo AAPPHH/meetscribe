@@ -6,6 +6,7 @@ dependencies = [
     "click>=8.5.0",
     "duckdb>=2.0.0",
     "pyarrow>=26.0.1",
+    "tzdata>=2026.6",
 ]
 
 [project.scripts]

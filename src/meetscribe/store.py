@@ -1,0 +1,436 @@
+import os
+import re
+import time
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+import duckdb
+import pyarrow as pa
+import pyarrow.ipc as ipc
+import pyarrow.parquet as pq
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+EOS = b"\xff\xff\xff\xff\x00\x00\x00\x00"
+ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+WORD_TYPE = pa.struct([("text", pa.string()), ("start_s", pa.float64()), ("end_s", pa.float64())])
+SCHEMA = pa.schema([
+    ("meeting_id", pa.string()),
+    ("title", pa.string()),
+    ("meeting_date", pa.date32()),
+    ("seg_id", pa.int32()),
+    ("start_s", pa.float64()),
+    ("end_s", pa.float64()),
+    ("speaker", pa.string()),
+    ("text", pa.string()),
+    ("language", pa.string()),
+    ("model", pa.string()),
+    ("device", pa.string()),
+    ("words", pa.list_(WORD_TYPE)),
+    ("created_at", pa.timestamp("us", tz="UTC")),
+])
+SPEAKER_SCHEMA = pa.schema([("meeting_id", pa.string()), ("label", pa.string()), ("name", pa.string())])
+COLUMNS = ", ".join(SCHEMA.names)
+REQUIRED = ("start_s", "end_s", "speaker", "text")
+
+
+def make_config(data_dir=None):
+    base = Path(data_dir or os.environ.get("MEETSCRIBE_DATA") or PROJECT_ROOT / "data")
+    return {
+        "data_dir": base,
+        "hot_dir": base / "hot",
+        "cold_dir": base / "cold",
+        "archive_dir": base / "archive",
+        "speakers_file": base / "speakers.parquet",
+    }
+
+
+CONFIG = make_config()
+
+
+class DuplicateMeetingError(Exception):
+    pass
+
+
+class MeetingNotFound(LookupError):
+    pass
+
+
+class VerifyError(RuntimeError):
+    pass
+
+
+def as_date(value):
+    if value is None:
+        return date.today()
+    if isinstance(value, datetime):
+        return value.date()
+    return value if isinstance(value, date) else date.fromisoformat(value)
+
+
+def read_parquet(path):
+    with open(path, "rb") as handle:
+        return pq.read_table(handle)
+
+
+def atomic_parquet(table, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    pq.write_table(table, tmp)
+    if read_parquet(tmp).num_rows != table.num_rows:
+        tmp.unlink()
+        raise VerifyError(f"row count mismatch for {path.name}")
+    os.replace(tmp, path)
+
+
+def sql_literal(path):
+    return "'" + path.as_posix().replace("'", "''") + "'"
+
+
+class HotFile:
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def read(self):
+        data = self.path.read_bytes()
+        batches, complete = [], False
+        try:
+            reader = ipc.open_stream(pa.BufferReader(data))
+        except (pa.ArrowException, OSError):
+            return SCHEMA.empty_table(), False
+        try:
+            while True:
+                batches.append(reader.read_next_batch())
+        except StopIteration:
+            complete = data.endswith(EOS)
+        except (pa.ArrowException, OSError):
+            pass
+        table = pa.Table.from_batches(batches, schema=reader.schema)
+        return table.select(SCHEMA.names).cast(SCHEMA), complete
+
+    def is_complete(self):
+        return self.read()[1]
+
+
+class SpeakerMap:
+    def __init__(self, store):
+        self.path = store.config["speakers_file"]
+
+    def all(self):
+        return read_parquet(self.path) if self.path.exists() else SPEAKER_SCHEMA.empty_table()
+
+    def _mapping(self):
+        return {(r["meeting_id"], r["label"]): r["name"] for r in self.all().to_pylist()}
+
+    def _write(self, mapping):
+        rows = [{"meeting_id": m, "label": l, "name": n} for (m, l), n in sorted(mapping.items())]
+        atomic_parquet(pa.Table.from_pylist(rows, schema=SPEAKER_SCHEMA), self.path)
+
+    def set(self, meeting_id, label, name):
+        name = name.strip()
+        if not name:
+            raise ValueError("name must not be empty")
+        mapping = self._mapping()
+        mapping[(meeting_id, label)] = name
+        self._write(mapping)
+
+    def unset(self, meeting_id, label):
+        mapping = self._mapping()
+        removed = mapping.pop((meeting_id, label), None) is not None
+        if removed:
+            self._write(mapping)
+        return removed
+
+
+class Store:
+    def __init__(self, config=None):
+        self.config = config or CONFIG
+        self.speakers = SpeakerMap(self)
+
+    @property
+    def hot_dir(self):
+        return self.config["hot_dir"]
+
+    @property
+    def cold_dir(self):
+        return self.config["cold_dir"]
+
+    @property
+    def archive_dir(self):
+        return self.config["archive_dir"]
+
+    def check_id(self, meeting_id):
+        if not isinstance(meeting_id, str) or not ID_PATTERN.match(meeting_id):
+            raise ValueError(f"invalid meeting_id: {meeting_id!r}")
+
+    def hot_path(self, meeting_id):
+        self.check_id(meeting_id)
+        return self.hot_dir / f"{meeting_id}.arrow"
+
+    def hot_files(self):
+        return sorted(self.hot_dir.glob("*.arrow"))
+
+    def cold_files(self):
+        return sorted(self.cold_dir.glob("year=*/month=*/*.parquet"))
+
+    def exists(self, meeting_id):
+        return self.hot_path(meeting_id).exists() or any(p.stem == meeting_id for p in self.cold_files())
+
+    def writer(self, meeting_id, **meta):
+        return TranscriptWriter(meeting_id, store=self, **meta)
+
+    def incomplete(self):
+        return [p.stem for p in self.hot_files() if not HotFile(p).is_complete()]
+
+    def cold_path(self, meeting_id, day):
+        return self.cold_dir / f"year={day.year:04d}" / f"month={day.month:02d}" / f"{meeting_id}.parquet"
+
+    def rotate(self, older_than_days=0, force=False):
+        result = {"rotated": [], "skipped": []}
+        for tmp in self.cold_dir.glob("**/*.tmp"):
+            tmp.unlink(missing_ok=True)
+        cutoff = time.time() - older_than_days * 86400
+        for path in self.hot_files():
+            meeting_id = path.stem
+            table, complete = HotFile(path).read()
+            reason = None
+            if not complete and not force:
+                reason = "incomplete"
+            elif older_than_days > 0 and path.stat().st_mtime > cutoff:
+                reason = "too_recent"
+            elif table.num_rows == 0:
+                reason = "empty"
+            if reason is None:
+                try:
+                    self._rotate_one(path, table)
+                except (OSError, pa.ArrowException, VerifyError) as exc:
+                    reason = f"error: {exc}"
+            if reason is None:
+                result["rotated"].append(meeting_id)
+            else:
+                result["skipped"].append({"meeting_id": meeting_id, "reason": reason})
+        return result
+
+    def _rotate_one(self, path, table):
+        day = table.column("meeting_date")[0].as_py()
+        atomic_parquet(table, self.cold_path(path.stem, day))
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
+        os.replace(path, self.archive_dir / path.name)
+
+
+class TranscriptWriter:
+    def __init__(self, meeting_id, title="", meeting_date=None, language=None, model=None, device=None, store=None):
+        self.store = store or Store()
+        self.path = self.store.hot_path(meeting_id)
+        self.meta = {
+            "meeting_id": meeting_id,
+            "title": title,
+            "meeting_date": as_date(meeting_date),
+            "language": language,
+            "model": model,
+            "device": device,
+        }
+        self.next_id = 0
+        self.file = None
+        self.stream = None
+
+    def __enter__(self):
+        if self.store.exists(self.meta["meeting_id"]):
+            raise DuplicateMeetingError(f"meeting_id already exists: {self.meta['meeting_id']}")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.file = open(self.path, "xb")
+        except FileExistsError:
+            raise DuplicateMeetingError(f"meeting_id already exists: {self.meta['meeting_id']}") from None
+        self.stream = ipc.new_stream(self.file, SCHEMA)
+        self.file.flush()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self.stream.close()
+        finally:
+            self.file.close()
+        return False
+
+    def _row(self, seg, now):
+        row = {**self.meta, "seg_id": self.next_id, "created_at": now, **seg}
+        missing = [k for k in REQUIRED if row.get(k) is None]
+        if missing:
+            raise ValueError(f"segment is missing {missing}")
+        if row.get("words") is not None:
+            row["words"] = [{k: w[k] for k in WORD_TYPE.names} for w in row["words"]]
+        self.next_id = row["seg_id"] + 1
+        return row
+
+    def append(self, segments):
+        now = datetime.now(timezone.utc)
+        saved = self.next_id
+        try:
+            rows = [self._row(seg, now) for seg in segments]
+            if not rows:
+                return 0
+            self.stream.write_batch(pa.RecordBatch.from_pylist(rows, schema=SCHEMA))
+            self.file.flush()
+        except Exception:
+            self.next_id = saved
+            raise
+        return len(rows)
+
+
+class Query:
+    def __init__(self, store=None):
+        self.store = store or Store()
+        self.con = duckdb.connect(":memory:")
+        self.con.execute("SET TimeZone='UTC'")
+        self.con.register("empty_segments", SCHEMA.empty_table())
+        self._signature = None
+        self.refresh()
+
+    def _state(self):
+        paths = [*self.store.hot_files(), *self.store.cold_files(), self.store.config["speakers_file"]]
+        state = []
+        for p in paths:
+            try:
+                st = p.stat()
+                state.append((str(p), st.st_size, st.st_mtime_ns))
+            except FileNotFoundError:
+                state.append((str(p), None, None))
+        return tuple(state)
+
+    def refresh(self):
+        state = self._state()
+        if state == self._signature:
+            return
+        tables = [HotFile(p).read()[0] for p in self.store.hot_files()]
+        self.con.register("hot_raw", pa.concat_tables(tables) if tables else SCHEMA.empty_table())
+        self.con.register("speakers", self.store.speakers.all())
+        source = "empty_segments"
+        if self.store.cold_files():
+            files = ", ".join(sql_literal(f) for f in self.store.cold_files())
+            source = f"read_parquet([{files}], hive_partitioning=true)"
+        for sql in (
+            f"CREATE OR REPLACE VIEW cold_raw AS SELECT {COLUMNS} FROM {source}",
+            f"CREATE OR REPLACE VIEW segments AS SELECT {COLUMNS} FROM hot_raw h "
+            f"WHERE NOT EXISTS (SELECT 1 FROM cold_raw c WHERE c.meeting_id = h.meeting_id) "
+            f"UNION ALL SELECT {COLUMNS} FROM cold_raw",
+            "CREATE OR REPLACE VIEW segments_named AS SELECT s.*, COALESCE(p.name, s.speaker) AS display_name "
+            "FROM segments s LEFT JOIN speakers p ON p.meeting_id = s.meeting_id AND p.label = s.speaker",
+        ):
+            self.con.execute(sql)
+        self._signature = state
+
+    def execute(self, sql, params=None):
+        self.refresh()
+        relation = self.con.sql(sql, params=params or [])
+        if relation is None:
+            return [], []
+        table = relation.to_arrow_table()
+        return table.column_names, list(zip(*(c.to_pylist() for c in table.columns)))
+
+    def _records(self, sql, params=None):
+        columns, rows = self.execute(sql, params)
+        return [dict(zip(columns, row)) for row in rows]
+
+    @staticmethod
+    def _where(**filters):
+        clauses = [sql for sql, value in filters.values() if value is not None]
+        params = [value for sql, value in filters.values() if value is not None for _ in range(sql.count("?"))]
+        return (" WHERE " + " AND ".join(clauses) if clauses else ""), params
+
+    @staticmethod
+    def _like(term):
+        return "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+    def search(self, term, meeting_id=None, speaker=None, limit=50):
+        where, params = self._where(
+            term=("lower(text) LIKE lower(?) ESCAPE '\\'", self._like(term)),
+            meeting_id=("meeting_id = ?", meeting_id),
+            speaker=("(speaker = ? OR display_name = ?)", speaker),
+        )
+        return self._records(
+            "SELECT meeting_id, seg_id, start_s, end_s, speaker, display_name, text FROM segments_named"
+            f"{where} ORDER BY meeting_date, meeting_id, seg_id LIMIT ?",
+            [*params, int(limit)],
+        )
+
+    def meetings(self):
+        return self._records(
+            "SELECT meeting_id, any_value(title) AS title, any_value(meeting_date) AS meeting_date, "
+            "count(*)::BIGINT AS segments, count(DISTINCT speaker)::BIGINT AS speakers, max(end_s) AS duration_s, "
+            "string_agg(DISTINCT language, ', ' ORDER BY language) AS language, "
+            "string_agg(DISTINCT model, ', ' ORDER BY model) AS model, "
+            "string_agg(DISTINCT device, ', ' ORDER BY device) AS device "
+            "FROM segments GROUP BY meeting_id ORDER BY meeting_date DESC, meeting_id"
+        )
+
+    def speaker_stats(self, meeting_id=None):
+        where, params = self._where(meeting_id=("meeting_id = ?", meeting_id))
+        return self._records(
+            "WITH t AS (SELECT meeting_id, display_name, speaker, GREATEST(end_s - start_s, 0) AS dur, "
+            "CASE WHEN words IS NOT NULL AND len(words) > 0 THEN len(words) WHEN trim(text) = '' THEN 0 "
+            "ELSE len(regexp_split_to_array(trim(text), '\\s+')) END AS n "
+            f"FROM segments_named{where}) "
+            "SELECT meeting_id, display_name AS speaker, list_sort(list(DISTINCT speaker)) AS labels, "
+            "sum(dur) AS talk_s, sum(dur) / NULLIF(sum(sum(dur)) OVER (PARTITION BY meeting_id), 0) AS share, "
+            "count(*)::BIGINT AS segments, sum(n)::BIGINT AS words "
+            "FROM t GROUP BY meeting_id, display_name ORDER BY meeting_id, talk_s DESC, speaker",
+            params,
+        )
+
+
+class Report:
+    def __init__(self, query):
+        self.query = query
+
+    @staticmethod
+    def clock(seconds):
+        hours, rest = divmod(int(seconds or 0), 3600)
+        minutes, secs = divmod(rest, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+    @staticmethod
+    def percent(share):
+        return f"{(share or 0) * 100:.1f}".replace(".", ",") + " %"
+
+    @staticmethod
+    def cell(value):
+        return str(value).replace("|", "\\|")
+
+    def render(self, meeting_id):
+        info = self.query._records(
+            "SELECT any_value(title) AS title, any_value(meeting_date) AS meeting_date, count(*) AS n, "
+            "max(end_s) AS duration_s, string_agg(DISTINCT language, ', ' ORDER BY language) AS language, "
+            "string_agg(DISTINCT model, ', ' ORDER BY model) AS model, "
+            "string_agg(DISTINCT device, ', ' ORDER BY device) AS device FROM segments WHERE meeting_id = ?",
+            [meeting_id],
+        )[0]
+        if not info["n"]:
+            raise MeetingNotFound(f"Unbekannte meeting_id: {meeting_id}")
+        title = info["title"] or meeting_id
+        lines = [f"# {title} – {info['meeting_date']:%d.%m.%Y}", ""]
+        facts = (
+            ("Dauer", self.clock(info["duration_s"])),
+            ("Sprache", info["language"]),
+            ("Modell", info["model"]),
+            ("Gerät", info["device"]),
+        )
+        lines += [f"- **{label}:** {value}" for label, value in facts if value]
+        lines += ["", "## Teilnehmer", "", "| Name | Redezeit | Redeanteil | Wörter |", "|---|---|---|---|"]
+        for s in self.query.speaker_stats(meeting_id):
+            lines.append(
+                f"| {self.cell(s['speaker'])} | {self.clock(s['talk_s'])} | {self.percent(s['share'])} | {s['words']} |"
+            )
+        lines += ["", "## Transkript", ""]
+        _, blocks = self.query.execute(
+            "WITH o AS (SELECT display_name, start_s, trim(text) AS text, "
+            "row_number() OVER (ORDER BY start_s, seg_id) AS rn FROM segments_named "
+            "WHERE meeting_id = ? AND trim(text) <> ''), "
+            "g AS (SELECT *, rn - row_number() OVER (PARTITION BY display_name ORDER BY rn) AS grp FROM o) "
+            "SELECT display_name, min(start_s), string_agg(text, ' ' ORDER BY rn) FROM g "
+            "GROUP BY display_name, grp ORDER BY min(rn)",
+            [meeting_id],
+        )
+        for name, start, text in blocks:
+            lines += [f"**[{self.clock(start)}] {name}:** {text}", ""]
+        return "\n".join(lines).rstrip("\n") + "\n"

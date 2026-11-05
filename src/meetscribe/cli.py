@@ -4,7 +4,7 @@ from pathlib import Path
 
 import click
 
-from meetscribe.store import MeetingNotFound, Query, Report, Store, make_config
+from meetscribe.store import Json, MeetingNotFound, Query, Report, Store, make_config
 
 OFFLINE_ENV = {
     "HF_HUB_OFFLINE": "1",
@@ -50,9 +50,30 @@ class Table:
         click.echo(self.render())
 
 
-def echo_records(records, columns=None, clip=TABLE["clip"]):
-    columns = columns or (list(records[0]) if records else [])
-    Table(columns, [[r[c] for c in columns] for r in records], clip).echo()
+class Output:
+    def __init__(self, machine=False):
+        self.machine = machine
+
+    def dump(self, data):
+        click.echo(Json.dumps(data))
+
+    def table(self, columns, rows, clip=TABLE["clip"]):
+        if self.machine:
+            self.dump({"columns": list(columns), "rows": [list(r) for r in rows]})
+        else:
+            Table(columns, rows, clip).echo()
+
+    def records(self, records, columns=None, formats=None, clip=TABLE["clip"]):
+        if self.machine:
+            return self.dump(records)
+        columns = columns or (list(records[0]) if records else [])
+        formats = formats or {}
+        shown = lambda r, c: formats[c](r[c]) if c in formats and r[c] is not None else r[c]
+        Table(columns, [[shown(r, c) for c in columns] for r in records], clip).echo()
+
+
+def out():
+    return click.get_current_context().obj
 
 
 def stdin_is_tty():
@@ -79,8 +100,10 @@ def require_meeting(store, meeting_id):
 
 
 @click.group(help="Lokale Besprechungsabschriften: Aufnahme, Transkription, Archiv und Protokoll.")
+@click.option("--json", "machine", is_flag=True, help="Maschinenlesbare JSON-Ausgabe (meetings, search, stats, speakers show, report, sql, devices).")
 @click.pass_context
-def main(ctx):
+def main(ctx, machine):
+    ctx.obj = Output(machine)
     reconfigure_streams()
     if ctx.invoked_subcommand != "setup":
         os.environ.update(OFFLINE_ENV)
@@ -110,17 +133,24 @@ def setup():
 @main.command(help="Audio-Eingaenge und OpenVINO-Geraete auflisten.")
 def devices():
     from meetscribe import pipeline
+    inputs, error = [], None
     try:
         picker = pipeline.AudioDevices.sounddevice_picker()
-        Table(
-            ["index", "name", "api", "kanaele", "rate"],
-            [[d["index"], d["name"], picker.hostapis[d["hostapi"]], d["max_input_channels"], int(d["default_samplerate"])]
-             for d in picker.inputs()],
-        ).echo()
+        inputs = [
+            {"index": d["index"], "name": d["name"], "api": picker.hostapis[d["hostapi"]], "channels": d["max_input_channels"], "rate": int(d["default_samplerate"])}
+            for d in picker.inputs()
+        ]
     except Exception as exc:
-        click.echo(f"Audio-Eingaenge nicht lesbar: {pipeline.Reason.of(exc)}", err=True)
+        error = f"Audio-Eingaenge nicht lesbar: {pipeline.Reason.of(exc)}"
+    openvino = pipeline.AudioDevices.openvino_devices()
+    if out().machine:
+        return out().dump({"inputs": inputs, "inputs_error": error, "openvino": openvino})
+    if error:
+        click.echo(error, err=True)
+    else:
+        Table(["index", "name", "api", "kanaele", "rate"], [[d["index"], d["name"], d["api"], d["channels"], d["rate"]] for d in inputs]).echo()
     click.echo()
-    Table(["openvino", "name"], [[r["device"], r["name"]] for r in pipeline.AudioDevices.openvino_devices()]).echo()
+    Table(["openvino", "name"], [[r["device"], r["name"]] for r in openvino]).echo()
 
 
 @main.command(help="Aufnahme bis Strg+C oder --seconds.")
@@ -219,21 +249,19 @@ def rotate(older_than_days, force):
 @click.option("--limit", type=int, default=20, show_default=True)
 def search(term, meeting, speaker, limit):
     rows = Query(get_store()).search(term, meeting_id=meeting, speaker=speaker, limit=limit)
-    echo_records(rows, ["meeting_id", "seg_id", "start_s", "display_name", "text"])
+    out().records(rows, ["meeting_id", "seg_id", "start_s", "display_name", "text"])
 
 
 @main.command(help="Alle Besprechungen auflisten.")
 def meetings():
-    echo_records(Query(get_store()).meetings(), ["meeting_id", "title", "meeting_date", "segments", "speakers", "duration_s", "device"])
+    out().records(Query(get_store()).meetings(), ["meeting_id", "title", "meeting_date", "segments", "speakers", "duration_s", "device"])
 
 
 @main.command(help="Redezeit und Woerter je Sprecher.")
 @click.option("--meeting", default=None)
 def stats(meeting):
     rows = Query(get_store()).speaker_stats(meeting)
-    for row in rows:
-        row["share"] = None if row["share"] is None else f"{row['share'] * 100:.1f} %"
-    echo_records(rows, ["meeting_id", "speaker", "labels", "talk_s", "share", "segments", "words"])
+    out().records(rows, ["meeting_id", "speaker", "labels", "talk_s", "share", "segments", "words"], formats={"share": lambda v: f"{v * 100:.1f} %"})
 
 
 @main.group(name="speakers", help="Sprecherzuordnung anzeigen und aendern.")
@@ -254,7 +282,7 @@ def speakers_show(meeting_id):
         "FROM segments_named WHERE meeting_id = ? GROUP BY speaker ORDER BY speaker",
         [meeting_id],
     )
-    Table(columns, rows).echo()
+    out().records([dict(zip(columns, row)) for row in rows])
 
 
 def known_labels(store, meeting_id):
@@ -291,18 +319,21 @@ def speakers_unset(label, meeting_id):
 
 @main.command(help="Markdown-Protokoll erzeugen (Standard: letzte Besprechung).")
 @click.argument("meeting_id", required=False)
-@click.option("--out", type=click.Path(dir_okay=False, path_type=Path), default=None, help="Zieldatei statt Ausgabe.")
-def report(meeting_id, out):
+@click.option("--out", "target", type=click.Path(dir_okay=False, path_type=Path), default=None, help="Zieldatei statt Ausgabe.")
+def report(meeting_id, target):
     store = get_store()
     meeting_id = require_meeting(store, meeting_id)
     try:
         text = Report(Query(store)).render(meeting_id)
     except MeetingNotFound as exc:
         raise click.ClickException(str(exc)) from exc
-    if out:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(text, encoding="utf-8")
-        click.echo(f"geschrieben: {out}")
+    if target:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    if out().machine:
+        return out().dump({"meeting_id": meeting_id, "path": str(target) if target else None, "markdown": text})
+    if target:
+        click.echo(f"geschrieben: {target}")
     else:
         click.echo(text, nl=False)
 
@@ -315,4 +346,4 @@ def sql(query):
         columns, rows = Query(get_store()).execute(query)
     except duckdb.Error as exc:
         raise click.ClickException(str(exc)) from exc
-    Table(columns, rows, clip=None).echo()
+    out().table(columns, rows, clip=None)

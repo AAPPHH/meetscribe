@@ -1,3 +1,5 @@
+import json
+import math
 import os
 import re
 import time
@@ -414,6 +416,24 @@ class Query:
             "FROM t GROUP BY meeting_id, display_name ORDER BY meeting_id, talk_s DESC, speaker",
             params,
         )
+
+
+class Json:
+    @classmethod
+    def clean(cls, value):
+        if isinstance(value, dict):
+            return {str(k): cls.clean(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls.clean(v) for v in value]
+        return None if isinstance(value, float) and not math.isfinite(value) else value
+
+    @staticmethod
+    def default(value):
+        return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+    @classmethod
+    def dumps(cls, data):
+        return json.dumps(cls.clean(data), ensure_ascii=True, default=cls.default)
 
 
 class Report:

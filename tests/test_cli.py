@@ -1,9 +1,11 @@
+import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
 import threading
+import time
 import types
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -702,3 +704,58 @@ def test_record_stream_open_failure_leaves_no_file(real_recorder):
 def test_search_help_does_not_promise_full_text_search():
     text = invoke("search", "--help").output
     assert "Volltext" not in text and "Teilstring" in text
+
+
+def parsed(result):
+    assert result.exit_code == 0, result.output
+    return json.loads(result.stdout)
+
+
+def test_json_switch_covers_read_commands(env):
+    add_pyannote(env)
+    assert transcribe(env, "--speakers", "2").exit_code == 0
+    assert invoke("speakers", "set", "SPEAKER_00", "Anna").exit_code == 0
+    meetings = parsed(invoke("--json", "meetings"))
+    assert [m["meeting_id"] for m in meetings] == ["m1"] and meetings[0]["segments"] == 2 and meetings[0]["meeting_date"] == "2026-03-04"
+    hits = parsed(invoke("--json", "search", "münchen"))
+    assert len(hits) == 1 and hits[0]["display_name"] == "Anna" and hits[0]["speaker"] == "SPEAKER_00" and hits[0]["text"].startswith("Grüße")
+    stats = parsed(invoke("--json", "stats"))
+    assert {r["speaker"] for r in stats} == {"Anna", "SPEAKER_01"} and all(isinstance(r["share"], float) and r["labels"] for r in stats)
+    shown = parsed(invoke("--json", "speakers", "show"))
+    assert {r["label"]: r["name"] for r in shown} == {"SPEAKER_00": "Anna", "SPEAKER_01": "SPEAKER_01"}
+    document = parsed(invoke("--json", "report"))
+    assert document["meeting_id"] == "m1" and document["path"] is None and "Anna" in document["markdown"]
+    target = env["tmp"] / "out" / "p.md"
+    written = parsed(invoke("--json", "report", "m1", "--out", target))
+    assert written["path"] == str(target) and target.read_text(encoding="utf-8") == written["markdown"]
+    table = parsed(invoke("--json", "sql", "SELECT 1 AS a, 2 AS a, 'ü' AS b, 'nan'::DOUBLE AS c, DATE '2026-01-02' AS d"))
+    assert table == {"columns": ["a", "a", "b", "c", "d"], "rows": [[1, 2, "ü", None, "2026-01-02"]]}
+    assert parsed(invoke("--json", "meetings")) == meetings
+    assert parsed(invoke("--json", "search", "gibtesnicht")) == []
+
+
+def test_json_output_is_ascii_and_default_output_unchanged(env):
+    assert transcribe(env, "--no-diarize").exit_code == 0
+    raw = invoke("--json", "search", "München").stdout
+    assert raw.isascii() and "\u00fc" not in raw and "M\u00fcnchen" in json.loads(raw)[0]["text"]
+    human = invoke("search", "München").output
+    assert human.startswith("meeting_id") and "München" in human and not human.startswith("[")
+    assert invoke("meetings").output.startswith("meeting_id")
+    assert invoke("report").output.startswith("#")
+
+
+def test_json_devices_lists_inputs_and_openvino(env, monkeypatch):
+    monkeypatch.setattr(pipeline.AudioDevices, "openvino_devices", staticmethod(lambda: [{"device": "NPU", "name": "Intel NPU"}]))
+    data = parsed(invoke("--json", "devices"))
+    assert data["openvino"] == [{"device": "NPU", "name": "Intel NPU"}] and data["inputs_error"] is None
+    assert [d["name"] for d in data["inputs"]] == [LAPTOP["name"], DJI["name"]]
+    assert data["inputs"][0] == {"index": 0, "name": LAPTOP["name"], "api": "MME", "channels": 2, "rate": 16000}
+    human = invoke("devices").output
+    assert "kanaele" in human and "Intel NPU" in human
+
+    def broken():
+        raise OSError("kein Treiber")
+
+    monkeypatch.setattr(pipeline.AudioDevices, "sounddevice_picker", staticmethod(broken))
+    data = parsed(invoke("--json", "devices"))
+    assert data["inputs"] == [] and "kein Treiber" in data["inputs_error"] and data["openvino"]

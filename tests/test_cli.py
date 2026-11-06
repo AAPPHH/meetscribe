@@ -90,6 +90,7 @@ def env(tmp_path, monkeypatch):
     for spec in pipeline.MODELS.values():
         (models / spec["dir"]).mkdir(parents=True, exist_ok=True)
         (models / spec["dir"] / "openvino_model.xml").write_text("x")
+        (models / spec["dir"] / "openvino_model.bin").write_bytes(b"x")
     monkeypatch.setenv("MEETSCRIBE_DATA", str(tmp_path / "data"))
     monkeypatch.setenv("MEETSCRIBE_MODELS", str(models))
     monkeypatch.delenv("MEETSCRIBE_DEVICE", raising=False)
@@ -983,3 +984,44 @@ def test_error_event_carries_unclipped_detail_and_done_counts_stored_speakers(en
     assert long_path in failed["detail"] and "Ursache: kaputt" in failed["detail"] and long_path in failed["message"]
     done = events_of(invoke("start", "--events", "--no-diarize", env["audio"]))[-1]
     assert done["event"] == "done" and done["speakers"] == 1 and done["labels"] == []
+
+
+def truncated_meeting(env, meeting_id="m-teil"):
+    with pytest.raises(KeyError):
+        with env["store"].writer(meeting_id, title="Teil", meeting_date="2026-03-04", language="de") as writer:
+            writer.append([{"start_s": 0.0, "end_s": 1.0, "speaker": "UNKNOWN", "text": "halb"}])
+            raise KeyError
+    return meeting_id
+
+
+def test_truncated_meeting_is_flagged_in_listing_and_report_and_can_be_discarded(env):
+    assert transcribe(env, "--no-diarize").exit_code == 0
+    truncated_meeting(env)
+    flags = {m["meeting_id"]: m["complete"] for m in parsed(invoke("--json", "meetings"))}
+    assert flags == {"m1": True, "m-teil": False}
+    assert "NEIN" in invoke("meetings").output
+    assert "unvollständig" in invoke("report", "m-teil").output and "unvollständig" not in invoke("report", "m1").output
+    refused = invoke("discard", "m1")
+    assert refused.exit_code == 1 and "vollstaendig" in refused.output and env["store"].exists("m1")
+    assert invoke("discard", "m-teil").exit_code == 0 and not env["store"].exists("m-teil")
+    assert invoke("discard", "m-teil").exit_code == 1
+
+
+def test_whisper_model_needs_nonempty_graph_and_weights(tmp_path):
+    folder = tmp_path / "w"
+    folder.mkdir()
+    assert not pipeline.Models.whisper_ready(folder)
+    (folder / "leer.xml").write_text("")
+    assert not pipeline.Models.whisper_ready(folder)
+    (folder / "leer.xml").write_text("<net/>")
+    assert not pipeline.Models.whisper_ready(folder)
+    (folder / "leer.bin").write_bytes(b"")
+    assert not pipeline.Models.whisper_ready(folder)
+    (folder / "leer.bin").write_bytes(b"w")
+    assert pipeline.Models.whisper_ready(folder)
+
+
+def test_check_marks_speaker_rows_as_diarize_scope(env):
+    rows = {r["id"]: r for r in parsed(invoke("--json", "check"))}
+    assert rows["pyannote"]["scope"] == rows["hf_token"]["scope"] == "diarize"
+    assert rows["ffmpeg"]["scope"] is None

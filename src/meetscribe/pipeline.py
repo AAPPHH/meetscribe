@@ -114,7 +114,8 @@ class Models:
 
     @staticmethod
     def whisper_ready(path):
-        return path.is_dir() and any(path.glob("*.xml"))
+        graphs = list(path.glob("*.xml")) if path.is_dir() else []
+        return bool(graphs) and all(g.stat().st_size and g.with_suffix(".bin").is_file() and g.with_suffix(".bin").stat().st_size for g in graphs)
 
     def diarization_missing(self):
         diar = SETTINGS["diarization"]
@@ -1051,8 +1052,8 @@ class SetupCheck:
         self.token = os.environ.get(SETTINGS["diarization"]["token_env"]) if token is None else token
 
     @staticmethod
-    def row(key, label, ok, fix):
-        return {"id": key, "label": label, "ok": bool(ok), "fix": None if ok else fix}
+    def row(key, label, ok, fix, scope=None):
+        return {"id": key, "label": label, "ok": bool(ok), "fix": None if ok else fix, "scope": scope}
 
     def run(self):
         diar = SETTINGS["diarization"]
@@ -1064,8 +1065,8 @@ class SetupCheck:
             ready = Models.whisper_ready(self.models.root / name)
             rows.append(self.row(f"whisper:{name}", f"Whisper-Modell ({'/'.join(devices)})", ready, f"'meetscribe setup' ausfuehren; es laedt {name} nach {self.models.root}."))
         ready = self.models.diarization_ready()
-        rows.append(self.row("pyannote", "pyannote-Modell (Sprechertrennung)", ready, f"{diar['token_env']} setzen und 'meetscribe setup' erneut ausfuehren; bis dahin ohne Sprechertrennung arbeiten."))
-        rows.append(self.row("hf_token", f"{diar['token_env']} (nur fuer 'meetscribe setup')", ready or self.token, f"{diar['token_env']} setzen (Zugriff auf huggingface.co/{diar['repo']} freischalten)."))
+        rows.append(self.row("pyannote", "pyannote-Modell (Sprechertrennung)", ready, f"{diar['token_env']} setzen und 'meetscribe setup' erneut ausfuehren; bis dahin ohne Sprechertrennung arbeiten.", "diarize"))
+        rows.append(self.row("hf_token", f"{diar['token_env']} (nur fuer 'meetscribe setup')", ready or self.token, f"{diar['token_env']} setzen (Zugriff auf huggingface.co/{diar['repo']} freischalten).", "diarize"))
         return rows
 
 

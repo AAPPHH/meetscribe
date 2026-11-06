@@ -263,6 +263,20 @@ def rotate(older_than_days, force):
         click.echo(f"uebersprungen: {skipped['meeting_id']} ({skipped['reason']})")
 
 
+@main.command(help="Unvollstaendige Besprechung verwerfen (Rest einer abgebrochenen Verarbeitung).")
+@click.argument("meeting_id")
+def discard(meeting_id):
+    store = get_store()
+    meeting_id = require_meeting(store, meeting_id)
+    if meeting_id not in store.incomplete():
+        raise click.ClickException(f"{meeting_id} ist vollstaendig und wird nicht verworfen.")
+    try:
+        store.discard(meeting_id)
+    except OSError as exc:
+        raise click.ClickException(f"{meeting_id} konnte nicht verworfen werden: {exc}") from exc
+    click.echo(f"{meeting_id} verworfen")
+
+
 @main.command(help="Teilstring-Suche (ohne Gross-/Kleinschreibung) in den Segmenten.")
 @click.argument("term")
 @click.option("--meeting", default=None)
@@ -275,7 +289,7 @@ def search(term, meeting, speaker, limit):
 
 @main.command(help="Alle Besprechungen auflisten.")
 def meetings():
-    out().records(Query(get_store()).meetings(), ["meeting_id", "title", "meeting_date", "segments", "speakers", "duration_s", "device"])
+    out().records(Query(get_store()).meetings(), ["meeting_id", "title", "meeting_date", "segments", "speakers", "duration_s", "device", "complete"], formats={"complete": lambda v: "ja" if v else "NEIN"})
 
 
 @main.command(help="Redezeit und Woerter je Sprecher.")

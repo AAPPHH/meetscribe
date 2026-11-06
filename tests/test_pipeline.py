@@ -277,6 +277,7 @@ def test_interrupted_diarization_setup_fails_preflight(tmp_path):
     write_snapshot(models, SNAPSHOT_YAML)
     (tmp_path / pipeline.MODELS["npu"]["dir"]).mkdir()
     (tmp_path / pipeline.MODELS["npu"]["dir"] / "m.xml").write_text("x")
+    (tmp_path / pipeline.MODELS["npu"]["dir"] / "m.bin").write_bytes(b"x")
     with pytest.raises(PipelineError, match="unvollstaendig.*segmentation.*--no-diarize"):
         TranscribeJob(None, "a.wav", "npu", "de", models=models).check()
     TranscribeJob(None, "a.wav", "npu", "de", models=models, diarize=False).check()

@@ -328,8 +328,10 @@ class Query:
         state = self._state()
         if state == self._signature:
             return
-        tables = [HotFile(p).read()[0] for p in self.store.hot_files()]
+        reads = [(p.stem, *HotFile(p).read()) for p in self.store.hot_files()]
+        tables = [table for _, table, _ in reads]
         self.con.register("hot_raw", pa.concat_tables(tables) if tables else SCHEMA.empty_table())
+        self.con.register("incomplete_ids", pa.table({"meeting_id": pa.array([m for m, _, complete in reads if not complete], pa.string())}))
         self.con.register("speakers", self.store.speakers.all())
         source = "empty_segments"
         if self.store.cold_files():
@@ -395,9 +397,13 @@ class Query:
             "count(*)::BIGINT AS segments, count(DISTINCT speaker)::BIGINT AS speakers, max(end_s) AS duration_s, "
             "string_agg(DISTINCT language, ', ' ORDER BY language) AS language, "
             "string_agg(DISTINCT model, ', ' ORDER BY model) AS model, "
-            "string_agg(DISTINCT device, ', ' ORDER BY device) AS device "
+            "string_agg(DISTINCT device, ', ' ORDER BY device) AS device, "
+            "meeting_id NOT IN (SELECT meeting_id FROM incomplete_ids) AS complete "
             "FROM segments GROUP BY meeting_id ORDER BY meeting_date DESC, meeting_id"
         )
+
+    def is_incomplete(self, meeting_id):
+        return bool(self._records("SELECT meeting_id FROM incomplete_ids WHERE meeting_id = ?", [meeting_id]))
 
     def latest_meeting(self):
         rows = self._records("SELECT meeting_id FROM segments GROUP BY meeting_id ORDER BY max(created_at) DESC, meeting_id DESC LIMIT 1")
@@ -473,6 +479,8 @@ class Report:
             ("Gerät", info["device"]),
         )
         lines += [f"- **{label}:** {value}" for label, value in facts if value]
+        if self.query.is_incomplete(meeting_id):
+            lines.append("- **Status:** unvollständig, die Verarbeitung wurde abgebrochen")
         lines += ["", "## Teilnehmer", "", "| Name | Redezeit | Redeanteil | Wörter |", "|---|---|---|---|"]
         for s in self.query.speaker_stats(meeting_id):
             lines.append(

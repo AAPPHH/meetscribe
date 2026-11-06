@@ -386,7 +386,8 @@ class Query:
             speaker=("(speaker = ? OR display_name = ?)", speaker),
         )
         return self._records(
-            "SELECT meeting_id, seg_id, start_s, end_s, speaker, display_name, text FROM segments_named"
+            "SELECT meeting_id, seg_id, start_s, end_s, speaker, display_name, text, "
+            "meeting_id NOT IN (SELECT meeting_id FROM incomplete_ids) AS complete FROM segments_named"
             f"{where} ORDER BY meeting_date, meeting_id, seg_id LIMIT ?",
             [*params, int(limit)],
         )

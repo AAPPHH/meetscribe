@@ -322,6 +322,15 @@ def test_meetings_of_one_day_are_listed_newest_first_not_alphabetically(store):
     assert [m["meeting_id"] for m in Query(store).meetings()] == ["zulu-runde", "alpha-runde", "zebra-runde", "aelter"]
 
 
+def test_search_hits_say_whether_their_meeting_is_complete(store):
+    write(store, "fertig")
+    write(store, "teil")
+    path = store.hot_path("teil")
+    path.write_bytes(path.read_bytes()[: -len(EOS)])
+    flags = {h["meeting_id"]: h["complete"] for h in Query(store).search("Fangen")}
+    assert flags == {"fertig": True, "teil": False}
+
+
 def test_report_content(store):
     with store.writer("r1", title="Projekt K\u00fcche", meeting_date="2026-03-04", language="de",
                       model="whisper-small", device="NPU") as w:

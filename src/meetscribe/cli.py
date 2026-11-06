@@ -100,7 +100,13 @@ def require_meeting(store, meeting_id):
     return meeting_id
 
 
-@click.group(help="Lokale Besprechungsabschriften: Aufnahme, Transkription, Archiv und Protokoll.")
+class Cli(click.Group):
+    def main(self, *args, **kwargs):
+        kwargs.setdefault("windows_expand_args", False)
+        return super().main(*args, **kwargs)
+
+
+@click.group(cls=Cli, help="Lokale Besprechungsabschriften: Aufnahme, Transkription, Archiv und Protokoll.")
 @click.option("--json", "machine", is_flag=True, help="Maschinenlesbare JSON-Ausgabe (meetings, search, stats, speakers show, report, sql, devices).")
 @click.pass_context
 def main(ctx, machine):

@@ -922,3 +922,19 @@ def test_start_events_keep_stdout_clean_of_foreign_prints(env, monkeypatch):
     monkeypatch.setattr(pipeline.StartFlow, "process", noisy)
     result = start("--events", "--no-diarize", env["audio"])
     assert result.exit_code == 0 and all(line.startswith("{") for line in result.stdout.splitlines())
+
+
+def test_values_reach_the_engine_unexpanded_on_the_real_entry_point(env, tmp_path):
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / "a.txt").write_text("x")
+    (cwd / "b.txt").write_text("x")
+    run_env = {**os.environ, "MEETSCRIBE_DATA": str(tmp_path / "data"), "USERNAME": "Anna", "PYTHONUTF8": "1"}
+
+    def entry(*args):
+        return subprocess.run([sys.executable, "-c", "from meetscribe.cli import main; main()", *args], cwd=cwd, env=run_env, capture_output=True, text=True)
+
+    star = entry("--json", "search", "--", "*")
+    assert (star.returncode, json.loads(star.stdout)) == (0, [])
+    literal = entry("--json", "sql", "SELECT '%USERNAME%' AS a, '~' AS b")
+    assert json.loads(literal.stdout)["rows"] == [["%USERNAME%", "~"]]

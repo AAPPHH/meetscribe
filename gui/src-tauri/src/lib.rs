@@ -25,6 +25,8 @@ const STDERR_TAIL: usize = 12;
 const POLL_MS: u64 = 50;
 const DISCARD_TRIES: usize = 4;
 const DISCARD_WAIT_MS: u64 = 300;
+const HEARTBEAT_EVENT: &str = "alive";
+const STILL_RUNNING: &str = "Die frühere Verarbeitung läuft vermutlich noch. Bitte einen Moment warten und es dann erneut versuchen.";
 const EVENT_NAME: &str = "engine-event";
 const EXIT_NAME: &str = "engine-exit";
 const CLOSE_NAME: &str = "close-requested";
@@ -187,6 +189,16 @@ impl Engine {
         parse_json_output(&self.run(args)?)
     }
 
+    fn meeting_state(&self, meeting_id: &str) -> Result<MeetingState, String> {
+        let listing = self.json(&["--json", "meetings"])?;
+        let found = listing.as_array().into_iter().flatten().find(|m| m["meeting_id"] == meeting_id);
+        Ok(match found {
+            None => MeetingState::Absent,
+            Some(m) if m["complete"].as_bool() == Some(false) => MeetingState::Partial,
+            Some(_) => MeetingState::Complete,
+        })
+    }
+
     fn discard(&self, meeting_id: &str) -> bool {
         for _ in 0..DISCARD_TRIES {
             if self.run(&["discard", "--", meeting_id]).is_ok() {
@@ -196,6 +208,13 @@ impl Engine {
         }
         false
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MeetingState {
+    Absent,
+    Partial,
+    Complete,
 }
 
 fn parse_json_output(text: &str) -> Result<Value, String> {
@@ -328,7 +347,7 @@ impl Session {
         std::thread::spawn(move || {
             let mut terminal = false;
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some(event) = parse_event(&line) {
+                if let Some(event) = parse_event(&line).filter(|e| e["event"] != HEARTBEAT_EVENT) {
                     runner.info.lock().unwrap().absorb(&event);
                     let mut stage = runner.stage.lock().unwrap();
                     let next = stage.0.after(&event);
@@ -464,8 +483,12 @@ struct PendingStore {
 }
 
 impl PendingStore {
+    fn read(&self) -> Option<Pending> {
+        serde_json::from_str(&std::fs::read_to_string(&self.path).ok()?).ok()
+    }
+
     fn load(&self) -> Option<Pending> {
-        let pending: Pending = serde_json::from_str(&std::fs::read_to_string(&self.path).ok()?).ok()?;
+        let pending = self.read()?;
         if Path::new(&pending.audio).is_file() {
             return Some(pending);
         }
@@ -484,6 +507,43 @@ impl PendingStore {
         if let Ok(text) = serde_json::to_string_pretty(pending) {
             let _ = std::fs::write(&self.path, text);
         }
+    }
+
+    fn settle(&self, engine: &Engine, meeting_id: &str) -> Result<MeetingState, String> {
+        match engine.meeting_state(meeting_id)? {
+            MeetingState::Partial if !engine.discard(meeting_id) => Err(STILL_RUNNING.into()),
+            state => Ok(state),
+        }
+    }
+
+    fn reconcile(&self, engine: &Engine, audio: &str) -> Result<(), String> {
+        let Some(id) = self.load().filter(|p| p.audio == audio).and_then(|p| p.meeting_id) else { return Ok(()) };
+        if self.settle(engine, &id)? == MeetingState::Complete {
+            self.clear();
+            return Err(format!("Diese Verarbeitung ist bereits abgeschlossen ({id}). Das Ergebnis steht unter „Besprechungen“."));
+        }
+        Ok(())
+    }
+
+    fn unfinished(&self, engine: Result<Engine, String>) -> Option<Pending> {
+        let pending = self.load()?;
+        let finished = match (pending.meeting_id.as_deref(), engine) {
+            (Some(id), Ok(engine)) => engine.meeting_state(id) == Ok(MeetingState::Complete),
+            _ => false,
+        };
+        if finished {
+            self.clear();
+            return None;
+        }
+        Some(pending)
+    }
+
+    fn forget(&self, engine: Result<Engine, String>) -> Result<(), String> {
+        if let (Some(id), Ok(engine)) = (self.read().and_then(|p| p.meeting_id), engine) {
+            self.settle(&engine, &id)?;
+        }
+        self.clear();
+        Ok(())
     }
 
     fn observe(&self, event: &Value, options: &StartOptions) {
@@ -621,10 +681,8 @@ async fn start_session(app: AppHandle, state: State<'_, AppState>, options: Star
     let engine = state.engine()?;
     let args = options.args();
     state.launch(|| {
-        if let (Some(pending), Some(audio)) = (state.pending.load(), options.audio()) {
-            if let Some(id) = pending.meeting_id.filter(|_| pending.audio == audio) {
-                engine.discard(&id);
-            }
+        if let Some(audio) = options.audio() {
+            state.pending.reconcile(&engine, &audio)?;
         }
         let pending = PendingStore { path: state.pending.path.clone() };
         let sink: Sink = Arc::new(move |name, payload| {
@@ -651,13 +709,13 @@ fn session_state(state: State<'_, AppState>) -> Value {
 }
 
 #[tauri::command]
-fn pending_run(state: State<'_, AppState>) -> Option<Pending> {
-    state.pending.load()
+async fn pending_run(state: State<'_, AppState>) -> Result<Option<Pending>, String> {
+    Ok(state.pending.unfinished(state.engine()))
 }
 
 #[tauri::command]
-fn discard_pending(state: State<'_, AppState>) {
-    state.pending.clear();
+async fn discard_pending(state: State<'_, AppState>) -> Result<(), String> {
+    state.pending.forget(state.engine())
 }
 
 #[tauri::command]

@@ -8,7 +8,14 @@ fn emit(line: &str) {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let listing = if args.first().map(String::as_str) == Some("--meetings-file") {
+        let text = std::fs::read_to_string(&args[1]).ok();
+        args.drain(..2);
+        text
+    } else {
+        None
+    };
     let has = |flag: &str| args.iter().any(|a| a == flag);
     let mode = std::env::var("FAKE_ENGINE_MODE").unwrap_or_default();
     if args.first().map(String::as_str) == Some("discard") {
@@ -22,6 +29,8 @@ fn main() {
             r##"{"meeting_id":"fake","path":null,"markdown":"# Fake\n\nProtokoll"}"##
         } else if has("check") {
             r#"[{"id":"ffmpeg","label":"ffmpeg","ok":true,"fix":null}]"#
+        } else if has("meetings") {
+            listing.as_deref().unwrap_or("[]")
         } else if has("speakers") {
             "fake gesetzt"
         } else {
@@ -66,6 +75,7 @@ fn main() {
         std::io::stdin().lock().read_line(&mut line).unwrap();
     }
     emit(r#"{"event":"transcribing","audio":"C:\\fake\\aufnahme.flac","meeting_id":"fake-1"}"#);
+    emit(r#"{"event":"alive"}"#);
     std::thread::sleep(Duration::from_millis(400));
     if mode == "process_fail" {
         emit(r#"{"event":"error","message":"Verarbeitung fehlgeschlagen: Test","detail":"Ursache im Detail","audio":"C:\\fake\\aufnahme.flac","meeting_id":null,"retry":"meetscribe start C:\\fake\\aufnahme.flac --device npu --no-open --events","exit_code":1}"#);

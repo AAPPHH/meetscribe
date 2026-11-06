@@ -346,3 +346,90 @@ fn discard_asks_the_engine_to_drop_exactly_that_meeting_and_reports_refusal() {
     assert!(engine.discard("m-teil"));
     assert!(!engine.discard("m-fail"));
 }
+
+const LISTING: &str = r#"[{"meeting_id":"m-fertig","complete":true},{"meeting_id":"m-teil","complete":false},{"meeting_id":"m-fail","complete":false}]"#;
+
+struct PendingCase {
+    dir: PathBuf,
+    store: PendingStore,
+    audio: String,
+}
+
+impl PendingCase {
+    fn new(name: &str) -> PendingCase {
+        let dir = scratch(name);
+        let audio = dir.join("a.flac");
+        std::fs::write(&audio, b"x").unwrap();
+        PendingCase { store: PendingStore { path: dir.join(PENDING_FILE) }, audio: audio.to_string_lossy().to_string(), dir }
+    }
+
+    fn engine(&self) -> Engine {
+        let file = self.dir.join("meetings.json");
+        std::fs::write(&file, LISTING).unwrap();
+        let args = vec!["--meetings-file".to_string(), file.to_string_lossy().to_string()];
+        Engine { spec: EngineSpec { program: fake_engine(), args, source: "test".into() } }
+    }
+
+    fn remember(&self, meeting_id: Option<&str>) {
+        self.store.write(&Pending { audio: self.audio.clone(), meeting_id: meeting_id.map(String::from), title: None, device: "gpu".into(), diarize: false });
+    }
+}
+
+#[test]
+fn meeting_state_tells_absent_partial_and_complete_apart() {
+    let engine = PendingCase::new("state").engine();
+    assert_eq!(engine.meeting_state("m-fertig"), Ok(MeetingState::Complete));
+    assert_eq!(engine.meeting_state("m-teil"), Ok(MeetingState::Partial));
+    assert_eq!(engine.meeting_state("m-weg"), Ok(MeetingState::Absent));
+    let broken = Engine { spec: EngineSpec::direct(r"C:\gibt\es\nicht.exe", "test") };
+    assert!(broken.meeting_state("m-teil").is_err());
+}
+
+#[test]
+fn a_run_that_finished_after_the_window_died_is_not_offered_and_not_started_twice() {
+    let case = PendingCase::new("finished");
+    case.remember(Some("m-fertig"));
+    let err = case.store.reconcile(&case.engine(), &case.audio).unwrap_err();
+    assert!(err.contains("bereits abgeschlossen") && err.contains("m-fertig"));
+    assert!(!case.store.path.exists());
+    case.remember(Some("m-fertig"));
+    assert!(case.store.unfinished(Ok(case.engine())).is_none() && !case.store.path.exists());
+    let _ = std::fs::remove_dir_all(&case.dir);
+}
+
+#[test]
+fn a_partial_run_is_discarded_before_the_retry_and_a_run_that_still_holds_it_blocks_the_retry() {
+    let case = PendingCase::new("partial");
+    case.remember(Some("m-teil"));
+    assert_eq!(case.store.unfinished(Ok(case.engine())).unwrap().meeting_id.as_deref(), Some("m-teil"));
+    assert!(case.store.reconcile(&case.engine(), &case.audio).is_ok());
+    case.remember(Some("m-fail"));
+    assert_eq!(case.store.reconcile(&case.engine(), &case.audio).unwrap_err(), STILL_RUNNING);
+    assert!(case.store.path.exists());
+    case.remember(Some("m-teil"));
+    assert!(case.store.reconcile(&case.engine(), r"C:\ein\anderes\audio.flac").is_ok());
+    case.remember(None);
+    assert!(case.store.reconcile(&case.engine(), &case.audio).is_ok() && case.store.path.exists());
+    let _ = std::fs::remove_dir_all(&case.dir);
+}
+
+#[test]
+fn forgetting_removes_the_partial_meeting_but_never_a_complete_one() {
+    let case = PendingCase::new("forget");
+    case.remember(Some("m-fail"));
+    assert_eq!(case.store.forget(Ok(case.engine())).unwrap_err(), STILL_RUNNING);
+    assert!(case.store.path.exists());
+    for id in [Some("m-teil"), Some("m-fertig"), Some("m-weg"), None] {
+        case.remember(id);
+        assert!(case.store.forget(Ok(case.engine())).is_ok() && !case.store.path.exists());
+    }
+    case.remember(Some("m-teil"));
+    assert!(case.store.forget(Err("keine Engine".into())).is_ok() && !case.store.path.exists());
+    let _ = std::fs::remove_dir_all(&case.dir);
+}
+
+#[test]
+fn heartbeat_events_never_reach_the_frontend() {
+    let (events, _) = run_fake("", &["start", "x.wav", "--events"], None);
+    assert_eq!(names(&events), ["preflight", "transcribing", "done", "exit"]);
+}

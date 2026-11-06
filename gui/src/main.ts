@@ -23,7 +23,7 @@ type Pending = { audio: string; meeting_id: string | null; title: string | null;
 type Platform = { mobile: boolean; notice: string | null };
 type Check = { id: string; label: string; ok: boolean; fix: string | null; detail?: string | null; scope?: string | null };
 type Meeting = { meeting_id: string; title: string | null; meeting_date: string; segments: number; speakers: number; duration_s: number; complete?: boolean };
-type Hit = { meeting_id: string; start_s: number; display_name: string; text: string };
+type Hit = { meeting_id: string; start_s: number; display_name: string; text: string; complete?: boolean };
 type Devices = { inputs: { name: string }[]; inputs_error: string | null; openvino: { device: string; name: string }[] };
 
 const TEXT = {
@@ -253,8 +253,14 @@ class StartView {
   }
 
   async discardPending() {
-    await call("discard_pending").catch(() => undefined);
+    let status = "";
+    try {
+      await call("discard_pending");
+    } catch (err) {
+      status = text(err);
+    }
     await this.showPending();
+    $("pending-status").textContent = status;
   }
 
   show(view: "idle" | "running" | "names" | "error") {
@@ -440,7 +446,8 @@ class StartView {
     $("error-audio").textContent = ev.audio ? `Das Audio ist erhalten: ${ev.audio}` : "";
     $("error-retry").textContent = ev.retry ? `Kommandozeile: ${ev.retry}` : "";
     $("error-detail").textContent = ev.detail ?? "";
-    $("error-more").hidden = !ev.detail;
+    const detail = (ev.detail ?? "").trim();
+    $("error-more").hidden = !detail || detail === (ev.message ?? "").trim();
     $("retry").hidden = !(ev.audio && !ev.meeting_id);
     $("error-meetings").hidden = !ev.meeting_id;
     this.show("error");
@@ -540,7 +547,9 @@ class SearchView {
       for (const h of hits) {
         const item = el("li");
         item.tabIndex = 0;
-        item.append(el("div", `${h.meeting_id} · ${clock(h.start_s)} · ${h.display_name}`, "meta"), el("div", h.text));
+        const meta = el("div", `${h.meeting_id} · ${clock(h.start_s)} · ${h.display_name}`, "meta");
+        if (h.complete === false) meta.append(el("span", "unvollständig", "tag"));
+        item.append(meta, el("div", h.text));
         const open = async () => {
           this.tabs.select("meetings");
           await this.meetings.load();
@@ -661,6 +670,7 @@ class ChecksView {
     const failing = rows.some((r) => !r.ok && !this.skipped(r));
     $("check-badge").hidden = !failing;
     $("setup-warning").hidden = !failing;
+    $("setup-hint").hidden = !rows.some((r) => !r.ok && r.scope === "diarize" && !this.skipped(r));
   }
 }
 

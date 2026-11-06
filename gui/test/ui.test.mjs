@@ -277,6 +277,41 @@ test("Zurück nach einem Fehler lässt Titel und Audiopfad stehen, Neue Aufnahme
   assert.equal(ui.$("audio").value, AUDIO);
 });
 
+test("Einzelheiten erscheinen nicht, wenn sie die Meldung nur wiederholen", async () => {
+  const ui = await boot({ start_session: () => null });
+  await startRun(ui);
+  await ui.emit("engine-event", { event: "error", message: "Es hat nicht geklappt.", detail: " Es hat nicht geklappt. ", audio: null, meeting_id: null });
+  assert.equal(ui.$("error-more").hidden, true);
+});
+
+test("Vergessen zeigt den Grund und lässt die Anzeige stehen, wenn die alte Verarbeitung noch läuft", async () => {
+  const pending = { audio: AUDIO, meeting_id: "m-1", title: null, device: "npu", diarize: true };
+  const ui = await boot({ pending_run: () => pending, discard_pending: () => Promise.reject("Die frühere Verarbeitung läuft vermutlich noch.") });
+  await ui.click("pending-discard");
+  assert.equal(ui.$("pending").hidden, false);
+  assert.ok(ui.$("pending-status").textContent.includes("läuft vermutlich noch"));
+});
+
+test("Suchtreffer aus unvollständigen Besprechungen sind markiert", async () => {
+  const hit = (id, complete) => ({ meeting_id: id, start_s: 5, display_name: "Anna", text: "Hallo", complete });
+  const ui = await boot({ search_text: () => [hit("ganz", true), hit("teil", false)] });
+  document.querySelector('[data-tab="search"]').click();
+  ui.$("search-term").value = "hallo";
+  ui.$("search-form").dispatchEvent(new dom.window.Event("submit", { cancelable: true }));
+  await flush();
+  const tags = [...document.querySelectorAll("#search-results li")].map((li) => li.querySelector(".tag")?.textContent ?? null);
+  assert.deepEqual(tags, [null, "unvollständig"]);
+});
+
+test("der Hinweis auf die schnelle Lösung erscheint nur, wenn die Sprechertrennung wirklich fehlt", async () => {
+  const on = await boot({ run_checks: () => ROWS });
+  assert.equal(on.$("setup-hint").hidden, false);
+  assert.ok(on.$("setup-hint").textContent.includes("Sprecher trennen"));
+  dom.window.close();
+  const off = await boot({ run_checks: () => ROWS }, { diarize: false });
+  assert.equal(off.$("setup-hint").hidden, true);
+});
+
 test("lange Pfade laufen im Dialog nicht über den Rand", () => {
   const css = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
   for (const rule of [".dialog", ".muted", ".notice"]) assert.match(css, new RegExp(`${rule.replace(".", "\.")} \{[^}]*overflow-wrap: anywhere`));

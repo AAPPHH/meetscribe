@@ -21,6 +21,7 @@
   <section id="tab-start" class="panel">
     <div id="setup-warning" class="notice error" hidden>
       Die Einrichtung ist unvollständig.
+      <span id="setup-hint" hidden>Schnelle Lösung für die Sprechertrennung: unter „Einstellungen“ den Haken bei „Sprecher trennen“ entfernen.</span>
       <button id="goto-checks" class="link">Prüfung öffnen</button>
     </div>
     <div id="platform-notice" class="notice error" hidden></div>
@@ -32,6 +33,7 @@
           <button id="pending-retry" class="primary">Erneut versuchen</button>
           <button id="pending-discard">Vergessen</button>
         </div>
+        <p id="pending-status" class="muted"></p>
       </div>
       <button id="start" class="big">Aufnahme starten</button>
       <label class="field">Titel (optional)

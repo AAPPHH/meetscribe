@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meetscribe</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Meetscribe</h1>
+  <nav id="tabs">
+    <button data-tab="start" class="active">Aufnehmen</button>
+    <button data-tab="meetings">Besprechungen</button>
+    <button data-tab="search">Suche</button>
+    <button data-tab="settings">Einstellungen</button>
+    <button data-tab="checks">Prüfung<span id="check-badge" class="badge" hidden>!</span></button>
+  </nav>
+</header>
+<main>
+  <section id="tab-start" class="panel">
+    <div id="setup-warning" class="notice error" hidden>
+      Die Einrichtung ist unvollständig.
+      <button id="goto-checks" class="link">Prüfung öffnen</button>
+    </div>
+    <div id="view-idle">
+      <button id="start" class="big">Aufnahme starten</button>
+      <label class="field">Titel (optional)
+        <input id="title" type="text" autocomplete="off" placeholder="z. B. Projektrunde">
+      </label>
+      <label class="field">Vorhandene Aufnahme statt Mikrofon (optional)
+        <span class="row">
+          <input id="audio" type="text" autocomplete="off" placeholder="Pfad zu einer Audio- oder Videodatei">
+          <button id="pick" type="button">Datei wählen</button>
+        </span>
+      </label>
+      <p id="summary" class="muted"></p>
+    </div>
+    <div id="view-running" hidden>
+      <div class="status">
+        <div id="stage" class="stage">Vorbereitung</div>
+        <div id="elapsed" class="elapsed">00:00</div>
+        <div id="input-name" class="muted"></div>
+      </div>
+      <button id="stop" class="big stop" hidden>Aufnahme beenden</button>
+    </div>
+    <ul id="warnings" class="warnings" hidden></ul>
+    <div id="view-names" hidden>
+      <h2 id="result-title">Fertig</h2>
+      <p id="result-info" class="muted"></p>
+      <div id="names"></div>
+      <div class="row buttons">
+        <button id="save-names" class="primary">Namen speichern</button>
+        <button id="open-report">Protokoll öffnen</button>
+        <button id="again">Neue Aufnahme</button>
+      </div>
+      <p id="names-status" class="muted"></p>
+    </div>
+    <div id="view-error" hidden>
+      <div class="notice error"><strong id="error-message"></strong></div>
+      <p id="error-audio" class="muted"></p>
+      <p id="error-retry" class="muted"></p>
+      <div class="row buttons">
+        <button id="retry" class="primary" hidden>Erneut versuchen</button>
+        <button id="error-meetings" hidden>Zu den Besprechungen</button>
+        <button id="error-back">Zurück</button>
+      </div>
+    </div>
+  </section>
+  <section id="tab-meetings" class="panel" hidden>
+    <div class="row buttons"><button id="reload-meetings">Aktualisieren</button></div>
+    <p id="meetings-status" class="muted"></p>
+    <div class="table-wrap"><table id="meetings-table"><thead><tr><th>Datum</th><th>Titel</th><th>Sprecher</th><th>Dauer</th></tr></thead><tbody></tbody></table></div>
+    <article id="report-view" class="report" hidden></article>
+  </section>
+  <section id="tab-search" class="panel" hidden>
+    <form id="search-form" class="row">
+      <input id="search-term" type="search" placeholder="Suchbegriff" autocomplete="off">
+      <button type="submit" class="primary">Suchen</button>
+    </form>
+    <p id="search-status" class="muted"></p>
+    <ul id="search-results" class="results"></ul>
+  </section>
+  <section id="tab-settings" class="panel" hidden>
+    <label class="field">Gerät für die Transkription
+      <select id="set-device">
+        <option value="npu">NPU (Standard)</option>
+        <option value="gpu">GPU</option>
+        <option value="cpu">CPU</option>
+      </select>
+    </label>
+    <label class="field">Mikrofon
+      <span class="row">
+        <select id="set-mic"></select>
+        <button id="reload-devices" type="button">Neu einlesen</button>
+      </span>
+    </label>
+    <label class="check"><input id="set-diarize" type="checkbox"> Sprecher trennen</label>
+    <p id="devices-info" class="muted"></p>
+    <h2>Engine</h2>
+    <label class="field">Pfad zu meetscribe.exe (leer = Standard)
+      <input id="set-engine" type="text" autocomplete="off">
+    </label>
+    <label class="field">Projektordner für den Rückfall über uv (leer = Standard)
+      <input id="set-repo" type="text" autocomplete="off">
+    </label>
+    <div class="row buttons"><button id="save-engine" class="primary">Speichern</button></div>
+    <p id="engine-info" class="muted"></p>
+    <p id="settings-status" class="muted"></p>
+  </section>
+  <section id="tab-checks" class="panel" hidden>
+    <div class="row buttons"><button id="reload-checks">Erneut prüfen</button></div>
+    <ul id="check-list" class="checks"></ul>
+  </section>
+</main>
+<div id="modal" class="modal" hidden>
+  <div class="dialog" role="dialog" aria-modal="true">
+    <h2 id="modal-title"></h2>
+    <p id="modal-text"></p>
+    <div class="row buttons">
+      <button id="modal-keep" class="primary"></button>
+      <button id="modal-confirm"></button>
+    </div>
+  </div>
+</div>
+<script type="module" src="main.js"></script>
+</body>
+</html>

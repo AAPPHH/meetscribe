@@ -279,8 +279,9 @@ def test_interrupted_diarization_setup_fails_preflight(tmp_path):
     (tmp_path / pipeline.MODELS["npu"]["dir"]).mkdir()
     (tmp_path / pipeline.MODELS["npu"]["dir"] / "m.xml").write_text("x")
     (tmp_path / pipeline.MODELS["npu"]["dir"] / "m.bin").write_bytes(b"x")
-    with pytest.raises(PipelineError, match="unvollstaendig.*segmentation.*--no-diarize"):
+    with pytest.raises(PipelineError, match="Diarisierungsmodell fehlt.*unvollständig.*Sprecher trennen.*--no-diarize.*setup") as caught:
         TranscribeJob(None, "a.wav", "npu", "de", models=models).check()
+    assert "segmentation" in caught.value.detail and "segmentation" not in caught.value.message and "segmentation" in caught.value.format_message()
     TranscribeJob(None, "a.wav", "npu", "de", models=models, diarize=False).check()
 
 

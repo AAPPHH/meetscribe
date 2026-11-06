@@ -571,7 +571,7 @@ def test_start_with_interrupted_diarization_setup_records_nothing(env):
     add_pyannote(env)
     (env["models"] / pipeline.SETTINGS["diarization"]["dir"] / "config.yaml").write_text("segmentation: $model/segmentation\n")
     result = start()
-    assert result.exit_code != 0 and "unvollstaendig" in result.output and "meetscribe setup" in result.output and "--no-diarize" in result.output
+    assert result.exit_code != 0 and "unvollständig" in result.output and "Sprecher trennen" in result.output and "meetscribe setup" in result.output and "segmentation" in result.output and "--no-diarize" in result.output
     assert FakeRecorder.started == [] and not recordings(env)
     assert start("--no-diarize", "--no-open").exit_code == 0
 
@@ -766,6 +766,7 @@ def test_json_devices_lists_inputs_and_openvino(env, monkeypatch):
 def test_check_reports_missing_pieces_with_fixes(env, monkeypatch):
     rows = {r["id"]: r for r in parsed(invoke("--json", "check"))}
     assert rows["ffmpeg"]["ok"] and rows["pyannote"]["ok"] is False and "meetscribe setup" in rows["pyannote"]["fix"]
+    assert "„Sprecher trennen“ ausschalten" in rows["pyannote"]["fix"] and "ausführen" in rows["pyannote"]["fix"] and "ausfuehren" not in rows["pyannote"]["fix"]
     assert rows["hf_token"]["ok"] is False and "HF_TOKEN" in rows["hf_token"]["fix"]
     assert all(r["ok"] and r["fix"] is None for k, r in rows.items() if k.startswith("whisper:"))
     human = invoke("check")

@@ -83,7 +83,12 @@ AWAKE_FLAGS = {"continuous": 0x80000000, "system_required": 0x00000001}
 
 
 class PipelineError(click.ClickException):
-    pass
+    def __init__(self, message, detail=None):
+        super().__init__(message)
+        self.detail = detail
+
+    def format_message(self):
+        return f"{self.message}\n{self.detail}" if self.detail else self.message
 
 
 class AudioError(PipelineError):
@@ -303,7 +308,7 @@ class Reason:
 
     @staticmethod
     def detail(exc):
-        text = exc.format_message() if isinstance(exc, click.ClickException) else str(exc)
+        text = getattr(exc, "detail", None) or (exc.format_message() if isinstance(exc, click.ClickException) else str(exc))
         return text.strip()[: SETTINGS["detail_chars"]] or type(exc).__name__
 
 
@@ -570,13 +575,15 @@ class TranscribeJob:
         if missing:
             diar = SETTINGS["diarization"]
             raise PipelineError(
-                f"Diarisierungsmodell fehlt oder ist unvollstaendig ({', '.join(str(p) for p in missing)}). Bitte {diar['token_env']} setzen "
-                f"(Zugriff auf {diar['repo']} bei huggingface.co akzeptieren) und 'meetscribe setup' ausfuehren, "
-                "oder mit --no-diarize ohne Sprechertrennung transkribieren."
+                "Diarisierungsmodell fehlt oder ist unvollständig: Die Sprechertrennung ist noch nicht eingerichtet. "
+                "Schnelle Lösung: in den Einstellungen „Sprecher trennen“ ausschalten (Kommandozeile: --no-diarize). "
+                f"Dauerhaft: {diar['token_env']} setzen und 'meetscribe setup' ausführen.",
+                f"Fehlende Dateien: {', '.join(str(p) for p in missing)}\n"
+                f"Für 'meetscribe setup' den Zugriff auf {diar['repo']} bei huggingface.co akzeptieren und {diar['token_env']} setzen.",
             )
         path = self.models.whisper_dir(self.device, self.model)
         if not Models.whisper_ready(path):
-            raise PipelineError(f"Whisper-Modell fehlt ({path}). Bitte 'meetscribe setup' ausfuehren.")
+            raise PipelineError(f"Whisper-Modell fehlt ({path}). Bitte 'meetscribe setup' ausführen.")
 
     def run(self):
         self.check()
@@ -1116,7 +1123,7 @@ class StartFlow:
             if not self.reporter.machine:
                 raise
             code = 130 if isinstance(exc, KeyboardInterrupt) else getattr(exc, "exit_code", 1)
-            message = exc.format_message() if isinstance(exc, click.ClickException) else Reason.of(exc)
+            message = exc.message if isinstance(exc, click.ClickException) else Reason.of(exc)
             self.reporter.event("error", message=message, detail=Reason.detail(exc), audio=None, meeting_id=None, retry=None, exit_code=code)
             raise click.exceptions.Exit(code) from exc
 
@@ -1138,10 +1145,10 @@ class SetupCheck:
             dirs.setdefault(MODELS[device]["dir"], []).append(device.upper())
         for name, devices in dirs.items():
             ready = Models.whisper_ready(self.models.root / name)
-            rows.append(self.row(f"whisper:{name}", f"Whisper-Modell ({'/'.join(devices)})", ready, f"'meetscribe setup' ausfuehren; es laedt {name} nach {self.models.root}."))
+            rows.append(self.row(f"whisper:{name}", f"Whisper-Modell ({'/'.join(devices)})", ready, f"'meetscribe setup' ausführen; es lädt {name} nach {self.models.root}."))
         ready = self.models.diarization_ready()
-        rows.append(self.row("pyannote", "pyannote-Modell (Sprechertrennung)", ready, f"{diar['token_env']} setzen und 'meetscribe setup' erneut ausfuehren; bis dahin ohne Sprechertrennung arbeiten.", "diarize"))
-        rows.append(self.row("hf_token", f"{diar['token_env']} (nur fuer 'meetscribe setup')", ready or self.token, f"{diar['token_env']} setzen (Zugriff auf huggingface.co/{diar['repo']} freischalten).", "diarize"))
+        rows.append(self.row("pyannote", "pyannote-Modell (Sprechertrennung)", ready, f"Schnelle Lösung: in den Einstellungen „Sprecher trennen“ ausschalten. Dauerhaft: {diar['token_env']} setzen und 'meetscribe setup' ausführen.", "diarize"))
+        rows.append(self.row("hf_token", f"{diar['token_env']} (nur für 'meetscribe setup')", ready or self.token, f"Nur für die Einrichtung der Sprechertrennung: {diar['token_env']} setzen (Zugriff auf huggingface.co/{diar['repo']} freischalten) und 'meetscribe setup' ausführen.", "diarize"))
         return rows
 
 

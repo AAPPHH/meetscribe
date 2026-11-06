@@ -120,12 +120,14 @@ Mit der globalen Option `--json` (vor dem Befehl: `meetscribe --json meetings`) 
 
 | Befehl | JSON |
 |---|---|
-| `meetings`, `search`, `stats`, `speakers show` | Liste von Objekten mit allen Spalten der Abfrage (`stats`: `share` als Bruchteil 0 bis 1, `labels` als Liste; `meetings`: `complete` ist `false` bei einer unvollständigen heißen Datei) |
+| `meetings`, `search`, `stats`, `speakers show` | Liste von Objekten mit allen Spalten der Abfrage (`stats`: `share` als Bruchteil 0 bis 1, `labels` als Liste; `meetings`: `complete` ist `false` bei einer unvollständigen heißen Datei, neueste zuerst: nach Datum, am selben Tag nach Anlagezeit; `search`: `complete` je Treffer) |
 | `sql` | `{"columns": [...], "rows": [[...]]}` (Spaltennamen dürfen doppelt vorkommen) |
 | `report` | `{"meeting_id": ..., "path": <Zieldatei oder null>, "markdown": ...}` |
 | `devices` | `{"inputs": [{"index", "name", "api", "channels", "rate"}], "inputs_error": <Text oder null>, "openvino": [{"device", "name"}]}` |
 
 `meetscribe start --events` schreibt statt der Konsolenausgabe eine JSON-Zeile je Ereignis auf stdout (was Bibliotheken sonst auf stdout schreiben, geht nach stderr). Es gibt keine Sprecherabfrage und das Protokoll wird nicht geöffnet. `--stdin-stop` beendet die Aufnahme, sobald eine Zeile (mit Zeilenumbruch) auf stdin ankommt oder stdin geschlossen wird; die Aufnahme bleibt erhalten und die Verarbeitung läuft normal weiter. Das ersetzt Strg+C für Elternprozesse ohne Konsole. Beide Optionen sind unabhängig voneinander nutzbar.
+
+Mit `--events` endet die Verarbeitung, sobald niemand mehr die Ereignisse liest (stdout nicht mehr beschreibbar, etwa weil die Oberfläche hart beendet wurde). Die Engine sendet dazu während der Verarbeitung alle 2 s `{"event": "alive"}`; schlägt ein Schreiben fehl, bricht sie wie bei Strg+C ab, entfernt die unfertige Besprechung und endet mit Exit-Code 130. Reagiert der Lauf nicht binnen 30 s (langer nativer Aufruf), beendet sich der Prozess hart; dann kann eine unvollständige Besprechung bleiben. War der Leser schon vor der Verarbeitung weg (etwa bei einem Abbruch während der Aufnahme), bleibt das Audio erhalten und wird nicht verarbeitet. `start` erlaubt nur einen Lauf zugleich: Eine Sperrdatei `data\start.lock` (das Betriebssystem gibt sie beim Prozessende frei) lässt einen zweiten Start mit „Es läuft bereits eine Aufnahme oder Verarbeitung“ scheitern.
 
 Auf Windows wertet `meetscribe` Argumente nicht selbst nach `~`, `%VAR%` und `*`/`?` aus; Titel, Sprechernamen, Suchbegriffe und Pfade kommen so an, wie sie übergeben wurden (eine Shell wie Git Bash kann weiterhin selbst auswerten).
 
@@ -136,6 +138,7 @@ Ereignisse, ein Objekt je Zeile mit dem Schlüssel `event`:
 {"event": "recording", "input": "DJI MIC MINI", "path": "C:\\...\\data\\aufnahmen\\2026-11-05_101500.flac"}
 {"event": "warning", "message": "Eingang 'DJI MIC MINI': kein Audio seit 6 s (...)"}
 {"event": "transcribing", "audio": "C:\\...\\data\\aufnahmen\\2026-11-05_101500.flac", "meeting_id": "20261105-projektrunde"}
+{"event": "alive"}
 {"event": "done", "meeting_id": "20261105-projektrunde", "report": "C:\\...\\protokolle\\2026-11-05_projektrunde.md", "audio": "C:\\...", "segments": 42, "speakers": 2, "labels": [{"label": "SPEAKER_00", "sample": "Guten Morgen zusammen ..."}]}
 {"event": "error", "message": "Verarbeitung fehlgeschlagen: ...", "detail": "voller Fehlertext", "audio": "C:\\...\\2026-11-05_101500.flac", "meeting_id": null, "retry": "meetscribe start C:\\...flac --device npu --no-open --events", "exit_code": 1}
 ```
@@ -204,13 +207,15 @@ cargo tauri build
 
 `npm run build` erzeugt `gui\dist`; ohne diesen Ordner schlagen `cargo test` und jeder Tauri-Bau fehl (er ist nicht eingecheckt). `cargo tauri build` kommt aus `cargo install tauri-cli`; alternativ `npm run tauri build` in `gui` (das CLI steht in `devDependencies`). Ergebnis: `gui\src-tauri\target\release\meetscribe-gui.exe` und der Installer `gui\src-tauri\target\release\bundle\nsis\Meetscribe_0.1.0_x64-setup.exe`. Tests: `npm test` (Oberflächentests mit jsdom und einem Ersatz für die Tauri-Schnittstelle), `cargo test` (Rust-Tests mit der Ersatz-Engine `examples\fake_engine`).
 
+Deinstallieren: Der Deinstallationsdialog hat das Feld „Anwendungsdaten löschen“. Ohne Haken, und immer bei der stillen Deinstallation (`/S`), bleiben `HKCU\Software\meetscribe\Meetscribe` (der Installationspfad), `%APPDATA%\de.meetscribe.gui` (Einstellungen, `pending.json`, `engine.log`) und `%LOCALAPPDATA%\de.meetscribe.gui` (WebView2-Daten) zurück; so steht es in der Vorlage des Tauri-Installers (`installer.nsi`, tauri-bundler 2.10.4), eine stille Deinstallation hat genau diese Reste hinterlassen. Wer alles entfernen will, setzt den Haken oder löscht diese Einträge von Hand. Daten, Modelle und Protokolle der Engine liegen woanders und bleiben immer.
+
 Die Engine ist nicht im Installer, er enthält nur die Oberfläche. Sie sucht die Engine in dieser Reihenfolge: gespeicherter Pfad aus den Einstellungen (ist er gesetzt und fehlt die Datei, gibt es einen Fehler statt eines stillen Ersatzes); `.venv` im Projektordner (Einstellung „Projektordner“, sonst der Ordner, aus dem die Oberfläche gebaut wurde); `meetscribe` im PATH; neben der Anwendung; zuletzt `uv run --project <Projektordner> meetscribe`. Auf einem anderen Rechner zuerst die Engine wie unter „Installation“ einrichten und danach in den Einstellungen den Pfad zu `meetscribe.exe` oder den Projektordner eintragen. Der Reiter „Prüfung“ zeigt, welche Engine läuft und was fehlt; Punkte der Sprechertrennung zählen nur, solange „Sprecher trennen“ an ist. Daten, Modelle und Protokolle verwaltet die Engine wie beschrieben (`MEETSCRIBE_DATA`, `MEETSCRIBE_MODELS`, `MEETSCRIBE_REPORTS`).
 
 Die Oberfläche legt ihre Dateien in `%APPDATA%\de.meetscribe.gui` ab (oder in dem Ordner aus `MEETSCRIBE_GUI_CONFIG`): `settings.json`, `pending.json` (eine noch nicht fertig verarbeitete Aufnahme) und `engine.log` (stderr der letzten Sitzung, ungekürzt).
 
-Verhalten beim Schließen: Während der Aufnahme bleibt das Fenster offen, bis sie beendet ist. In Vorbereitung und Verarbeitung fragt ein Dialog; „Abbrechen und schließen“ beendet die Engine samt aller Unterprozesse (auch beim Start über `uv`), entfernt die unfertige Besprechung (`discard`) und merkt sich die Aufnahme. Beim nächsten Start bietet die Startseite „Erneut versuchen“ oder „Vergessen“ an. Stürzt die Engine ab, zeigt die Fehleransicht den Pfad der Aufnahme, den Knopf „Erneut versuchen“ und den Fehlertext samt Pfad der Protokolldatei. Wird das Webview neu geladen (F5), nimmt die Ansicht eine laufende Sitzung wieder auf.
+Verhalten beim Schließen: Während der Aufnahme bleibt das Fenster offen, bis sie beendet ist. In Vorbereitung und Verarbeitung fragt ein Dialog; „Abbrechen und schließen“ beendet die Engine samt aller Unterprozesse (auch beim Start über `uv`), entfernt die unfertige Besprechung (`discard`) und merkt sich die Aufnahme. Beim nächsten Start bietet die Startseite „Erneut versuchen“ oder „Vergessen“ an. Vorher fragt die Oberfläche die Engine nach der Besprechung dieses Laufs: Ist sie schon vollständig (der Lauf endete trotz allem), wird nichts mehr angeboten und ein Wiederholen verweigert, damit keine zweite Besprechung entsteht; ist ein Rest da, wird er verworfen; hält ihn noch ein laufender Prozess fest, meldet die Oberfläche das und startet keinen zweiten. „Vergessen“ entfernt ebenfalls einen solchen Rest (eine vollständige Besprechung bleibt immer erhalten). Der Pfad des Audios steht während Aufnahme und Verarbeitung auf der Seite. „Zurück“ nach einem Fehler lässt Titel und Pfad stehen, „Neue Aufnahme“ leert sie. Fehlt bei eingeschalteter Sprechertrennung das Modell, nennen Fehlermeldung, Banner und Reiter „Prüfung“ als schnelle Lösung, in den Einstellungen „Sprecher trennen“ auszuschalten. Stürzt die Engine ab, zeigt die Fehleransicht den Pfad der Aufnahme, den Knopf „Erneut versuchen“ und den Fehlertext samt Pfad der Protokolldatei. Wird das Webview neu geladen (F5), nimmt die Ansicht eine laufende Sitzung wieder auf.
 
-Grenzen: Stirbt die Oberfläche selbst während einer Aufnahme (Absturz, Task-Manager), bleibt die Aufnahme erhalten, aber die Verarbeitung bricht ab, sobald die Engine ihre Ereignisse nicht mehr schreiben kann. `pending.json` merkt sich die Aufnahme, die Startseite bietet sie beim nächsten Start an. Bei einem harten Abbruch kann eine unvollständige Besprechung bleiben; `meetings` zeigt sie mit `complete = false`.
+Grenzen: Stirbt die Oberfläche selbst (Absturz, Task-Manager), merkt die Engine das spätestens beim nächsten Schreiben ihrer Ereignisse (höchstens etwa 2 s) und bricht die Verarbeitung ab; eine laufende Aufnahme wird vorher gespeichert (stdin wird geschlossen). Das Audio bleibt erhalten, `pending.json` merkt es sich, die Startseite bietet es beim nächsten Start an. Steckt die Engine gerade in einem langen nativen Aufruf, kann der Abbruch bis zu 30 s dauern; solange verweigert ein neuer Start mit einer Meldung. Bei einem harten Abbruch des Prozesses kann eine unvollständige Besprechung bleiben; `meetings` zeigt sie mit `complete = false`, die Suche markiert ihre Treffer, „Erneut versuchen“ und „Vergessen“ räumen sie auf. Nicht mit einer echten Aufnahme geprüft (kein Mikrofon): der Abbruch der Oberfläche während der Aufnahme.
 
 ### Android
 
@@ -265,6 +270,7 @@ Standardmäßig unter dem Projektordner; `MEETSCRIBE_DATA`, `MEETSCRIBE_MODELS` 
 | `data\cold\year=JJJJ\month=MM\<id>.parquet` | archivierte Besprechungen, Parquet |
 | `data\archive\<id>.arrow` | Original der heißen Datei nach dem Archivieren (nicht gelöscht) |
 | `data\speakers.parquet` | Sprecherzuordnung |
+| `data\start.lock` | Sperrdatei, die einen zweiten gleichzeitigen `start` verhindert |
 | `data\aufnahmen\` | Aufnahmen von `start` |
 | `protokolle\` | Markdown-Protokolle |
 | `models\` | Whisper-Modelle, Diarisierungsmodell, `ov_cache\` |
@@ -302,4 +308,4 @@ Nicht an echter Hardware oder echten Eingaben geprüft:
 - `--events` und `--stdin-stop`: mit simuliertem Rekorder und echten Pipes getestet, nicht mit echter Aufnahme. Die Oberfläche wurde mit der Ersatz-Engine und mit echten Läufen aus Dateien bedient, eine Aufnahme mit dem echten Mikrofon über die Oberfläche nicht. Ausgaben nativer Bibliotheken direkt auf den Dateideskriptor 1 werden nicht nach stderr umgeleitet.
 - Android: kein APK gebaut, nichts auf einem Gerät oder Emulator gesehen (siehe „Android“).
 
-Tests: `uv run pytest -q` (167 Tests, alle grün; sie prüfen Logik und Abläufe mit Ersatzobjekten, nicht die oben genannten Hardwarefälle). Tests der Oberfläche siehe „Oberfläche“.
+Tests: `uv run pytest -q` (177 Tests, alle grün; sie prüfen Logik und Abläufe mit Ersatzobjekten, nicht die oben genannten Hardwarefälle). Tests der Oberfläche siehe „Oberfläche“.

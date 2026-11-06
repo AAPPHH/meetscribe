@@ -205,7 +205,7 @@ class StartView {
     $("save-names").addEventListener("click", () => this.saveNames());
     $("open-report").addEventListener("click", () => this.openReport());
     $("again").addEventListener("click", () => this.reset());
-    $("error-back").addEventListener("click", () => this.reset());
+    $("error-back").addEventListener("click", () => this.back());
     $("retry").addEventListener("click", () => this.retry());
     $("pending-retry").addEventListener("click", () => this.retryPending());
     $("pending-discard").addEventListener("click", () => this.discardPending());
@@ -279,7 +279,8 @@ class StartView {
     this.audio = audio;
     this.diarize = diarize;
     $("pending").hidden = true;
-    $("input-name").textContent = audio ?? "";
+    $("input-name").textContent = "";
+    this.showAudio();
     $<HTMLButtonElement>("stop").hidden = true;
     this.show("running");
   }
@@ -306,6 +307,10 @@ class StartView {
     else this.stage("preflight");
   }
 
+  showAudio() {
+    $("audio-path").textContent = this.audio ? `Audio: ${this.audio}` : "";
+  }
+
   stage(key: string) {
     $("stage").textContent = TEXT.stages[key] ?? key;
   }
@@ -313,6 +318,7 @@ class StartView {
   recording(input: string) {
     this.stage("recording");
     $("input-name").textContent = `Eingang: ${input}`;
+    this.showAudio();
     const stop = $<HTMLButtonElement>("stop");
     stop.hidden = false;
     stop.disabled = false;
@@ -321,7 +327,8 @@ class StartView {
   processing() {
     this.stage(this.diarize ? "transcribing" : "transcribingPlain");
     $("stop").hidden = true;
-    if (this.audio) $("input-name").textContent = `Audio: ${this.audio}`;
+    $("input-name").textContent = "";
+    this.showAudio();
   }
 
   async stop() {
@@ -443,12 +450,16 @@ class StartView {
     if (this.failure?.audio) this.begin({ ...this.options(), audio: this.failure.audio });
   }
 
-  reset() {
-    $<HTMLInputElement>("audio").value = "";
-    $<HTMLInputElement>("title").value = "";
+  back() {
     this.summary();
     this.show("idle");
     this.showPending();
+  }
+
+  reset() {
+    $<HTMLInputElement>("audio").value = "";
+    $<HTMLInputElement>("title").value = "";
+    this.back();
   }
 }
 

@@ -126,6 +126,7 @@ test("nach einem Neuladen mitten in der Aufnahme kehrt die Ansicht mit Stopp-Kno
   assert.equal(ui.$("stop").disabled, false);
   assert.match(ui.$("elapsed").textContent, /^01:0[5-9]$/);
   assert.ok(ui.$("input-name").textContent.includes("DJI MIC"));
+  assert.ok(ui.$("audio-path").textContent.includes(AUDIO));
   assert.equal(ui.$("warnings").children.length, 1);
   await ui.click("stop");
   assert.equal(ui.called("stop_session").length, 1);
@@ -136,7 +137,7 @@ test("nach einem Neuladen in der Verarbeitung gibt es keinen Stopp-Knopf, aber d
   assert.equal(ui.$("view-running").hidden, false);
   assert.equal(ui.$("stop").hidden, true);
   assert.equal(ui.$("stage").textContent, "Transkription und Sprechertrennung");
-  assert.ok(ui.$("input-name").textContent.includes(AUDIO));
+  assert.ok(ui.$("audio-path").textContent.includes(AUDIO));
 });
 
 test("eine unfertige Verarbeitung wird beim Start angeboten und lässt sich wiederholen oder vergessen", async () => {
@@ -248,4 +249,35 @@ test("auf Android sind Aufnahme und Dateiwahl gesperrt und der Grund steht da", 
   assert.equal(ui.$("start").disabled, true);
   assert.equal(ui.$("platform-notice").hidden, false);
   assert.equal(ui.$("platform-notice").textContent, "Auf diesem Gerät läuft keine Engine.");
+});
+
+test("der Audiopfad steht während der Aufnahme auf der Seite und bleibt, wenn der Dialog Weiter aufnehmen gewählt wird", async () => {
+  const ui = await boot({ start_session: () => null });
+  await startRun(ui);
+  assert.ok(!document.body.textContent.includes("aufnahme.flac"));
+  await ui.emit("engine-event", { event: "recording", input: "DJI MIC", path: AUDIO });
+  assert.ok(ui.$("view-running").textContent.includes(AUDIO));
+  assert.ok(ui.$("input-name").textContent.includes("DJI MIC"));
+  await closeDialog(ui, "recording", AUDIO);
+  await ui.click("modal-keep");
+  assert.ok(ui.$("view-running").textContent.includes(AUDIO));
+  await ui.emit("engine-event", { event: "transcribing", audio: AUDIO, meeting_id: "m" });
+  assert.ok(ui.$("view-running").textContent.includes(AUDIO));
+});
+
+test("Zurück nach einem Fehler lässt Titel und Audiopfad stehen, Neue Aufnahme leert sie", async () => {
+  const ui = await boot({ start_session: () => null });
+  ui.$("title").value = "Projektrunde";
+  ui.$("audio").value = AUDIO;
+  await startRun(ui);
+  await ui.emit("engine-event", { event: "error", message: "Diarisierungsmodell fehlt", audio: null, meeting_id: null });
+  await ui.click("error-back");
+  assert.equal(ui.$("view-idle").hidden, false);
+  assert.equal(ui.$("title").value, "Projektrunde");
+  assert.equal(ui.$("audio").value, AUDIO);
+});
+
+test("lange Pfade laufen im Dialog nicht über den Rand", () => {
+  const css = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
+  for (const rule of [".dialog", ".muted", ".notice"]) assert.match(css, new RegExp(`${rule.replace(".", "\.")} \{[^}]*overflow-wrap: anywhere`));
 });

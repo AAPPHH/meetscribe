@@ -107,14 +107,14 @@ button.big.stop { background: var(--danger); color: var(--surface); }
 .row { display: flex; gap: 8px; align-items: center; }
 .buttons { margin: 16px 0 8px; flex-wrap: wrap; }
 .row input[type="text"], .row input[type="search"] { flex: 1; min-width: 0; }
-.muted { color: var(--muted); font-size: 13px; margin: 6px 0; }
+.muted { color: var(--muted); font-size: 13px; margin: 6px 0; overflow-wrap: anywhere; }
 .status { text-align: center; padding: 24px 0 8px; }
 .stage { font-size: 24px; font-weight: 600; }
 .elapsed { font-size: 56px; font-variant-numeric: tabular-nums; font-weight: 300; margin: 8px 0; }
-.notice { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; border: 1px solid var(--line); }
+.notice { overflow-wrap: anywhere; padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; border: 1px solid var(--line); }
 .notice.error { background: var(--danger-bg); color: var(--danger); border-color: var(--danger); }
 .warnings { list-style: none; padding: 0; margin: 16px 0; }
-.warnings li { padding: 8px 12px; margin-bottom: 6px; border-left: 4px solid var(--danger); background: var(--danger-bg); border-radius: 4px; }
+.warnings li { overflow-wrap: anywhere; padding: 8px 12px; margin-bottom: 6px; border-left: 4px solid var(--danger); background: var(--danger-bg); border-radius: 4px; }
 .speaker { padding: 12px 14px; margin-bottom: 10px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
 .speaker .label { font-size: 12px; color: var(--muted); }
 .speaker .sample { margin: 4px 0 8px; font-style: italic; }
@@ -145,7 +145,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .checks .fix { margin-top: 4px; color: var(--text); }
 .checks .label { font-weight: 600; }
 .modal { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; padding: 16px; }
-.dialog { background: var(--surface); border-radius: 14px; padding: 8px 24px 20px; max-width: 480px; width: 100%; border: 1px solid var(--line); }
+.dialog { overflow-wrap: anywhere; background: var(--surface); border-radius: 14px; padding: 8px 24px 20px; max-width: 480px; width: 100%; border: 1px solid var(--line); }
 @media (max-width: 640px) {
   main { padding: 16px 12px 40px; }
   button.big { min-height: 110px; font-size: 24px; }

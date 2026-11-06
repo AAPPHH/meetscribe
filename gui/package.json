@@ -4,13 +4,17 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc --noEmit && node scripts/build.mjs"
+    "build": "tsc --noEmit && node scripts/build.mjs",
+    "test": "node scripts/build.mjs --test && node --test test/ui.test.mjs",
+    "tauri": "tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4",
     "esbuild": "^0.25.0",
+    "jsdom": "^29.1.1",
     "typescript": "^5.6.0"
   }
 }

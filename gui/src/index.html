@@ -23,10 +23,19 @@
       Die Einrichtung ist unvollständig.
       <button id="goto-checks" class="link">Prüfung öffnen</button>
     </div>
+    <div id="platform-notice" class="notice error" hidden></div>
     <div id="view-idle">
+      <div id="pending" class="notice" hidden>
+        <strong>Unfertige Verarbeitung gefunden.</strong>
+        <p id="pending-audio" class="muted"></p>
+        <div class="row buttons">
+          <button id="pending-retry" class="primary">Erneut versuchen</button>
+          <button id="pending-discard">Vergessen</button>
+        </div>
+      </div>
       <button id="start" class="big">Aufnahme starten</button>
       <label class="field">Titel (optional)
-        <input id="title" type="text" autocomplete="off" placeholder="z. B. Projektrunde">
+        <input id="title" type="text" autocomplete="off" maxlength="80" placeholder="z. B. Projektrunde">
       </label>
       <label class="field">Vorhandene Aufnahme statt Mikrofon (optional)
         <span class="row">
@@ -60,6 +69,7 @@
       <div class="notice error"><strong id="error-message"></strong></div>
       <p id="error-audio" class="muted"></p>
       <p id="error-retry" class="muted"></p>
+      <details id="error-more" hidden><summary>Einzelheiten</summary><pre id="error-detail"></pre></details>
       <div class="row buttons">
         <button id="retry" class="primary" hidden>Erneut versuchen</button>
         <button id="error-meetings" hidden>Zu den Besprechungen</button>

@@ -20,6 +20,8 @@ Mit vorhandener Datei, etwa einer Handyaufnahme:
 meetscribe start besprechung.m4a --title "Projektrunde"
 ```
 
+Statt der Konsole gibt es eine Oberfläche mit einem Knopf „Aufnahme starten“ (siehe „Oberfläche“).
+
 ## Voraussetzungen
 
 - Windows 11 (64 Bit). Entwickelt und gemessen nur auf Windows 11 mit Core Ultra 7 258V, Arc 140V, 32 GB RAM.
@@ -76,6 +78,8 @@ Ablauf:
 
 Die Aufnahme liegt unter `data\aufnahmen\<JJJJ-MM-TT_HHMMSS>.flac` (bei Kollision `-2`) und wird nie gelöscht. Schlägt die Verarbeitung fehl oder wird sie mit Strg+C abgebrochen, gibt `start` `Audio erhalten: <Pfad>` und eine fertige Zeile `Erneut versuchen: meetscribe start <Pfad> ...` aus und endet mit Exit-Code 1 (bei Strg+C 130). Eine dabei halb geschriebene Besprechung wird wieder entfernt (auch bei `transcribe`), der erneute Versuch bekommt dieselbe ID. Scheitert erst die Nachbearbeitung (Sprechernamen speichern, Protokoll schreiben, etwa weil `MEETSCRIBE_REPORTS` auf eine Datei zeigt oder `speakers.parquet` gesperrt ist) oder wird dabei Strg+C gedrückt, ist die Besprechung schon vollständig gespeichert: `start` gibt dann `Audio erhalten`, `Besprechung gespeichert: <ID>` und `Protokoll erneut erzeugen: meetscribe report <ID>` aus (Exit-Code 1, bei Strg+C 130), ohne Traceback. Dann nicht erneut `start` aufrufen, das legt eine zweite Besprechung mit `-2` an.
 
+Ist die Datei nicht vorhanden oder ein Ordner, meldet `start` das in der Vorprüfung auf Deutsch (`Audiodatei nicht gefunden: ...`), bevor etwas aufgenommen oder geladen wird. Ein Titel darf höchstens 80 Zeichen lang sein; längere werden in der Vorprüfung abgelehnt, weil aus ihm Besprechungs-ID und Protokolldateiname entstehen. Beginnt ein Dateiname mit `-`, vor ihn `--` setzen (`meetscribe start --no-open -- --datei.wav`); Programme, die Werte durchreichen, sollten das immer tun.
+
 Optionen: `--title`, `--mic dji|laptop|both|<Namensteil>`, `--device npu|gpu|cpu`, `--speakers N` (Sprecherzahl vorgeben), `--no-diarize`, `--no-open`. Titel ohne Angabe: Dateiname der Aufnahme bzw. der Datei. Datum der Besprechung ist immer das heutige Datum. Die Sprache ist bei `start` fest Deutsch.
 
 ### Vorhandene Datei
@@ -99,7 +103,8 @@ meetscribe report 20261105-projektrunde --out C:\temp\protokoll.md
 | Befehl | Zweck |
 |---|---|
 | `meetscribe devices` | Audioeingänge (Index, Name, API, Kanäle, Rate) und OpenVINO-Geräte auflisten; prüft z. B. ob der DJI-Empfänger sichtbar ist; mit `--json` als JSON |
-| `meetscribe check` | ffmpeg, Whisper-Modelle, pyannote-Modell und `HF_TOKEN` prüfen, mit Lösung je fehlendem Punkt (Exit-Code 1, wenn etwas fehlt); mit `--json` eine Liste `{"id", "label", "ok", "fix"}` (Exit-Code 0) |
+| `meetscribe check` | ffmpeg, Whisper-Modelle, pyannote-Modell und `HF_TOKEN` prüfen, mit Lösung je fehlendem Punkt (Exit-Code 1, wenn etwas fehlt); mit `--json` eine Liste `{"id", "label", "ok", "fix", "scope"}` (Exit-Code 0); `scope` ist `diarize` bei den Zeilen, die nur mit Sprechertrennung nötig sind, sonst `null`. Ein Whisper-Modell gilt als vorhanden, wenn jede `.xml` nicht leer ist und eine nicht leere `.bin` daneben liegt |
+| `meetscribe discard ID` | unvollständige Besprechung (Rest eines harten Abbruchs) entfernen; vollständige lehnt der Befehl ab |
 | `meetscribe record --out datei.flac [--mic ...] [--seconds N]` | nur aufnehmen, Standard-Mikrofon `laptop`; eine vorhandene Zieldatei wird nicht überschrieben, der Befehl bricht ab; gestörte Eingänge werden wie bei `start` sofort gemeldet, danach endet der Befehl mit Exit-Code 1 |
 | `meetscribe transcribe datei [...]` | nur transkribieren und ablegen, ohne Protokoll und ohne Sprecherabfrage |
 | `meetscribe rotate [--older-than-days N] [--force]` | heiße Dateien ins Archiv verschieben (Standard 0 Tage: alle vollständigen) |
@@ -115,12 +120,14 @@ Mit der globalen Option `--json` (vor dem Befehl: `meetscribe --json meetings`) 
 
 | Befehl | JSON |
 |---|---|
-| `meetings`, `search`, `stats`, `speakers show` | Liste von Objekten mit allen Spalten der Abfrage (`stats`: `share` als Bruchteil 0 bis 1, `labels` als Liste) |
+| `meetings`, `search`, `stats`, `speakers show` | Liste von Objekten mit allen Spalten der Abfrage (`stats`: `share` als Bruchteil 0 bis 1, `labels` als Liste; `meetings`: `complete` ist `false` bei einer unvollständigen heißen Datei) |
 | `sql` | `{"columns": [...], "rows": [[...]]}` (Spaltennamen dürfen doppelt vorkommen) |
 | `report` | `{"meeting_id": ..., "path": <Zieldatei oder null>, "markdown": ...}` |
 | `devices` | `{"inputs": [{"index", "name", "api", "channels", "rate"}], "inputs_error": <Text oder null>, "openvino": [{"device", "name"}]}` |
 
 `meetscribe start --events` schreibt statt der Konsolenausgabe eine JSON-Zeile je Ereignis auf stdout (was Bibliotheken sonst auf stdout schreiben, geht nach stderr). Es gibt keine Sprecherabfrage und das Protokoll wird nicht geöffnet. `--stdin-stop` beendet die Aufnahme, sobald eine Zeile (mit Zeilenumbruch) auf stdin ankommt oder stdin geschlossen wird; die Aufnahme bleibt erhalten und die Verarbeitung läuft normal weiter. Das ersetzt Strg+C für Elternprozesse ohne Konsole. Beide Optionen sind unabhängig voneinander nutzbar.
+
+Auf Windows wertet `meetscribe` Argumente nicht selbst nach `~`, `%VAR%` und `*`/`?` aus; Titel, Sprechernamen, Suchbegriffe und Pfade kommen so an, wie sie übergeben wurden (eine Shell wie Git Bash kann weiterhin selbst auswerten).
 
 Ereignisse, ein Objekt je Zeile mit dem Schlüssel `event`:
 
@@ -128,12 +135,12 @@ Ereignisse, ein Objekt je Zeile mit dem Schlüssel `event`:
 {"event": "preflight"}
 {"event": "recording", "input": "DJI MIC MINI", "path": "C:\\...\\data\\aufnahmen\\2026-11-05_101500.flac"}
 {"event": "warning", "message": "Eingang 'DJI MIC MINI': kein Audio seit 6 s (...)"}
-{"event": "transcribing", "audio": "C:\\...\\data\\aufnahmen\\2026-11-05_101500.flac"}
+{"event": "transcribing", "audio": "C:\\...\\data\\aufnahmen\\2026-11-05_101500.flac", "meeting_id": "20261105-projektrunde"}
 {"event": "done", "meeting_id": "20261105-projektrunde", "report": "C:\\...\\protokolle\\2026-11-05_projektrunde.md", "audio": "C:\\...", "segments": 42, "speakers": 2, "labels": [{"label": "SPEAKER_00", "sample": "Guten Morgen zusammen ..."}]}
-{"event": "error", "message": "Verarbeitung fehlgeschlagen: ...", "audio": "C:\\...\\2026-11-05_101500.flac", "meeting_id": null, "retry": "meetscribe start C:\\...flac --device npu --no-open --events", "exit_code": 1}
+{"event": "error", "message": "Verarbeitung fehlgeschlagen: ...", "detail": "voller Fehlertext", "audio": "C:\\...\\2026-11-05_101500.flac", "meeting_id": null, "retry": "meetscribe start C:\\...flac --device npu --no-open --events", "exit_code": 1}
 ```
 
-`recording` entfällt bei vorhandener Datei. Bei `--mic both` nennt `input` beide Geräte mit ` + ` und `path` den Mix. `warning` steht für Eingangsprobleme, Überläufe, unvollständige Aufnahme, Geräte-Rückfall und Rotationsfehler. `done` ist das letzte Ereignis eines erfolgreichen Laufs (Exit-Code 0); `labels` enthält je Sprecher (ohne `UNKNOWN`) den längsten Satz, höchstens 140 Zeichen; Namen setzt die GUI danach mit `speakers set`. `error` ist das letzte Ereignis bei Exit-Code 1 oder 130. Vor der Aufnahme (Vorprüfung) sind `audio`, `meeting_id` und `retry` `null`. Schlägt erst die Nachbearbeitung fehl, ist die Besprechung gespeichert: `meeting_id` ist gesetzt und `retry` ist `meetscribe report <ID>` (nicht erneut `start`).
+`recording` entfällt bei vorhandener Datei. Bei `--mic both` nennt `input` beide Geräte mit ` + ` und `path` den Mix. `warning` steht für Eingangsprobleme, Überläufe, unvollständige Aufnahme, Geräte-Rückfall und Rotationsfehler. `done` ist das letzte Ereignis eines erfolgreichen Laufs (Exit-Code 0); `labels` enthält je Sprecher (ohne `UNKNOWN`) den längsten Satz, höchstens 140 Zeichen; Namen setzt die GUI danach mit `speakers set`. `transcribing` nennt die ID, unter der die Besprechung angelegt wird; bricht der Lauf hart ab (Prozess beendet), bleibt eine unvollständige Datei mit dieser ID zurück, die `meetscribe discard <ID>` entfernt. `speakers` in `done` ist die Zahl der gespeicherten Sprecher, ohne Trennung also 1 (`UNKNOWN`), wie in `meetings`. `error` ist das letzte Ereignis bei Exit-Code 1 oder 130; `message` ist auf 400 Zeichen gekürzt, `detail` enthält den vollen Fehlertext (bis 4000 Zeichen). Vor der Aufnahme (Vorprüfung) sind `audio`, `meeting_id` und `retry` `null`. Schlägt erst die Nachbearbeitung fehl, ist die Besprechung gespeichert: `meeting_id` ist gesetzt und `retry` ist `meetscribe report <ID>` (nicht erneut `start`).
 
 ### Gerätewahl und Fallback
 
@@ -178,6 +185,38 @@ Schema von `segments`:
 `speakers`: `meeting_id`, `label`, `name`.
 
 DuckDB-Erweiterungen werden weder automatisch installiert noch automatisch geladen (`autoinstall_known_extensions` und `autoload_known_extensions` sind aus) und die Konfiguration ist gesperrt, `SET` auf diese Einstellungen schlägt also fehl. Ein Aufruf wie `read_parquet('https://...')` bricht deshalb ohne Netzzugriff mit der DuckDB-Fehlermeldung ab (`requires the extension httpfs`, Exit-Code 1, kein Traceback). Lokale Dateien, etwa `read_parquet('C:/pfad/datei.parquet')`, und die Sichten funktionieren weiter. Zusätzlich lehnt `sql` jede Anweisung `INSTALL`, `FORCE INSTALL` und `LOAD` sowie `UPDATE EXTENSIONS` ab (Meldung `... gesperrt`, Exit-Code 1), bevor DuckDB etwas ausführt; ein Test mit lokalem HTTP-Server bestätigt, dass dabei keine Anfrage entsteht. Nicht geprüft ist, ob DuckDB außerhalb dieser Anweisungen Erweiterungen nachladen kann (`load_extension` gibt es in DuckDB 2.0.0 nicht). Schon auf dem Rechner liegende Erweiterungen (`%USERPROFILE%\.duckdb\extensions`) werden von `sql` nicht geladen.
+
+## Oberfläche
+
+Die Oberfläche (`gui\`, Tauri 2 mit einfachem HTML/TypeScript) ist eine Hülle um dieselbe Engine: Sie startet `meetscribe` als Kindprozess und liest dessen `--events` und `--json`. Alles Fachliche (Aufnahme, Transkription, Archiv) bleibt in der Engine. Täglich genügt ein Klick auf „Aufnahme starten“; Besprechungen, Suche, Einstellungen und Prüfung sind eigene Reiter.
+
+Bauen (Windows). Voraussetzungen, die nicht installiert werden: Node.js, Rust mit MSVC-Toolchain samt Visual-Studio-Buildtools, WebView2 und die Engine aus „Installation“.
+
+```
+cd gui
+npm ci
+npm run build
+npm test
+cd src-tauri
+cargo test
+cargo tauri build
+```
+
+`npm run build` erzeugt `gui\dist`; ohne diesen Ordner schlagen `cargo test` und jeder Tauri-Bau fehl (er ist nicht eingecheckt). `cargo tauri build` kommt aus `cargo install tauri-cli`; alternativ `npm run tauri build` in `gui` (das CLI steht in `devDependencies`). Ergebnis: `gui\src-tauri\target\release\meetscribe-gui.exe` und der Installer `gui\src-tauri\target\release\bundle\nsis\Meetscribe_0.1.0_x64-setup.exe`. Tests: `npm test` (Oberflächentests mit jsdom und einem Ersatz für die Tauri-Schnittstelle), `cargo test` (Rust-Tests mit der Ersatz-Engine `examples\fake_engine`).
+
+Die Engine ist nicht im Installer, er enthält nur die Oberfläche. Sie sucht die Engine in dieser Reihenfolge: gespeicherter Pfad aus den Einstellungen (ist er gesetzt und fehlt die Datei, gibt es einen Fehler statt eines stillen Ersatzes); `.venv` im Projektordner (Einstellung „Projektordner“, sonst der Ordner, aus dem die Oberfläche gebaut wurde); `meetscribe` im PATH; neben der Anwendung; zuletzt `uv run --project <Projektordner> meetscribe`. Auf einem anderen Rechner zuerst die Engine wie unter „Installation“ einrichten und danach in den Einstellungen den Pfad zu `meetscribe.exe` oder den Projektordner eintragen. Der Reiter „Prüfung“ zeigt, welche Engine läuft und was fehlt; Punkte der Sprechertrennung zählen nur, solange „Sprecher trennen“ an ist. Daten, Modelle und Protokolle verwaltet die Engine wie beschrieben (`MEETSCRIBE_DATA`, `MEETSCRIBE_MODELS`, `MEETSCRIBE_REPORTS`).
+
+Die Oberfläche legt ihre Dateien in `%APPDATA%\de.meetscribe.gui` ab (oder in dem Ordner aus `MEETSCRIBE_GUI_CONFIG`): `settings.json`, `pending.json` (eine noch nicht fertig verarbeitete Aufnahme) und `engine.log` (stderr der letzten Sitzung, ungekürzt).
+
+Verhalten beim Schließen: Während der Aufnahme bleibt das Fenster offen, bis sie beendet ist. In Vorbereitung und Verarbeitung fragt ein Dialog; „Abbrechen und schließen“ beendet die Engine samt aller Unterprozesse (auch beim Start über `uv`), entfernt die unfertige Besprechung (`discard`) und merkt sich die Aufnahme. Beim nächsten Start bietet die Startseite „Erneut versuchen“ oder „Vergessen“ an. Stürzt die Engine ab, zeigt die Fehleransicht den Pfad der Aufnahme, den Knopf „Erneut versuchen“ und den Fehlertext samt Pfad der Protokolldatei. Wird das Webview neu geladen (F5), nimmt die Ansicht eine laufende Sitzung wieder auf.
+
+Grenzen: Stirbt die Oberfläche selbst während einer Aufnahme (Absturz, Task-Manager), bleibt die Aufnahme erhalten, aber die Verarbeitung bricht ab, sobald die Engine ihre Ereignisse nicht mehr schreiben kann. `pending.json` merkt sich die Aufnahme, die Startseite bietet sie beim nächsten Start an. Bei einem harten Abbruch kann eine unvollständige Besprechung bleiben; `meetings` zeigt sie mit `complete = false`.
+
+### Android
+
+Der Stand ist ein Gerüst, kein lauffähiges Programm. Das Projekt ist eine Tauri-Bibliothek mit Einstiegspunkt für Mobilgeräte, die Windows-Teile des Rust-Codes sind abgetrennt, und `cargo check --target aarch64-linux-android --lib` läuft durch. Ein APK wurde nicht gebaut, weil auf dem Entwicklungsrechner weder Android SDK und NDK noch ein JDK installiert sind; `gui\src-tauri\gen\android` existiert nicht (`gen` steht in `.gitignore`). Vorgehen, ungeprüft: Android Studio mit SDK und NDK installieren, `ANDROID_HOME`, `NDK_HOME` und `JAVA_HOME` setzen, `rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android`, dann in `gui` `npm run tauri android init` und `npm run tauri android build`.
+
+Auf dem Telefon läuft keine Engine: Whisper über OpenVINO, pyannote und PyTorch sind Programme dieses Windows-Rechners, und die Oberfläche startet die Engine als lokalen Prozess. Die Android-Fassung zeigt deshalb nur einen Hinweis, sperrt „Aufnahme starten“ und meldet bei jeder Engine-Abfrage, dass die Engine auf einem PC laufen muss. Ein sinnvoller Betrieb auf Android bräuchte eine Engine, die auf einem PC lauscht und die das Telefon über das Netz anspricht (nicht vorhanden, nicht entworfen), oder eine eigene Transkription auf dem Gerät.
 
 ## Mikrofone
 
@@ -230,7 +269,7 @@ Standardmäßig unter dem Projektordner; `MEETSCRIBE_DATA`, `MEETSCRIBE_MODELS` 
 | `protokolle\` | Markdown-Protokolle |
 | `models\` | Whisper-Modelle, Diarisierungsmodell, `ov_cache\` |
 
-DuckDB liest heiße und kalte Dateien als eine Sicht (`segments`) und verbindet die Sprecherzuordnung (`segments_named`). Namen ändern nur `speakers.parquet`, nie die Rohdaten. Eine unvollständige heiße Datei (nur noch bei hartem Prozessabbruch, etwa Absturz oder Stromausfall; bei Fehlern und Strg+C wird sie entfernt) wird bei `rotate` ohne `--force` übersprungen. `start` rotiert zuletzt automatisch alles, was vollständig und älter als 30 Tage ist (Alter nach Änderungsdatum der Datei).
+DuckDB liest heiße und kalte Dateien als eine Sicht (`segments`) und verbindet die Sprecherzuordnung (`segments_named`). Namen ändern nur `speakers.parquet`, nie die Rohdaten. Eine unvollständige heiße Datei (nur noch bei hartem Prozessabbruch, etwa Absturz, Stromausfall oder beendetem Prozess; bei Fehlern und Strg+C wird sie entfernt) wird bei `rotate` ohne `--force` übersprungen, erscheint in `meetings` mit `complete = false` (Tabelle: `NEIN`), bekommt im Protokoll die Zeile `Status: unvollständig` und lässt sich mit `meetscribe discard <ID>` entfernen. `start` rotiert zuletzt automatisch alles, was vollständig und älter als 30 Tage ist (Alter nach Änderungsdatum der Datei).
 
 Audio wird nicht automatisch gelöscht, auch nicht nach der Archivierung. `data\`, `models\`, `protokolle\` und gängige Audioendungen stehen in `.gitignore`.
 
@@ -260,6 +299,7 @@ Nicht an echter Hardware oder echten Eingaben geprüft:
 - Die WER stammt aus synthetischem Testaudio (siehe oben); echte Besprechungen sind nicht vermessen.
 - Messungen nur auf einem Gerät (Core Ultra 7 258V). Andere Core-Ultra-Generationen sind nicht geprüft.
 - Strg+C während der Aufnahme wurde mit einem simulierten Rekorder und einem echten Konsolen-Ereignis geprüft, nicht mit echter Aufnahme.
-- `--events` und `--stdin-stop`: mit simuliertem Rekorder und echten Pipes getestet, nicht mit echter Aufnahme und nicht aus einer echten GUI. Ausgaben nativer Bibliotheken direkt auf den Dateideskriptor 1 werden nicht nach stderr umgeleitet.
+- `--events` und `--stdin-stop`: mit simuliertem Rekorder und echten Pipes getestet, nicht mit echter Aufnahme. Die Oberfläche wurde mit der Ersatz-Engine und mit echten Läufen aus Dateien bedient, eine Aufnahme mit dem echten Mikrofon über die Oberfläche nicht. Ausgaben nativer Bibliotheken direkt auf den Dateideskriptor 1 werden nicht nach stderr umgeleitet.
+- Android: kein APK gebaut, nichts auf einem Gerät oder Emulator gesehen (siehe „Android“).
 
-Tests: `uv run pytest -q` (157 Tests, alle grün; sie prüfen Logik und Abläufe mit Ersatzobjekten, nicht die oben genannten Hardwarefälle).
+Tests: `uv run pytest -q` (167 Tests, alle grün; sie prüfen Logik und Abläufe mit Ersatzobjekten, nicht die oben genannten Hardwarefälle). Tests der Oberfläche siehe „Oberfläche“.

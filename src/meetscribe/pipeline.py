@@ -957,7 +957,7 @@ class StartFlow:
         self.job.audio = Path(audio)
         self.job.requested_id = Naming.meeting_id(self.store, self.job.day, self.title or self.job.audio.stem)
         started = time.monotonic()
-        self.reporter.event("transcribing", audio=str(audio))
+        self.reporter.event("transcribing", audio=str(audio), meeting_id=self.job.requested_id)
         try:
             self.result = self.job.run()
             if not self.result["segments"]:

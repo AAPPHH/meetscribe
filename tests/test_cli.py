@@ -829,6 +829,7 @@ def test_start_events_with_audiofile_emit_stage_events_without_prompts(env, monk
     events = events_of(result)
     assert names(events) == ["preflight", "transcribing", "done"]
     assert events[1]["audio"] == str(env["audio"])
+    assert events[1]["meeting_id"] == events[2]["meeting_id"]
     done = events[2]
     assert done["meeting_id"].endswith("-wochenplanung")
     assert done["report"] == str(reports(env)[0]) and done["audio"] == str(env["audio"]) and done["segments"] == 2 and done["speakers"] == 2

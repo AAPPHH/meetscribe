@@ -1,5 +1,6 @@
 import gc
 import os
+import _thread
 import queue
 import re
 import shutil
@@ -74,6 +75,9 @@ START = {
     "program": "meetscribe",
     "stdin_fd": 0,
     "title_chars": 80,
+    "lock_file": "start.lock",
+    "heartbeat_s": 2.0,
+    "abort_grace_s": 30.0,
 }
 AWAKE_FLAGS = {"continuous": 0x80000000, "system_required": 0x00000001}
 
@@ -207,6 +211,7 @@ class KeepAwake:
 
 class Reporter:
     machine = False
+    broken = False
 
     def say(self, text="", err=False):
         click.echo(text, err=err)
@@ -853,6 +858,74 @@ class RecordingSession:
         return [{**report, "problem": self.problems.get(r)} for r, report in zip(started, reports)]
 
 
+class RunLock:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.file = None
+
+    def _lock(self, take):
+        self.file.seek(0)
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK if take else msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(self.file.fileno(), (fcntl.LOCK_EX | fcntl.LOCK_NB) if take else fcntl.LOCK_UN)
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.file = open(self.path, "a+b")
+        try:
+            self._lock(True)
+        except OSError:
+            self.file.close()
+            raise PipelineError(
+                "Es läuft bereits eine Aufnahme oder Verarbeitung (nach hartem Beenden der Oberfläche läuft die alte noch kurz weiter). "
+                "Bitte einen Moment warten und dann erneut versuchen."
+            ) from None
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        with suppress(OSError):
+            self._lock(False)
+        self.file.close()
+        return False
+
+
+class Heartbeat:
+    def __init__(self, reporter, interval=None, grace=None, interrupt=_thread.interrupt_main, leave=os._exit):
+        self.reporter = reporter
+        self.interval = START["heartbeat_s"] if interval is None else interval
+        self.grace = START["abort_grace_s"] if grace is None else grace
+        self.interrupt = interrupt
+        self.leave = leave
+        self.done = threading.Event()
+        self.thread = None
+
+    def _run(self):
+        while not self.done.wait(self.interval):
+            self.reporter.event("alive")
+            if self.reporter.broken:
+                self.interrupt()
+                if not self.done.wait(self.grace):
+                    self.leave(130)
+                return
+
+    def __enter__(self):
+        if self.reporter.machine:
+            if self.reporter.broken:
+                raise PipelineError("Die Oberfläche ist nicht mehr erreichbar, die Verarbeitung wird nicht gestartet. Das Audio bleibt erhalten.")
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.done.set()
+        if self.thread is not None:
+            self.thread.join()
+        return False
+
+
 class StartFlow:
     def __init__(self, store, audio=None, mic=None, device="npu", title=None, speakers=None, diarize=True,
                  open_report=True, tty=False, models=None, picker=None, reporter=None, stdin_stop=False):
@@ -959,7 +1032,8 @@ class StartFlow:
         started = time.monotonic()
         self.reporter.event("transcribing", audio=str(audio), meeting_id=self.job.requested_id)
         try:
-            self.result = self.job.run()
+            with Heartbeat(self.reporter):
+                self.result = self.job.run()
             if not self.result["segments"]:
                 raise PipelineError("Keine Sprache erkannt, kein Protokoll erstellt")
         except (Exception, KeyboardInterrupt) as exc:
@@ -1034,7 +1108,8 @@ class StartFlow:
 
     def run(self):
         try:
-            return self.execute()
+            with RunLock(self.store.config["data_dir"] / START["lock_file"]):
+                return self.execute()
         except click.exceptions.Exit:
             raise
         except (Exception, KeyboardInterrupt) as exc:

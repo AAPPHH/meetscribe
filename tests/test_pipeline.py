@@ -1,6 +1,7 @@
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -12,8 +13,8 @@ import soundfile as sf
 
 from meetscribe import pipeline
 from meetscribe.pipeline import (
-    ASRFailure, ASRRunner, PipelineError, Aligner, AudioError, AudioLoader, DeviceError, InputPicker, Interrupt, KeepAwake, Mixer, Models, Naming,
-    RecordingSession, StdinWatcher, TranscribeJob, Transcriber, Windows,
+    ASRFailure, ASRRunner, PipelineError, Aligner, AudioError, AudioLoader, DeviceError, EventReporter, Heartbeat, InputPicker, Interrupt, KeepAwake, Mixer, Models, Naming,
+    RecordingSession, RunLock, StdinWatcher, TranscribeJob, Transcriber, Windows,
 )
 from meetscribe.store import HotFile, Query, ReportFile, Store, make_config
 
@@ -652,3 +653,71 @@ def test_recording_session_stops_when_stop_signal_is_set(tmp_path, monkeypatch):
     started = time.monotonic()
     reports = session.run(stop=stop)
     assert time.monotonic() - started < 5 and session.final == tmp_path / "rec.flac" and reports[0]["seconds"] == 0.1
+
+
+def test_run_lock_refuses_a_second_holder_and_frees_after_release(tmp_path):
+    path = tmp_path / "data" / "start.lock"
+    with RunLock(path):
+        with pytest.raises(PipelineError, match="läuft bereits"):
+            RunLock(path).__enter__()
+    with RunLock(path):
+        pass
+
+
+def test_run_lock_is_held_across_processes_and_freed_when_the_holder_dies(tmp_path):
+    path = tmp_path / "start.lock"
+    code = "import sys; from meetscribe.pipeline import RunLock; lock = RunLock(sys.argv[1]).__enter__(); print('held', flush=True); sys.stdin.readline()"
+    holder = subprocess.Popen([sys.executable, "-c", code, str(path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        with pytest.raises(PipelineError):
+            RunLock(path).__enter__()
+    finally:
+        holder.stdin.close()
+        holder.wait(10)
+    with RunLock(path):
+        pass
+
+
+class OneWayStream:
+    def __init__(self, fail_on=None):
+        self.lines, self.fail_on = [], fail_on
+
+    def write(self, data):
+        if self.fail_on and self.fail_on in data:
+            raise OSError(22, "Invalid argument")
+        self.lines.append(data)
+
+    def flush(self):
+        pass
+
+
+def test_heartbeat_sends_alive_events_while_the_consumer_listens():
+    stream = OneWayStream()
+    with Heartbeat(EventReporter(stream), interval=0.02):
+        time.sleep(0.15)
+    assert sum('"alive"' in line for line in stream.lines) >= 2
+
+
+def test_heartbeat_interrupts_then_leaves_when_the_consumer_is_gone():
+    calls = []
+    reporter = EventReporter(OneWayStream(fail_on="alive"))
+    with Heartbeat(reporter, interval=0.01, grace=0.05, interrupt=lambda: calls.append("interrupt"), leave=lambda code: calls.append(("leave", code))):
+        time.sleep(0.3)
+    assert calls == ["interrupt", ("leave", 130)]
+    calls.clear()
+    reporter = EventReporter(OneWayStream(fail_on="alive"))
+    with Heartbeat(reporter, interval=0.01, grace=5, interrupt=lambda: calls.append("interrupt"), leave=lambda code: calls.append(("leave", code))) as beat:
+        time.sleep(0.1)
+        beat.done.set()
+    assert calls == ["interrupt"]
+
+
+def test_heartbeat_refuses_to_start_for_a_dead_consumer_and_is_silent_without_events():
+    dead = EventReporter(OneWayStream(fail_on="x"))
+    dead.event("x")
+    with pytest.raises(PipelineError, match="nicht mehr erreichbar"):
+        Heartbeat(dead).__enter__()
+    with Heartbeat(pipeline.Reporter(), interval=0.01) as beat:
+        time.sleep(0.05)
+    assert beat.thread is None

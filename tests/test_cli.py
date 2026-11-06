@@ -11,13 +11,14 @@ from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import click
 import numpy as np
 import pytest
 import soundfile as sf
 from click.testing import CliRunner
 
 from meetscribe import cli, pipeline
-from meetscribe.store import HotFile, Store, make_config
+from meetscribe.store import HotFile, Query, Store, make_config
 
 REAL_RECORDER = pipeline.Recorder
 
@@ -967,10 +968,67 @@ class DeadPipe:
         raise OSError(22, "Invalid argument")
 
 
-def test_dead_event_pipe_does_not_abort_processing(env):
+def slow_job(env, monkeypatch, seconds=6):
+    original = pipeline.TranscribeJob.run
+
+    def run(self):
+        with self.store.writer(self.requested_id, title="x", meeting_date="2026-03-04", language="de", discard_on_error=True) as writer:
+            writer.append([{"start_s": 0.0, "end_s": 1.0, "speaker": "S", "text": "Anfang"}])
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                time.sleep(0.01)
+        return original(self)
+
+    monkeypatch.setattr(pipeline.TranscribeJob, "run", run)
+
+
+def test_dead_event_pipe_aborts_before_processing_and_keeps_the_audio(env):
     flow = pipeline.StartFlow(env["store"], audio=env["audio"], title="Rohr", diarize=False, reporter=pipeline.EventReporter(DeadPipe()))
-    assert flow.run().exists() and len(reports(env)) == 1
-    assert env["store"].incomplete() == [] and flow.reporter.broken
+    with pytest.raises(click.exceptions.Exit):
+        flow.run()
+    assert flow.reporter.broken and env["store"].incomplete() == [] and Query(env["store"]).meetings() == []
+    assert env["audio"].exists() and not reports(env) and not env["loaded"]
+
+
+def test_gui_killed_during_recording_saves_the_audio_and_does_not_process_it(env, monkeypatch):
+    flow = pipeline.StartFlow(env["store"], mic="dji", diarize=False, reporter=pipeline.EventReporter(DeadPipe()), stdin_stop=True)
+    with StdinFeed(monkeypatch, b"", close=True), pytest.raises(click.exceptions.Exit):
+        flow.run()
+    assert len(recordings(env)) == 1 and sf.info(recordings(env)[0]).frames > 0
+    assert Query(env["store"]).meetings() == [] and env["store"].incomplete() == [] and not reports(env) and not env["loaded"]
+
+
+def test_event_pipe_dying_during_processing_aborts_and_removes_the_partial_meeting(env, monkeypatch):
+    monkeypatch.setitem(pipeline.START, "heartbeat_s", 0.05)
+    slow_job(env, monkeypatch)
+
+    class Pipe:
+        lines = []
+
+        def write(self, data):
+            if '"alive"' in data:
+                raise OSError(22, "Invalid argument")
+            Pipe.lines.append(data)
+
+        def flush(self):
+            pass
+
+    flow = pipeline.StartFlow(env["store"], audio=env["audio"], title="Waise", diarize=False, reporter=pipeline.EventReporter(Pipe()))
+    started = time.monotonic()
+    with pytest.raises(click.exceptions.Exit) as caught:
+        flow.run()
+    assert caught.value.exit_code == 130 and time.monotonic() - started < 4
+    assert env["store"].incomplete() == [] and Query(env["store"]).meetings() == [] and not reports(env) and env["audio"].exists()
+    assert any('"transcribing"' in line for line in Pipe.lines)
+
+
+def test_second_start_is_refused_while_another_one_holds_the_lock(env):
+    with pipeline.RunLock(env["store"].config["data_dir"] / pipeline.START["lock_file"]):
+        result = invoke("start", "--events", "--no-diarize", env["audio"])
+    assert result.exit_code == 1 and names(events_of(result)) == ["error"]
+    assert "läuft bereits" in events_of(result)[0]["message"] and env["store"].incomplete() == [] and not reports(env)
+    assert invoke("start", "--events", "--no-diarize", env["audio"]).exit_code == 0
+    assert len(Query(env["store"]).meetings()) == 1
 
 
 def test_error_event_carries_unclipped_detail_and_done_counts_stored_speakers(env, monkeypatch):

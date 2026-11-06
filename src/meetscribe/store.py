@@ -399,7 +399,7 @@ class Query:
             "string_agg(DISTINCT model, ', ' ORDER BY model) AS model, "
             "string_agg(DISTINCT device, ', ' ORDER BY device) AS device, "
             "meeting_id NOT IN (SELECT meeting_id FROM incomplete_ids) AS complete "
-            "FROM segments GROUP BY meeting_id ORDER BY meeting_date DESC, meeting_id"
+            "FROM segments GROUP BY meeting_id ORDER BY meeting_date DESC, max(created_at) DESC, meeting_id"
         )
 
     def is_incomplete(self, meeting_id):

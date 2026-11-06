@@ -1,5 +1,6 @@
 import os
 import shutil
+import time
 from datetime import date
 
 import pytest
@@ -311,6 +312,14 @@ def test_meetings_listing(store):
     assert [m["meeting_id"] for m in listing] == ["c", "b", "a"]
     assert listing[1]["language"] == "en" and listing[0]["segments"] == 3 and listing[0]["speakers"] == 2
     assert listing[0]["duration_s"] == 9.0 and listing[0]["meeting_date"] == date(2026, 3, 1)
+
+
+def test_meetings_of_one_day_are_listed_newest_first_not_alphabetically(store):
+    for name in ("zebra-runde", "alpha-runde", "zulu-runde"):
+        write(store, name, day="2026-03-04")
+        time.sleep(0.05)
+    write(store, "aelter", day="2026-03-03")
+    assert [m["meeting_id"] for m in Query(store).meetings()] == ["zulu-runde", "alpha-runde", "zebra-runde", "aelter"]
 
 
 def test_report_content(store):

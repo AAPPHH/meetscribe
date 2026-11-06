@@ -232,7 +232,7 @@ def transcribe(audio, device, model, language, title, day, meeting_id, no_diariz
 
 
 @main.command(help="Aufnehmen (oder AUDIOFILE nehmen), transkribieren, Sprecher benennen, Protokoll schreiben.")
-@click.argument("audio", required=False, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("audio", required=False, type=click.Path(path_type=Path))
 @click.option("--title", default=None)
 @click.option("--mic", default=None, help="dji, laptop, both oder Namensteil; Standard: DJI, sonst Laptop.")
 @click.option("--device", type=click.Choice(DEVICE_CHOICES, case_sensitive=False), envvar="MEETSCRIBE_DEVICE",

@@ -938,3 +938,48 @@ def test_values_reach_the_engine_unexpanded_on_the_real_entry_point(env, tmp_pat
     assert (star.returncode, json.loads(star.stdout)) == (0, [])
     literal = entry("--json", "sql", "SELECT '%USERNAME%' AS a, '~' AS b")
     assert json.loads(literal.stdout)["rows"] == [["%USERNAME%", "~"]]
+
+
+@pytest.mark.parametrize("target", ["missing.wav", "."])
+def test_start_events_reports_unusable_audio_path_in_german(env, target):
+    path = env["tmp"] / target
+    result = invoke("start", "--events", "--no-diarize", path)
+    assert result.exit_code == 1 and names(events_of(result)) == ["preflight", "error"]
+    error = events_of(result)[-1]
+    assert error["message"].startswith("Audiodatei nicht gefunden:") and error["audio"] is None
+    assert "Usage" not in result.output and not recordings(env) and FakeRecorder.started == []
+
+
+def test_start_rejects_overlong_title_before_recording(env):
+    result = invoke("start", "--events", "--no-diarize", "--title", "x" * 400)
+    assert result.exit_code == 1 and names(events_of(result)) == ["preflight", "error"]
+    assert "Titel ist zu lang" in events_of(result)[-1]["message"] and FakeRecorder.started == [] and not recordings(env)
+    assert invoke("start", "--events", "--no-diarize", "--title", "x" * 80, env["audio"]).exit_code == 0
+
+
+class DeadPipe:
+    def write(self, data):
+        raise OSError(22, "Invalid argument")
+
+    def flush(self):
+        raise OSError(22, "Invalid argument")
+
+
+def test_dead_event_pipe_does_not_abort_processing(env):
+    flow = pipeline.StartFlow(env["store"], audio=env["audio"], title="Rohr", diarize=False, reporter=pipeline.EventReporter(DeadPipe()))
+    assert flow.run().exists() and len(reports(env)) == 1
+    assert env["store"].incomplete() == [] and flow.reporter.broken
+
+
+def test_error_event_carries_unclipped_detail_and_done_counts_stored_speakers(env, monkeypatch):
+    long_path = "C:\\" + "ordner\\" * 40 + "x.wav"
+
+    def broken(path, rate=None):
+        raise RuntimeError(f"Audio konnte nicht dekodiert werden ({long_path})\nUrsache: kaputt")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pipeline.AudioLoader, "load", staticmethod(broken))
+        failed = events_of(invoke("start", "--events", "--no-diarize", env["audio"]))[-1]
+    assert long_path in failed["detail"] and "Ursache: kaputt" in failed["detail"] and long_path in failed["message"]
+    done = events_of(invoke("start", "--events", "--no-diarize", env["audio"]))[-1]
+    assert done["event"] == "done" and done["speakers"] == 1 and done["labels"] == []

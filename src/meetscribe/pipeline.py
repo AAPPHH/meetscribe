@@ -39,7 +39,8 @@ SETTINGS = {
     "unknown_speaker": "UNKNOWN",
     "models_env": "MEETSCRIBE_MODELS",
     "cache_subdir": "ov_cache",
-    "reason_chars": 120,
+    "reason_chars": 400,
+    "detail_chars": 4000,
     "diarization": {
         "repo": "pyannote/speaker-diarization-community-1",
         "dir": "pyannote-speaker-diarization-community-1",
@@ -72,6 +73,7 @@ START = {
     "sentence_chars": 140,
     "program": "meetscribe",
     "stdin_fd": 0,
+    "title_chars": 80,
 }
 AWAKE_FLAGS = {"continuous": 0x80000000, "system_required": 0x00000001}
 
@@ -220,6 +222,7 @@ class EventReporter(Reporter):
 
     def __init__(self, stream=None):
         self.stream = stream or sys.stdout
+        self.broken = False
 
     def say(self, text="", err=False):
         pass
@@ -228,7 +231,13 @@ class EventReporter(Reporter):
         self.event("warning", message=text)
 
     def event(self, name, **data):
-        click.echo(Json.dumps({"event": name, **data}), file=self.stream)
+        if self.broken:
+            return
+        try:
+            click.echo(Json.dumps({"event": name, **data}), file=self.stream)
+            self.stream.flush()
+        except (OSError, ValueError):
+            self.broken = True
 
 
 class StdinWatcher:
@@ -285,6 +294,11 @@ class Reason:
         text = lines[0] if lines else ""
         text = f"{type(exc).__name__}: {text}" if text else type(exc).__name__
         return text[: SETTINGS["reason_chars"]]
+
+    @staticmethod
+    def detail(exc):
+        text = exc.format_message() if isinstance(exc, click.ClickException) else str(exc)
+        return text.strip()[: SETTINGS["detail_chars"]] or type(exc).__name__
 
 
 class AudioLoader:
@@ -459,7 +473,7 @@ class Transcriber:
         return words
 
     def run(self, audio, turns, writer):
-        rate, floor, count = self.windows.rate, 0.0, 0
+        rate, floor, count, speakers = self.windows.rate, 0.0, 0, set()
         for first, last in self.windows.split(audio):
             chunk = audio[first:last]
             if float(np.max(np.abs(chunk))) < SETTINGS["silence_peak"]:
@@ -470,9 +484,10 @@ class Transcriber:
             for segment in segments:
                 segment.update(device=engine.device.upper(), model=engine.model)
             count += writer.append(segments)
+            speakers.update(segment["speaker"] for segment in segments)
             if words:
                 floor = words[-1]["start_s"]
-        return {"segments": count, "used": [d.upper() for d in self.runner.used]}
+        return {"segments": count, "speakers": len(speakers), "used": [d.upper() for d in self.runner.used]}
 
 
 class Diarizer:
@@ -574,7 +589,7 @@ class TranscribeJob:
             summary = Transcriber(runner).run(audio, turns, writer)
         if not summary["segments"]:
             self.store.discard(meeting_id)
-        return {**summary, "meeting_id": meeting_id, "requested": self.device.upper(), "speakers": len({t["speaker"] for t in turns})}
+        return {**summary, "meeting_id": meeting_id, "requested": self.device.upper()}
 
 
 class InputPicker:
@@ -876,6 +891,10 @@ class StartFlow:
 
     def preflight(self):
         self.reporter.event("preflight")
+        if self.audio is not None and not self.audio.is_file():
+            raise AudioError(f"Audiodatei nicht gefunden: {self.audio}")
+        if self.title and len(self.title) > START["title_chars"]:
+            raise PipelineError(f"Der Titel ist zu lang ({len(self.title)} Zeichen, höchstens {START['title_chars']}).")
         AudioLoader.require()
         planned = self.audio or self.recording_path()
         self.job = TranscribeJob(
@@ -930,7 +949,7 @@ class StartFlow:
         else:
             self.reporter.say(f"Erneut versuchen: {retry}", err=True)
         code = 130 if interrupted else 1
-        self.reporter.event("error", message=message, audio=str(audio), meeting_id=saved, retry=retry, exit_code=code)
+        self.reporter.event("error", message=message, detail=Reason.detail(exc), audio=str(audio), meeting_id=saved, retry=retry, exit_code=code)
         raise click.exceptions.Exit(code)
 
     def process(self, audio):
@@ -1022,7 +1041,7 @@ class StartFlow:
                 raise
             code = 130 if isinstance(exc, KeyboardInterrupt) else getattr(exc, "exit_code", 1)
             message = exc.format_message() if isinstance(exc, click.ClickException) else Reason.of(exc)
-            self.reporter.event("error", message=message, audio=None, meeting_id=None, retry=None, exit_code=code)
+            self.reporter.event("error", message=message, detail=Reason.detail(exc), audio=None, meeting_id=None, retry=None, exit_code=code)
             raise click.exceptions.Exit(code) from exc
 
 

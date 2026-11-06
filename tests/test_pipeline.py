@@ -150,7 +150,7 @@ def test_fallback_mid_run_keeps_rows_and_device(store, capfd):
     summary, _ = run_windows(store, factory)
     err = capfd.readouterr().err.strip().splitlines()
     assert len(err) == 1 and "NPU" in err[0] and "DEVICE_LOST" in err[0]
-    assert summary == {"segments": 3, "used": ["NPU", "GPU"]}
+    assert summary == {"segments": 3, "speakers": 1, "used": ["NPU", "GPU"]}
     assert HotFile(store.hot_path("m1")).is_complete()
     rows = Query(store).execute("SELECT seg_id, start_s, device, model FROM segments ORDER BY seg_id")[1]
     assert [r[2] for r in rows] == ["NPU", "GPU", "GPU"]

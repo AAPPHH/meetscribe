@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Meetscribe Oberflaeche"
 
+[lib]
+name = "meetscribe_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

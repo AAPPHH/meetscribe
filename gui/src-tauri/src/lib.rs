@@ -1,28 +1,50 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const DEFAULT_ENGINE: &str = r"C:\clones\meetscribe\.venv\Scripts\meetscribe.exe";
-const DEFAULT_REPO: &str = r"C:\clones\meetscribe";
+const MOBILE: bool = cfg!(any(target_os = "android", target_os = "ios"));
+const EXE: &str = if cfg!(windows) { ".exe" } else { "" };
+const VENV_BIN: &str = if cfg!(windows) { "Scripts" } else { "bin" };
+const ENGINE_NAME: &str = "meetscribe";
+const UV_NAME: &str = "uv";
+const MOBILE_NOTICE: &str = "Auf diesem Gerät läuft keine Engine. Aufnehmen, Besprechungen und Suche brauchen die Engine auf einem PC.";
 const ENV_CONFIG: &str = "MEETSCRIBE_GUI_CONFIG";
 const SETTINGS_FILE: &str = "settings.json";
+const PENDING_FILE: &str = "pending.json";
+const LOG_FILE: &str = "engine.log";
 const DEVICES: [&str; 3] = ["npu", "gpu", "cpu"];
 const AUDIO_EXTENSIONS: [&str; 9] = ["wav", "flac", "mp3", "m4a", "ogg", "opus", "aac", "mp4", "webm"];
 const STDERR_TAIL: usize = 12;
 const POLL_MS: u64 = 50;
+const DISCARD_TRIES: usize = 4;
+const DISCARD_WAIT_MS: u64 = 300;
 const EVENT_NAME: &str = "engine-event";
 const EXIT_NAME: &str = "engine-exit";
+const CLOSE_NAME: &str = "close-requested";
+
+trait Detached {
+    fn detached(&mut self) -> &mut Self;
+}
+
+impl Detached for Command {
+    #[cfg(windows)]
+    fn detached(&mut self) -> &mut Self {
+        use std::os::windows::process::CommandExt;
+        self.creation_flags(0x0800_0000)
+    }
+
+    #[cfg(not(windows))]
+    fn detached(&mut self) -> &mut Self {
+        self
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -64,10 +86,18 @@ struct EngineSpec {
     source: String,
 }
 
+impl EngineSpec {
+    fn direct(program: impl Into<PathBuf>, source: &str) -> EngineSpec {
+        EngineSpec { program: program.into(), args: vec![], source: source.into() }
+    }
+}
+
 struct Locator<'a> {
     settings: &'a Settings,
     exists: &'a dyn Fn(&Path) -> bool,
     path_var: String,
+    exe_dir: Option<PathBuf>,
+    build_repo: PathBuf,
 }
 
 impl<'a> Locator<'a> {
@@ -76,35 +106,55 @@ impl<'a> Locator<'a> {
     }
 
     fn repo(&self) -> PathBuf {
-        PathBuf::from(if self.settings.repo.trim().is_empty() { DEFAULT_REPO } else { self.settings.repo.trim() })
+        let saved = self.settings.repo.trim();
+        if saved.is_empty() { self.build_repo.clone() } else { PathBuf::from(saved) }
     }
 
     fn locate(&self) -> Result<EngineSpec, String> {
+        if MOBILE {
+            return Err(MOBILE_NOTICE.into());
+        }
+        let name = format!("{ENGINE_NAME}{EXE}");
         let saved = self.settings.engine.trim();
-        let candidates = [(saved, "gespeicherter Pfad"), (DEFAULT_ENGINE, "Standardpfad")];
-        for (candidate, source) in candidates {
-            if !candidate.is_empty() && (self.exists)(Path::new(candidate)) {
-                return Ok(EngineSpec { program: PathBuf::from(candidate), args: vec![], source: source.into() });
-            }
+        if !saved.is_empty() {
+            return if (self.exists)(Path::new(saved)) {
+                Ok(EngineSpec::direct(saved, "gespeicherter Pfad"))
+            } else {
+                Err(format!("Der gespeicherte Engine-Pfad existiert nicht: {saved}. In den Einstellungen korrigieren oder leer lassen."))
+            };
         }
         let repo = self.repo();
-        match self.find_in_path("uv.exe") {
-            Some(uv) if (self.exists)(&repo.join("pyproject.toml")) => Ok(EngineSpec {
+        let has_project = (self.exists)(&repo.join("pyproject.toml"));
+        let saved_repo = self.settings.repo.trim();
+        if !saved_repo.is_empty() && !has_project {
+            return Err(format!("Der gespeicherte Projektordner enthält keine pyproject.toml: {saved_repo}. In den Einstellungen korrigieren oder leer lassen."));
+        }
+        let venv = repo.join(".venv").join(VENV_BIN).join(&name);
+        if (self.exists)(&venv) {
+            return Ok(EngineSpec::direct(venv, "Projektordner"));
+        }
+        if let Some(found) = self.find_in_path(&name) {
+            return Ok(EngineSpec::direct(found, "PATH"));
+        }
+        if let Some(beside) = self.exe_dir.as_ref().map(|d| d.join(&name)).filter(|p| (self.exists)(p)) {
+            return Ok(EngineSpec::direct(beside, "neben der Anwendung"));
+        }
+        match self.find_in_path(&format!("{UV_NAME}{EXE}")) {
+            Some(uv) if has_project => Ok(EngineSpec {
                 program: uv,
-                args: ["run", "--project", &repo.to_string_lossy(), "meetscribe"].map(String::from).to_vec(),
+                args: ["run", "--project", &repo.to_string_lossy(), ENGINE_NAME].map(String::from).to_vec(),
                 source: "uv".into(),
             }),
-            _ => Err(format!(
-                "Engine nicht gefunden. Pfad zu meetscribe.exe in den Einstellungen eintragen oder im Projektordner {} 'uv sync' ausführen.",
-                repo.display()
-            )),
+            _ => Err("Engine nicht gefunden. In den Einstellungen den Pfad zu meetscribe oder den Projektordner eintragen; im Projektordner zuerst 'uv sync' ausführen.".into()),
         }
     }
 }
 
 fn locate_engine(settings: &Settings) -> Result<EngineSpec, String> {
     let exists = |p: &Path| p.exists();
-    Locator { settings, exists: &exists, path_var: std::env::var("PATH").unwrap_or_default() }.locate()
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
+    let build_repo = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).map(Path::to_path_buf).unwrap_or_default();
+    Locator { settings, exists: &exists, path_var: std::env::var("PATH").unwrap_or_default(), exe_dir, build_repo }.locate()
 }
 
 struct Engine {
@@ -114,7 +164,7 @@ struct Engine {
 impl Engine {
     fn command(&self, args: &[String]) -> Command {
         let mut cmd = Command::new(&self.spec.program);
-        cmd.args(&self.spec.args).args(args).creation_flags(CREATE_NO_WINDOW);
+        cmd.args(&self.spec.args).args(args).detached();
         cmd
     }
 
@@ -135,6 +185,16 @@ impl Engine {
 
     fn json(&self, args: &[&str]) -> Result<Value, String> {
         parse_json_output(&self.run(args)?)
+    }
+
+    fn discard(&self, meeting_id: &str) -> bool {
+        for _ in 0..DISCARD_TRIES {
+            if self.run(&["discard", "--", meeting_id]).is_ok() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(DISCARD_WAIT_MS));
+        }
+        false
     }
 }
 
@@ -181,17 +241,58 @@ impl Stage {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct RunInfo {
+    audio: Option<String>,
+    input: Option<String>,
+    meeting_id: Option<String>,
+    warnings: Vec<String>,
+}
+
+impl RunInfo {
+    fn absorb(&mut self, event: &Value) {
+        let text = |key: &str| event[key].as_str().map(String::from);
+        match event["event"].as_str() {
+            Some("recording") => {
+                self.input = text("input");
+                self.audio = text("path").or(self.audio.take());
+            }
+            Some("transcribing") => {
+                self.audio = text("audio").or(self.audio.take());
+                self.meeting_id = text("meeting_id");
+            }
+            Some("warning") => self.warnings.extend(text("message")),
+            _ => {}
+        }
+    }
+}
+
+fn kill_tree(child: &mut Child) {
+    if cfg!(windows) {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .detached()
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 type Sink = Arc<dyn Fn(&str, Value) + Send + Sync>;
 
 struct Session {
     child: Mutex<Child>,
     stdin: Mutex<Option<ChildStdin>>,
-    stage: Mutex<Stage>,
+    stage: Mutex<(Stage, Instant)>,
+    info: Mutex<RunInfo>,
     finished: AtomicBool,
 }
 
 impl Session {
-    fn spawn(mut cmd: Command, sink: Sink) -> Result<Arc<Session>, String> {
+    fn spawn(mut cmd: Command, sink: Sink, log: Option<PathBuf>) -> Result<Arc<Session>, String> {
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -204,13 +305,18 @@ impl Session {
         let session = Arc::new(Session {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
-            stage: Mutex::new(Stage::Preflight),
+            stage: Mutex::new((Stage::Preflight, Instant::now())),
+            info: Mutex::new(RunInfo::default()),
             finished: AtomicBool::new(false),
         });
         let tail = Arc::new(Mutex::new(Vec::<String>::new()));
         let err_tail = tail.clone();
+        let mut log_file = log.as_ref().and_then(|p| std::fs::File::create(p).ok());
         let err_thread = std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Some(file) = log_file.as_mut() {
+                    let _ = writeln!(file, "{line}");
+                }
                 let mut lines = err_tail.lock().unwrap();
                 lines.push(line);
                 if lines.len() > STDERR_TAIL {
@@ -223,9 +329,13 @@ impl Session {
             let mut terminal = false;
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if let Some(event) = parse_event(&line) {
+                    runner.info.lock().unwrap().absorb(&event);
                     let mut stage = runner.stage.lock().unwrap();
-                    *stage = stage.after(&event);
-                    terminal |= *stage == Stage::Finished;
+                    let next = stage.0.after(&event);
+                    if next != stage.0 {
+                        *stage = (next, Instant::now());
+                    }
+                    terminal |= next == Stage::Finished;
                     drop(stage);
                     sink(EVENT_NAME, event);
                 }
@@ -237,20 +347,39 @@ impl Session {
                 std::thread::sleep(Duration::from_millis(POLL_MS));
             };
             let _ = err_thread.join();
-            *runner.stage.lock().unwrap() = Stage::Finished;
+            *runner.stage.lock().unwrap() = (Stage::Finished, Instant::now());
             runner.stdin.lock().unwrap().take();
             runner.finished.store(true, Ordering::SeqCst);
-            sink(EXIT_NAME, json!({ "code": code, "terminal": terminal, "stderr": tail.lock().unwrap().join("\n") }));
+            let info = runner.info.lock().unwrap().clone();
+            let log = log.map(|p| p.to_string_lossy().to_string());
+            sink(EXIT_NAME, json!({ "code": code, "terminal": terminal, "stderr": tail.lock().unwrap().join("\n"), "audio": info.audio, "log": log }));
         });
         Ok(session)
     }
 
     fn stage(&self) -> Stage {
-        *self.stage.lock().unwrap()
+        self.stage.lock().unwrap().0
+    }
+
+    fn info(&self) -> RunInfo {
+        self.info.lock().unwrap().clone()
     }
 
     fn active(&self) -> bool {
         !self.finished.load(Ordering::SeqCst)
+    }
+
+    fn state(&self) -> Value {
+        let (stage, since) = *self.stage.lock().unwrap();
+        let info = self.info();
+        json!({
+            "active": self.active(),
+            "stage": stage,
+            "elapsed_s": since.elapsed().as_secs(),
+            "audio": info.audio,
+            "input": info.input,
+            "warnings": info.warnings,
+        })
     }
 
     fn stop(&self) -> Result<(), String> {
@@ -266,12 +395,12 @@ impl Session {
         if self.stage() == Stage::Recording {
             return Err("Die Aufnahme läuft noch. Erst beenden, damit das Audio gespeichert wird.".into());
         }
-        let _ = self.child.lock().unwrap().kill();
+        kill_tree(&mut self.child.lock().unwrap());
         Ok(())
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct StartOptions {
     title: Option<String>,
     audio: Option<String>,
@@ -280,28 +409,102 @@ struct StartOptions {
     diarize: bool,
 }
 
-fn start_args(o: &StartOptions) -> Result<Vec<String>, String> {
-    if !DEVICES.contains(&o.device.as_str()) {
-        return Err(format!("Unbekanntes Gerät: {}", o.device));
+impl StartOptions {
+    fn clean(value: &Option<String>) -> Option<String> {
+        value.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
     }
-    let clean = |v: &Option<String>| v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
-    let audio = clean(&o.audio);
-    let mut args: Vec<String> = vec!["start".into()];
-    args.extend(audio.clone());
-    args.extend(["--events", "--no-open", "--device", &o.device].map(String::from));
-    if audio.is_none() {
-        args.push("--stdin-stop".into());
-        if let Some(mic) = clean(&o.mic) {
-            args.extend(["--mic".into(), mic]);
+
+    fn audio(&self) -> Option<String> {
+        Self::clean(&self.audio)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if !DEVICES.contains(&self.device.as_str()) {
+            return Err(format!("Unbekanntes Gerät: {}", self.device));
+        }
+        match self.audio() {
+            Some(audio) if !Path::new(&audio).is_file() => Err(format!("Audiodatei nicht gefunden: {audio}")),
+            _ => Ok(()),
         }
     }
-    if let Some(title) = clean(&o.title) {
-        args.extend(["--title".into(), title]);
+
+    fn args(&self) -> Vec<String> {
+        let audio = self.audio();
+        let mut args: Vec<String> = ["start", "--events", "--no-open", "--device", &self.device].map(String::from).to_vec();
+        if audio.is_none() {
+            args.push("--stdin-stop".into());
+            if let Some(mic) = Self::clean(&self.mic) {
+                args.extend(["--mic".into(), mic]);
+            }
+        }
+        if let Some(title) = Self::clean(&self.title) {
+            args.extend(["--title".into(), title]);
+        }
+        if !self.diarize {
+            args.push("--no-diarize".into());
+        }
+        if let Some(audio) = audio {
+            args.extend(["--".into(), audio]);
+        }
+        args
     }
-    if !o.diarize {
-        args.push("--no-diarize".into());
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+struct Pending {
+    audio: String,
+    meeting_id: Option<String>,
+    title: Option<String>,
+    device: String,
+    diarize: bool,
+}
+
+struct PendingStore {
+    path: PathBuf,
+}
+
+impl PendingStore {
+    fn load(&self) -> Option<Pending> {
+        let pending: Pending = serde_json::from_str(&std::fs::read_to_string(&self.path).ok()?).ok()?;
+        if Path::new(&pending.audio).is_file() {
+            return Some(pending);
+        }
+        self.clear();
+        None
     }
-    Ok(args)
+
+    fn clear(&self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+
+    fn write(&self, pending: &Pending) {
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(pending) {
+            let _ = std::fs::write(&self.path, text);
+        }
+    }
+
+    fn observe(&self, event: &Value, options: &StartOptions) {
+        let text = |key: &str| event[key].as_str().map(String::from);
+        match event["event"].as_str() {
+            Some("done") => self.clear(),
+            Some("error") if event["meeting_id"].is_string() => self.clear(),
+            Some("recording") | Some("transcribing") | Some("error") => {
+                let audio = text("audio").or_else(|| text("path"));
+                let Some(audio) = audio else { return };
+                self.write(&Pending {
+                    audio,
+                    meeting_id: text("meeting_id"),
+                    title: StartOptions::clean(&options.title),
+                    device: options.device.clone(),
+                    diarize: options.diarize,
+                });
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,10 +515,21 @@ struct SpeakerName {
 
 struct AppState {
     settings_path: PathBuf,
+    pending: PendingStore,
+    log_path: PathBuf,
     session: Mutex<Option<Arc<Session>>>,
 }
 
 impl AppState {
+    fn launch(&self, spawn: impl FnOnce() -> Result<Arc<Session>, String>) -> Result<(), String> {
+        let mut slot = self.session.lock().unwrap();
+        if slot.as_ref().is_some_and(|s| s.active()) {
+            return Err("Es läuft bereits eine Sitzung.".into());
+        }
+        *slot = Some(spawn()?);
+        Ok(())
+    }
+
     fn settings(&self) -> Settings {
         Settings::load(&self.settings_path)
     }
@@ -338,6 +552,11 @@ fn config_dir(app: &tauri::App) -> PathBuf {
 
 fn check_row(id: &str, label: &str, ok: bool, fix: Option<String>, detail: Option<String>) -> Value {
     json!({ "id": id, "label": label, "ok": ok, "fix": fix, "detail": detail })
+}
+
+#[tauri::command]
+fn platform_info() -> Value {
+    json!({ "mobile": MOBILE, "notice": MOBILE.then_some(MOBILE_NOTICE) })
 }
 
 #[tauri::command]
@@ -386,29 +605,36 @@ async fn run_checks(state: State<'_, AppState>) -> Result<Value, String> {
         Err(fix) => return Ok(json!([check_row("engine", label, false, Some(fix), None)])),
     };
     let detail = format!("{} ({})", spec.program.display(), spec.source);
-    let mut rows = vec![check_row("engine", label, true, None, Some(detail))];
     match (Engine { spec }).json(&["--json", "check"]) {
-        Ok(Value::Array(items)) => rows.extend(items),
-        Ok(_) => rows.push(check_row("check", "Prüfung", false, Some("Unerwartete Antwort der Engine.".into()), None)),
-        Err(err) => rows.push(check_row("check", "Prüfung", false, Some(err), None)),
+        Ok(Value::Array(items)) => Ok(Value::Array([vec![check_row("engine", label, true, None, Some(detail))], items].concat())),
+        Ok(_) => Ok(json!([check_row("engine", label, false, Some("Die Engine antwortet nicht wie erwartet.".into()), Some(detail))])),
+        Err(err) => {
+            let fix = format!("Die Engine lässt sich nicht prüfen: {}", err.chars().take(300).collect::<String>());
+            Ok(json!([check_row("engine", label, false, Some(fix), Some(detail))]))
+        }
     }
-    Ok(Value::Array(rows))
 }
 
 #[tauri::command]
 async fn start_session(app: AppHandle, state: State<'_, AppState>, options: StartOptions) -> Result<(), String> {
-    if state.active_session().is_some() {
-        return Err("Es läuft bereits eine Sitzung.".into());
-    }
+    options.validate()?;
     let engine = state.engine()?;
-    let args = start_args(&options)?;
-    let handle = app.clone();
-    let sink: Sink = Arc::new(move |name, payload| {
-        let _ = handle.emit(name, payload);
-    });
-    let session = Session::spawn(engine.command(&args), sink)?;
-    *state.session.lock().unwrap() = Some(session);
-    Ok(())
+    let args = options.args();
+    state.launch(|| {
+        if let (Some(pending), Some(audio)) = (state.pending.load(), options.audio()) {
+            if let Some(id) = pending.meeting_id.filter(|_| pending.audio == audio) {
+                engine.discard(&id);
+            }
+        }
+        let pending = PendingStore { path: state.pending.path.clone() };
+        let sink: Sink = Arc::new(move |name, payload| {
+            if name == EVENT_NAME {
+                pending.observe(&payload, &options);
+            }
+            let _ = app.emit(name, payload);
+        });
+        Session::spawn(engine.command(&args), sink, Some(state.log_path.clone()))
+    })
 }
 
 #[tauri::command]
@@ -419,9 +645,19 @@ fn stop_session(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 fn session_state(state: State<'_, AppState>) -> Value {
     match state.active_session() {
-        Some(session) => json!({ "active": true, "stage": session.stage() }),
+        Some(session) => session.state(),
         None => json!({ "active": false, "stage": "finished" }),
     }
+}
+
+#[tauri::command]
+fn pending_run(state: State<'_, AppState>) -> Option<Pending> {
+    state.pending.load()
+}
+
+#[tauri::command]
+fn discard_pending(state: State<'_, AppState>) {
+    state.pending.clear();
 }
 
 #[tauri::command]
@@ -443,12 +679,11 @@ fn open_report(path: String) -> Result<(), String> {
     if !is_md || !target.is_file() {
         return Err(format!("Protokoll nicht gefunden: {path}"));
     }
-    Command::new("explorer.exe")
-        .arg(target)
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("Protokoll nicht geöffnet: {e}"))
+    if MOBILE {
+        return Err("Auf diesem Gerät lässt sich das Protokoll nicht öffnen.".into());
+    }
+    let opener = if cfg!(windows) { "explorer.exe" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    Command::new(opener).arg(target).detached().spawn().map(|_| ()).map_err(|e| format!("Protokoll nicht geöffnet: {e}"))
 }
 
 #[tauri::command]
@@ -462,20 +697,30 @@ async fn pick_audio(app: AppHandle) -> Option<String> {
 }
 
 #[tauri::command]
-fn exit_app(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+async fn exit_app(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     if let Some(session) = state.active_session() {
         session.kill()?;
+        if let (Some(id), Ok(engine)) = (session.info().meeting_id, state.engine()) {
+            engine.discard(&id);
+        }
     }
     app.exit(0);
     Ok(())
 }
 
-fn main() {
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let dir = config_dir(app);
-            app.manage(AppState { settings_path: dir.join(SETTINGS_FILE), session: Mutex::new(None) });
+            app.manage(AppState {
+                settings_path: dir.join(SETTINGS_FILE),
+                pending: PendingStore { path: dir.join(PENDING_FILE) },
+                log_path: dir.join(LOG_FILE),
+                session: Mutex::new(None),
+            });
+            let _ = std::fs::create_dir_all(&dir);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -483,11 +728,12 @@ fn main() {
                 let state = window.app_handle().state::<AppState>();
                 if let Some(session) = state.active_session() {
                     api.prevent_close();
-                    let _ = window.emit("close-requested", json!({ "stage": session.stage() }));
+                    let _ = window.emit(CLOSE_NAME, json!({ "stage": session.stage(), "audio": session.info().audio }));
                 }
             }
         })
         .invoke_handler(tauri::generate_handler![
+            platform_info,
             get_settings,
             save_settings,
             engine_info,
@@ -499,6 +745,8 @@ fn main() {
             start_session,
             stop_session,
             session_state,
+            pending_run,
+            discard_pending,
             save_speakers,
             open_report,
             pick_audio,
@@ -509,188 +757,4 @@ fn main() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashSet;
-
-    fn locator<'a>(settings: &'a Settings, present: &'a dyn Fn(&Path) -> bool, path_var: &str) -> Locator<'a> {
-        Locator { settings, exists: present, path_var: path_var.to_string() }
-    }
-
-    fn present_from(paths: &'static [&'static str]) -> impl Fn(&Path) -> bool {
-        let set: HashSet<PathBuf> = paths.iter().map(PathBuf::from).collect();
-        move |p| set.contains(p)
-    }
-
-    #[test]
-    fn event_lines_skip_noise_and_keep_events() {
-        assert_eq!(parse_event(r#"  {"event":"recording","input":"DJI"}  "#).unwrap()["input"], "DJI");
-        assert!(parse_event("Warnung der Bibliothek").is_none());
-        assert!(parse_event(r#"{"kein":"event"}"#).is_none());
-        assert!(parse_event(r#"{"event":"kaputt"#).is_none());
-        assert!(parse_event(r#"{"event":5}"#).is_none());
-        assert!(parse_event("").is_none());
-    }
-
-    #[test]
-    fn stages_follow_events() {
-        let ev = |name: &str| json!({ "event": name });
-        let mut stage = Stage::Preflight;
-        for (name, expected) in [
-            ("warning", Stage::Preflight),
-            ("recording", Stage::Recording),
-            ("warning", Stage::Recording),
-            ("transcribing", Stage::Processing),
-            ("done", Stage::Finished),
-        ] {
-            stage = stage.after(&ev(name));
-            assert_eq!(stage, expected);
-        }
-        assert_eq!(Stage::Processing.after(&ev("error")), Stage::Finished);
-    }
-
-    #[test]
-    fn json_output_tolerates_leading_noise() {
-        assert_eq!(parse_json_output("[1,2]\n").unwrap(), json!([1, 2]));
-        assert_eq!(parse_json_output("Rauschen\n{\"a\":1}\n").unwrap(), json!({ "a": 1 }));
-        assert!(parse_json_output("nur Text").is_err());
-    }
-
-    #[test]
-    fn saved_engine_wins_then_default_then_uv() {
-        let settings = Settings { engine: r"D:\x\meetscribe.exe".into(), ..Settings::default() };
-        let present = present_from(&[r"D:\x\meetscribe.exe", DEFAULT_ENGINE]);
-        let spec = locator(&settings, &present, "").locate().unwrap();
-        assert_eq!((spec.program, spec.source.as_str()), (PathBuf::from(r"D:\x\meetscribe.exe"), "gespeicherter Pfad"));
-        let present = present_from(&[DEFAULT_ENGINE]);
-        let spec = locator(&settings, &present, "").locate().unwrap();
-        assert_eq!((spec.program, spec.source.as_str()), (PathBuf::from(DEFAULT_ENGINE), "Standardpfad"));
-        let spec = locator(&Settings::default(), &present, "").locate().unwrap();
-        assert_eq!(spec.source, "Standardpfad");
-    }
-
-    #[test]
-    fn uv_fallback_uses_project_and_requires_pyproject() {
-        let settings = Settings::default();
-        let uv = r"C:\tools\uv.exe";
-        let pyproject = format!(r"{DEFAULT_REPO}\pyproject.toml");
-        let present = |p: &Path| p == Path::new(uv) || p == Path::new(&pyproject);
-        let spec = locator(&settings, &present, r"C:\win;C:\tools").locate().unwrap();
-        assert_eq!(spec.program, PathBuf::from(uv));
-        assert_eq!(spec.args, ["run", "--project", DEFAULT_REPO, "meetscribe"]);
-        let custom = Settings { repo: r"E:\repo".into(), ..Settings::default() };
-        let present = |p: &Path| p == Path::new(uv) || p == Path::new(r"E:\repo\pyproject.toml");
-        assert_eq!(locator(&custom, &present, r"C:\tools").locate().unwrap().args[2], r"E:\repo");
-        let only_uv = |p: &Path| p == Path::new(uv);
-        let err = locator(&settings, &only_uv, r"C:\tools").locate().unwrap_err();
-        assert!(err.contains("Engine nicht gefunden") && err.contains("uv sync"));
-        let none = |_: &Path| false;
-        assert!(locator(&settings, &none, r"C:\tools").locate().is_err());
-    }
-
-    #[test]
-    fn start_args_cover_recording_and_file_modes() {
-        let base = StartOptions { title: Some("  Runde ".into()), audio: None, mic: Some("DJI".into()), device: "gpu".into(), diarize: false };
-        assert_eq!(
-            start_args(&base).unwrap(),
-            ["start", "--events", "--no-open", "--device", "gpu", "--stdin-stop", "--mic", "DJI", "--title", "Runde", "--no-diarize"]
-        );
-        let file = StartOptions { title: None, audio: Some(r"C:\a b\x.wav".into()), mic: Some("DJI".into()), device: "npu".into(), diarize: true };
-        assert_eq!(start_args(&file).unwrap(), ["start", r"C:\a b\x.wav", "--events", "--no-open", "--device", "npu"]);
-        let blank = StartOptions { title: Some(" ".into()), audio: Some("".into()), mic: Some("".into()), device: "cpu".into(), diarize: true };
-        assert_eq!(start_args(&blank).unwrap(), ["start", "--events", "--no-open", "--device", "cpu", "--stdin-stop"]);
-        let bad = StartOptions { device: "tpu".into(), ..blank };
-        assert!(start_args(&bad).is_err());
-    }
-
-    #[test]
-    fn settings_roundtrip_and_defaults() {
-        let dir = std::env::temp_dir().join(format!("meetscribe-gui-test-{}", std::process::id()));
-        let path = dir.join(SETTINGS_FILE);
-        assert_eq!(Settings::load(&path), Settings::default());
-        let settings = Settings { engine: "x".into(), mic: "DJI".into(), device: "gpu".into(), diarize: false, ..Settings::default() };
-        settings.save(&path).unwrap();
-        assert_eq!(Settings::load(&path), settings);
-        std::fs::write(&path, r#"{"device":"cpu"}"#).unwrap();
-        assert_eq!(Settings::load(&path), Settings { device: "cpu".into(), ..Settings::default() });
-        assert!(Settings { device: "tpu".into(), ..Settings::default() }.save(&path).is_err());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    fn fake_engine() -> PathBuf {
-        std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("examples").join("fake_engine.exe")
-    }
-
-    fn wait_for(limit: usize, mut done: impl FnMut() -> bool) {
-        for _ in 0..limit {
-            if done() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-    }
-
-    fn run_fake(mode: &str, args: &[&str], stop_after: Option<&str>) -> (Vec<(String, Value)>, Arc<Session>) {
-        let mut cmd = Command::new(fake_engine());
-        cmd.args(args).env("FAKE_ENGINE_MODE", mode).creation_flags(CREATE_NO_WINDOW);
-        let seen = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
-        let log = seen.clone();
-        let session = Session::spawn(cmd, Arc::new(move |name, payload| log.lock().unwrap().push((name.to_string(), payload)))).unwrap();
-        if let Some(name) = stop_after {
-            wait_for(200, || seen.lock().unwrap().iter().any(|(_, v)| v["event"] == name));
-            wait_for(200, || session.stage() == Stage::Recording);
-            session.stop().unwrap();
-        }
-        wait_for(400, || !session.active());
-        let events = seen.lock().unwrap().clone();
-        (events, session)
-    }
-
-    fn names(events: &[(String, Value)]) -> Vec<String> {
-        events.iter().map(|(n, v)| if n == EXIT_NAME { "exit".to_string() } else { v["event"].as_str().unwrap().to_string() }).collect()
-    }
-
-    #[test]
-    fn session_stop_line_ends_recording_and_processing_continues() {
-        let (events, session) = run_fake("", &["start", "--events", "--stdin-stop"], Some("recording"));
-        assert_eq!(names(&events), ["preflight", "recording", "warning", "transcribing", "done", "exit"]);
-        let exit = &events.last().unwrap().1;
-        assert_eq!((exit["code"].as_i64(), exit["terminal"].as_bool()), (Some(0), Some(true)));
-        assert!(!session.active() && session.stage() == Stage::Finished);
-        assert_eq!(events[4].1["labels"][0]["sample"], "Guten Morgen zusammen.");
-        assert!(session.stop().is_err());
-    }
-
-    #[test]
-    fn session_reports_failure_events_and_exit_code() {
-        let (events, _) = run_fake("preflight_fail", &["start", "--events"], None);
-        assert_eq!(names(&events), ["preflight", "error", "exit"]);
-        assert_eq!(events[2].1["code"], 1);
-        let (events, _) = run_fake("process_fail", &["start", "x.wav", "--events"], None);
-        assert_eq!(names(&events), ["preflight", "transcribing", "error", "exit"]);
-        assert!(events[2].1["retry"].as_str().unwrap().contains("--events"));
-        assert_eq!(events[2].1["audio"], r"C:\fake\aufnahme.flac");
-    }
-
-    #[test]
-    fn kill_is_refused_while_recording_but_works_after() {
-        let mut cmd = Command::new(fake_engine());
-        cmd.args(["start", "--events", "--stdin-stop"]).creation_flags(CREATE_NO_WINDOW);
-        let session = Session::spawn(cmd, Arc::new(|_, _| {})).unwrap();
-        wait_for(200, || session.stage() == Stage::Recording);
-        assert!(session.kill().is_err());
-        session.stop().unwrap();
-        wait_for(200, || session.stage() != Stage::Recording);
-        assert!(session.kill().is_ok());
-    }
-
-    #[test]
-    fn engine_json_queries_run_through_the_command_line() {
-        let engine = Engine { spec: EngineSpec { program: fake_engine(), args: vec![], source: "test".into() } };
-        assert_eq!(engine.json(&["--json", "devices"]).unwrap()["inputs"][0]["name"], "Fake Mikrofon");
-        assert_eq!(engine.json(&["--json", "report", "--", "fake"]).unwrap()["markdown"], "# Fake\n\nProtokoll");
-        assert!(engine.run(&["speakers", "set", "--meeting", "fake", "--", "A", "B"]).is_ok());
-        let broken = Engine { spec: EngineSpec { program: PathBuf::from(r"C:\gibt\es\nicht.exe"), args: vec![], source: "test".into() } };
-        assert!(broken.json(&["--json", "meetings"]).unwrap_err().contains("nicht gestartet"));
-    }
-}
+mod tests;

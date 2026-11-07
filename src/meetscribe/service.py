@@ -16,6 +16,7 @@ from inspect import signature
 from pathlib import Path
 
 import click
+import duckdb
 
 from meetscribe import backends, pipeline
 from meetscribe.backends import BACKEND_CHOICES, CATALOG, Catalog, Hardware, Selection
@@ -62,8 +63,10 @@ TEXT = {
     "discard_failed": "{meeting_id} konnte nicht verworfen werden: {reason}",
     "unknown_label": "Unbekanntes Label '{label}'. Vorhanden: {labels}",
     "no_mapping": "Keine Zuordnung fuer {label} in {meeting_id}.",
+    "audio_missing": "Die Audiodatei existiert nicht oder ist keine Datei: {audio}",
 }
 RUN_OPTIONS = ("audio", "title", "mic", "device", "backend", "model", "diarize", "speakers", "fallback")
+TRANSCRIPT = {"default_rows": 200, "max_rows": 1000}
 SPEAKERS_SQL = (
     "SELECT speaker AS label, any_value(display_name) AS name, sum(end_s - start_s) AS talk_s, count(*) AS segments "
     "FROM segments_named WHERE meeting_id = ? GROUP BY speaker ORDER BY speaker"
@@ -177,6 +180,7 @@ class RunState:
         self.id = ident
         self.options = options
         self.stop = pipeline.StopSignal()
+        self.cancel = pipeline.StopSignal()
         self.stage = "preflight"
         self.since = time.monotonic()
         self.audio = self.input = self.meeting_id = None
@@ -274,7 +278,8 @@ class Download:
 
 
 class Service:
-    def __init__(self, store=None, engines=None):
+    def __init__(self, store=None, engines=None, sandbox=False):
+        self.sandbox = sandbox
         self.store = store or Store(make_config())
         self.engines = engines or pipeline.FreshEngines()
         self.lock = threading.RLock()
@@ -289,7 +294,7 @@ class Service:
     def reading(self):
         with self.lock:
             if self.query is None:
-                self.query = Query(self.store)
+                self.query = Query(self.store, sandbox=self.sandbox)
             yield self.query
 
     def warm(self):
@@ -331,6 +336,32 @@ class Service:
         except duckdb.Error as exc:
             raise ServiceError(str(exc)) from exc
         return {"columns": list(columns), "rows": [list(r) for r in rows]}
+
+    def select(self, query, limit=None):
+        try:
+            with self.reading() as reader:
+                columns, rows, more = reader.select(query, limit)
+        except duckdb.Error as exc:
+            raise ServiceError(str(exc)) from exc
+        return {"columns": list(columns), "rows": [list(r) for r in rows], "truncated": more}
+
+    def transcript(self, meeting_id=None, speaker=None, offset=0, limit=None):
+        meeting_id = self.require(meeting_id)
+        limit = min(max(int(limit or TRANSCRIPT["default_rows"]), 1), TRANSCRIPT["max_rows"])
+        offset = max(int(offset or 0), 0)
+        with self.reading() as query:
+            info = next(m for m in query.meetings() if m["meeting_id"] == meeting_id)
+            where = "meeting_id = ?" + (" AND (speaker = ? OR display_name = ?)" if speaker else "")
+            params = [meeting_id, *([speaker, speaker] if speaker else [])]
+            total = query.execute(f"SELECT count(*) FROM segments_named WHERE {where}", params)[1][0][0]
+            segments = query._records(
+                f"SELECT seg_id, start_s, end_s, speaker AS label, display_name AS speaker, text FROM segments_named WHERE {where} "
+                "ORDER BY start_s, seg_id LIMIT ? OFFSET ?", [*params, limit, offset],
+            )
+        return {
+            "meeting_id": meeting_id, "title": info["title"], "date": info["meeting_date"], "complete": info["complete"],
+            "total": total, "offset": offset, "next_offset": offset + len(segments) if offset + len(segments) < total else None, "segments": segments,
+        }
 
     def speakers_show(self, meeting_id=None):
         meeting_id = self.require(meeting_id)
@@ -477,7 +508,7 @@ class Service:
         reporter = RunReporter(run, wire)
         flow, code = None, 0
         try:
-            flow = self.flow(reporter=reporter, stop=run.stop, **run.options)
+            flow = self.flow(reporter=reporter, stop=run.stop, cancel=run.cancel, **run.options)
             with pipeline.KeepAwake():
                 flow.run()
         except click.exceptions.Exit as exc:
@@ -503,6 +534,21 @@ class Service:
         run.stop.set()
         return {"run": run.id}
 
+    def cancel_run(self):
+        run = self.run
+        if run is None or not run.active:
+            raise ServiceError(TEXT["no_run"])
+        run.cancel.set()
+        run.stop.set()
+        return {"run": run.id}
+
+    def begin_transcription(self, audio, wire, submit, **options):
+        path = Path(audio)
+        if not path.is_file():
+            raise ServiceError(TEXT["audio_missing"].format(audio=audio))
+        options = {k: v for k, v in options.items() if k in RUN_OPTIONS and k not in ("audio", "mic") and v is not None}
+        return self.begin_run({**options, "audio": str(path.resolve())}, wire, submit)
+
     def run_state(self):
         run = self.run
         return run.snapshot() if run is not None else {"active": False, "stage": "finished"}
@@ -525,6 +571,7 @@ class Service:
             self.download.kill()
         if self.run is not None:
             self.run.stop.set()
+            self.run.cancel.set()
         self.engines.release()
 
 

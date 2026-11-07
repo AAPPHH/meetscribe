@@ -7,10 +7,11 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from meetscribe import backends, pipeline, service
-from meetscribe.service import EngineCache, RpcServer, Service, Wire
+from meetscribe.service import EngineCache, RpcServer, Service, ServiceError, Wire
 from test_cli import FakeEngine, FakeRecorder, env, transcribe, truncated_meeting  # noqa: F401
 
 LAUNCHER = Path(__file__).parent / "fake_engine_process.py"
@@ -489,3 +490,84 @@ def test_many_queries_in_a_row_stay_fast_once_warm(engine_process, env):
         peer.call("meetings")
         peer.call("search", term="münchen", limit=50)
     assert (time.perf_counter() - started) / 40 < 0.25
+
+
+class CollectWire:
+    closed = False
+
+    def __init__(self):
+        self.notes = []
+
+    def notify(self, method, params):
+        self.notes.append((method, params))
+        return True
+
+    def events(self):
+        return [p for m, p in self.notes if m == "run.event" and p["event"] != "alive"]
+
+
+def in_thread(job):
+    threading.Thread(target=job, daemon=True).start()
+
+
+def test_cancel_stops_processing_between_windows_and_leaves_no_partial_meeting(env, fast, monkeypatch):
+    monkeypatch.setitem(pipeline.SETTINGS, "window_s", 10.0)
+    monkeypatch.setattr(pipeline.AudioLoader, "load", staticmethod(lambda path, rate=None: np.full(16000 * 60, 0.1, dtype="float32")))
+    SlowEngine.gate = threading.Event()
+    svc, wire = Service(env["store"], EngineCache(idle_s=60)), CollectWire()
+    run = svc.begin_transcription(env["audio"], wire, in_thread, diarize=False)
+    deadline = time.monotonic() + 15
+    while svc.run.stage != "processing" and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert svc.run.stage == "processing" and svc.cancel_run() == run
+    SlowEngine.gate.set()
+    assert svc.run.finished.wait(20) and svc.run.code == 130
+    error = wire.events()[-1]
+    assert error["event"] == "error" and error["message"] == "Verarbeitung abgebrochen." and error["exit_code"] == 130
+    assert not env["store"].hot_files() and svc.meetings() == []
+    assert ("run.exit", {"run": 1, "code": 130, "terminal": True}) in wire.notes
+    with pytest.raises(ServiceError, match="Keine Sitzung aktiv"):
+        svc.cancel_run()
+    assert svc.begin_transcription(env["audio"], wire, in_thread, diarize=False) == {"run": 2}
+    SlowEngine.gate = None
+    assert svc.run.finished.wait(30)
+
+
+def test_stopping_a_recording_does_not_cancel_the_processing_that_follows(env, fast):
+    FakeRecorder.interrupt_with = "none"
+    svc, wire = Service(env["store"], EngineCache(idle_s=60)), CollectWire()
+    svc.begin_run({"device": "auto", "diarize": False}, wire, in_thread)
+    deadline = time.monotonic() + 15
+    while svc.run.stage != "recording" and time.monotonic() < deadline:
+        time.sleep(0.02)
+    svc.stop_run()
+    assert svc.run.finished.wait(20) and svc.run.code == 0 and wire.events()[-1]["event"] == "done"
+
+
+@pytest.mark.parametrize("audio", ["fehlt.wav", "."])
+def test_transcription_needs_an_existing_audio_file_and_never_records(env, fast, audio):
+    svc = Service(env["store"], EngineCache(idle_s=60))
+    with pytest.raises(ServiceError, match="existiert nicht oder ist keine Datei"):
+        svc.begin_transcription(env["tmp"] / audio, CollectWire(), in_thread)
+    assert svc.run is None and FakeRecorder.started == []
+
+
+def test_transcript_pages_through_segments_with_names(env, fast):
+    assert transcribe(env, "--no-diarize").exit_code == 0
+    svc = Service(env["store"])
+    svc.speakers_set("UNKNOWN", "Anna", "m1")
+    full = svc.transcript("m1")
+    assert full["total"] == 1 and full["next_offset"] is None and full["segments"][0]["speaker"] == "Anna" and full["segments"][0]["label"] == "UNKNOWN"
+    assert svc.transcript(None, speaker="Anna")["total"] == 1 and svc.transcript("m1", speaker="Bernd")["segments"] == []
+    assert svc.transcript("m1", offset=5)["segments"] == []
+    with pytest.raises(ServiceError, match="Unbekannte meeting_id"):
+        svc.transcript("gibtsnicht")
+
+
+def test_sandboxed_service_selects_read_only(env):
+    assert transcribe(env, "--no-diarize").exit_code == 0
+    svc = Service(env["store"], sandbox=True)
+    assert svc.select("SELECT count(*) AS n FROM segments") == {"columns": ["n"], "rows": [[1]], "truncated": False}
+    with pytest.raises(ServiceError, match="SELECT"):
+        svc.select("DROP VIEW segments")
+    assert svc.select("SELECT * FROM range(10)", 3)["truncated"] is True

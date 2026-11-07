@@ -21,7 +21,7 @@ import soundfile as sf
 
 from meetscribe import backends
 from meetscribe.backends import CATALOG, Catalog, Hardware, Selection
-from meetscribe.store import PROJECT_ROOT, Json, Query, Report, ReportFile, as_date
+from meetscribe.store import PROJECT_ROOT, FileLock, Json, LockBusy, Query, Report, ReportFile, as_date
 
 SETTINGS = {
     "language": "de",
@@ -337,6 +337,10 @@ class StdinWatcher:
         return self.event.is_set()
 
 
+class Cancelled(KeyboardInterrupt):
+    pass
+
+
 class StopSignal:
     def __init__(self):
         self.event = threading.Event()
@@ -349,6 +353,10 @@ class StopSignal:
 
     def is_set(self):
         return self.event.is_set()
+
+    def check(self):
+        if self.event.is_set():
+            raise Cancelled()
 
 
 class Interrupt:
@@ -556,10 +564,11 @@ class ASRRunner:
 
 
 class Transcriber:
-    def __init__(self, runner, aligner=None, windows=None):
+    def __init__(self, runner, aligner=None, windows=None, cancel=None):
         self.runner = runner
         self.aligner = aligner or Aligner()
         self.windows = windows or Windows()
+        self.cancel = cancel or StopSignal()
 
     @staticmethod
     def words(result, offset, limit, floor):
@@ -578,6 +587,7 @@ class Transcriber:
     def run(self, audio, turns, writer):
         rate, floor, count, speakers, ran = self.windows.rate, 0.0, 0, set(), []
         for first, last in self.windows.split(audio):
+            self.cancel.check()
             chunk = audio[first:last]
             if float(np.max(np.abs(chunk))) < SETTINGS["silence_peak"]:
                 continue
@@ -645,9 +655,10 @@ class Naming:
 class TranscribeJob:
     def __init__(self, store, audio, device, language, models=None, model=None, title=None, day=None, meeting_id=None,
                  diarize=True, fallback=True, speakers=None, min_speakers=None, max_speakers=None, reporter=None,
-                 backend="auto", hardware=None, engines=None):
+                 backend="auto", hardware=None, engines=None, cancel=None):
         self.reporter = reporter or Reporter()
         self.engines = engines or FreshEngines()
+        self.cancel = cancel or StopSignal()
         self.store = store
         self.audio = Path(audio)
         self.device = (device or "auto").lower()
@@ -720,14 +731,16 @@ class TranscribeJob:
         if exists:
             raise PipelineError(f"meeting_id existiert bereits: {meeting_id}")
         audio = AudioLoader.load(self.audio)
+        self.cancel.check()
         turns = Diarizer(self.models).diarize(audio, **self.speaker_options) if self.diarize else []
+        self.cancel.check()
         gc.collect()
         runner = ASRRunner(
             self.plan.chain, lambda step: self.engines.get(step, self.models, self.language), self.fallback, self.reporter,
             drop=lambda step: self.engines.drop(step, self.models, self.language),
         )
         with self.store.writer(meeting_id, title=self.title, meeting_date=self.day, language=self.language, discard_on_error=True) as writer:
-            summary = Transcriber(runner).run(audio, turns, writer)
+            summary = Transcriber(runner, cancel=self.cancel).run(audio, turns, writer)
         if not summary["segments"]:
             self.store.discard(meeting_id)
         return {**summary, "meeting_id": meeting_id, "requested": self.plan.requested, "ran": self.ran(summary, runner.load_s)}
@@ -993,38 +1006,15 @@ class RecordingSession:
         return [{**report, "problem": self.problems.get(r)} for r, report in zip(started, reports)]
 
 
-class RunLock:
-    def __init__(self, path):
-        self.path = Path(path)
-        self.file = None
-
-    def _lock(self, take):
-        self.file.seek(0)
-        if sys.platform == "win32":
-            import msvcrt
-            msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK if take else msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(self.file.fileno(), (fcntl.LOCK_EX | fcntl.LOCK_NB) if take else fcntl.LOCK_UN)
-
+class RunLock(FileLock):
     def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = open(self.path, "a+b")
         try:
-            self._lock(True)
-        except OSError:
-            self.file.close()
+            return super().__enter__()
+        except LockBusy:
             raise PipelineError(
                 "Es läuft bereits eine Aufnahme oder Verarbeitung (nach hartem Beenden der Oberfläche läuft die alte noch kurz weiter). "
                 "Bitte einen Moment warten und dann erneut versuchen."
             ) from None
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        with suppress(OSError):
-            self._lock(False)
-        self.file.close()
-        return False
 
 
 class Heartbeat:
@@ -1064,8 +1054,9 @@ class Heartbeat:
 class StartFlow:
     def __init__(self, store, audio=None, mic=None, device="auto", title=None, speakers=None, diarize=True,
                  open_report=True, tty=False, models=None, picker=None, reporter=None, stdin_stop=False,
-                 backend="auto", model=None, fallback=True, hardware=None, stop=None, engines=None):
+                 backend="auto", model=None, fallback=True, hardware=None, stop=None, engines=None, cancel=None):
         self.reporter = reporter or Reporter()
+        self.cancel = cancel
         self.engines = engines
         self.store = store
         self.audio = Path(audio) if audio else None
@@ -1119,7 +1110,7 @@ class StartFlow:
         self.job = TranscribeJob(
             self.store, planned, self.device, SETTINGS["language"], models=self.models, model=self.model, title=self.title,
             diarize=self.diarize, speakers=self.speakers, reporter=self.reporter, backend=self.backend,
-            fallback=self.fallback, hardware=self.hardware, engines=self.engines,
+            fallback=self.fallback, hardware=self.hardware, engines=self.engines, cancel=self.cancel,
         )
         self.job.check()
         if self.audio is not None:

@@ -362,8 +362,13 @@ impl PendingStore {
     }
 
     fn reconcile(&self, engine: &Arc<EngineClient>, audio: &str) -> Result<(), String> {
-        let Some(id) = self.load().filter(|p| p.audio == audio).and_then(|p| p.meeting_id) else { return Ok(()) };
-        if settle_meeting(engine, &id)? == MeetingState::Complete {
+        let Some(pending) = self.read() else { return Ok(()) };
+        let Some(id) = pending.meeting_id.clone() else { return Ok(()) };
+        let same = pending.audio == audio;
+        let state = settle_meeting(engine, &id)?;
+        if !same {
+            self.clear();
+        } else if state == MeetingState::Complete {
             self.clear();
             return Err(format!("Diese Verarbeitung ist bereits abgeschlossen ({id}). Das Ergebnis steht unter „Besprechungen“."));
         }

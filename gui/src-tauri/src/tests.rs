@@ -618,9 +618,25 @@ fn a_partial_run_is_discarded_before_the_retry_and_a_run_that_still_holds_it_blo
     assert_eq!(store.reconcile(&rig.client, &audio).unwrap_err(), STILL_RUNNING);
     assert!(store.path.exists());
     remember(&store, &audio, Some("m-teil"));
-    assert!(store.reconcile(&rig.client, r"C:\ein\anderes\audio.flac").is_ok());
+    assert!(store.reconcile(&rig.client, r"C:\ein\anderes\audio.flac").is_ok() && !store.path.exists());
     remember(&store, &audio, None);
     assert!(store.reconcile(&rig.client, &audio).is_ok() && store.path.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_crashed_run_is_cleaned_up_when_another_file_starts_and_a_run_that_still_holds_it_blocks_that_start() {
+    let (rig, store, audio, dir) = pending_engine("other");
+    let other = r"C:\ein\anderes\audio.flac";
+    for id in ["m-teil", "m-fertig", "m-weg"] {
+        remember(&store, &audio, Some(id));
+        assert!(store.reconcile(&rig.client, other).is_ok() && !store.path.exists(), "{id}");
+    }
+    remember(&store, &audio, Some("m-fail"));
+    assert_eq!(store.reconcile(&rig.client, other).unwrap_err(), STILL_RUNNING);
+    assert_eq!(store.read().unwrap().meeting_id.as_deref(), Some("m-fail"));
+    remember(&store, &audio, None);
+    assert!(store.reconcile(&rig.client, other).is_ok() && store.path.exists());
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -1126,6 +1126,8 @@ def test_start_events_show_a_fallback_as_warning_and_in_the_result(env):
     events = events_of(start("--events", "--no-diarize", env["audio"]))
     warning = next(e for e in events if e["event"] == "warning")
     assert "NPU fehlgeschlagen" in warning["message"] and "Rückfall auf iGPU" in warning["message"]
+    fallback = next(e for e in events if e["event"] == "fallback")
+    assert (fallback["from"], fallback["to"], fallback["backend"]) == ("NPU", "iGPU", "openvino")
     ran = events[-1]["ran"]
     assert ran["fallback"] is True and ran["devices"] == ["iGPU"] and ran["requested"] == "Automatisch"
     assert ran["text"].startswith("iGPU · ")
@@ -1180,7 +1182,7 @@ def test_models_command_lists_catalog_with_state_size_and_fit(env):
     lines = {tuple(line.split()[:3]): line for line in text.output.splitlines() if line.split()[:1] and line.split()[0] in backends.CATALOG["models"]}
     turbo = lines[("large-v3-turbo", "openvino", "fp16")].split()
     assert turbo[3:5] == ["1628", "MB"] and turbo[5] == "ja"
-    assert "ungeprüft" in lines[("small", "openvino", "fp16")] and "nein" in lines[("small", "faster-whisper", "ct2")]
+    assert "ungeprüft" in lines[("medium", "openvino", "fp16")] and "ungeprüft" not in lines[("small", "openvino", "fp16")] and "nein" in lines[("small", "faster-whisper", "ct2")]
     data = parsed(invoke("models", "--json"))
     assert data["default_model"] == "large-v3-turbo" and len(data["models"]) == 18 and len(data["choices"]) == 105
     assert [b["id"] for b in data["backends"]] == ["openvino", "faster-whisper"] and data["backends"][1]["installed"] is False

@@ -49,7 +49,7 @@ CATALOG = {
         "openvino": {
             "tiny": {"fp16": {"repo": "OpenVINO/whisper-tiny-fp16-ov", "mb": 84}, "int8": {"repo": "OpenVINO/whisper-tiny-int8-ov", "mb": 49}},
             "base": {"fp16": {"repo": "OpenVINO/whisper-base-fp16-ov", "mb": 154}, "int8": {"repo": "OpenVINO/whisper-base-int8-ov", "mb": 85}},
-            "small": {"fp16": {"repo": "OpenVINO/whisper-small-fp16-ov", "mb": 493}, "int8": {"repo": "OpenVINO/whisper-small-int8-ov", "mb": 257}},
+            "small": {"fp16": {"repo": "OpenVINO/whisper-small-fp16-ov", "mb": 493, "npu": "ok"}, "int8": {"repo": "OpenVINO/whisper-small-int8-ov", "mb": 257}},
             "medium": {"fp16": {"repo": "OpenVINO/whisper-medium-fp16-ov", "mb": 1539}, "int8": {"repo": "OpenVINO/whisper-medium-int8-ov", "mb": 784}},
             "large-v3": {"fp16": {"repo": "OpenVINO/whisper-large-v3-fp16-ov", "mb": 3099}, "int8": {"repo": "OpenVINO/whisper-large-v3-int8-ov", "mb": 1568}},
             "large-v3-turbo": {"fp16": {"repo": "OpenVINO/whisper-large-v3-turbo-fp16-ov", "mb": 1628, "npu": "ok"}, "int8": {"repo": "OpenVINO/whisper-large-v3-turbo-int8-ov", "mb": 828}},
@@ -75,9 +75,10 @@ CUDA_NAME = "NVIDIA-Karte {index} (CUDA)"
 
 
 class SelectionError(click.ClickException):
-    def __init__(self, message, detail=None):
+    def __init__(self, message, detail=None, reason=None):
         super().__init__(message)
         self.detail = detail
+        self.reason = reason or message
 
     def format_message(self):
         return f"{self.message}\n{self.detail}" if self.detail else self.message
@@ -335,7 +336,7 @@ class Selection:
             if found:
                 notices.append(CATALOG["notice_gpu"])
         if not found:
-            raise SelectionError(self.refusal(backend, hardware, name, reasons))
+            raise self.refusal(backend, hardware, name, reasons)
         ready = [s for s in found if s.installed]
         primary = (ready or found)[0]
         if ready and primary is not found[0]:
@@ -350,9 +351,9 @@ class Selection:
 
     @staticmethod
     def refusal(backend, hardware, model, reasons):
-        lines = list(dict.fromkeys(reason for _, _, reason in reasons if reason))
+        reason = " ".join(dict.fromkeys(reason for _, _, reason in reasons if reason))
         head = f"Diese Kombination geht nicht (Backend {backend}, Hardware {hardware}, Modell {model})."
-        return head + (" " + " ".join(lines) if lines else "")
+        return SelectionError(f"{head} {reason}".strip(), reason=reason)
 
     def matrix(self):
         rows = []
@@ -364,7 +365,7 @@ class Selection:
                         plan = self.resolve(backend, hardware, model)
                         row.update(ok=True, reason=None, resolved=plan.brief(), size_mb=plan.primary.entry["mb"], installed=plan.installed, status=plan.primary.status, notices=plan.notices)
                     except SelectionError as exc:
-                        row.update(ok=False, reason=exc.message, resolved=None, size_mb=None, installed=False, status="refused", notices=[])
+                        row.update(ok=False, reason=exc.reason, resolved=None, size_mb=None, installed=False, status="refused", notices=[])
                     rows.append(row)
         return rows
 

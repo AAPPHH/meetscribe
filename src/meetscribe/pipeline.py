@@ -491,6 +491,7 @@ class ASRRunner:
                     self.reporter.warn(f"{step.label} fehlgeschlagen: {Reason.of(exc)}", prefix="")
                     raise ASRFailure("Alle Geräte fehlgeschlagen: " + ", ".join(s.label for s in self.steps)) from exc
                 following = self.steps[self.index]
+                self.reporter.event("fallback", **{"from": step.label, "to": following.label, "backend": following.backend})
                 self.reporter.warn(f"{step.label} fehlgeschlagen: {Reason.of(exc)}. Rückfall auf {following.label} ({Catalog.backend_label(following.backend)}).", prefix="")
                 continue
             if step.label not in self.used:

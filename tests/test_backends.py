@@ -222,7 +222,7 @@ def test_matrix_covers_every_combination_with_reasons(models):
     assert by[("openvino", "gpu", "small")]["resolved"]["hardware"] == "igpu" and by[("openvino", "gpu", "small")]["notices"]
     refused = by[("faster-whisper", "npu", "small")]
     assert not refused["ok"] and "nur auf der CPU" in refused["reason"] and refused["resolved"] is None
-    assert not by[("faster-whisper", "gpu", "small")]["ok"] and by[("openvino", "npu", "small")]["status"] == "unverified"
+    assert not by[("faster-whisper", "gpu", "small")]["ok"] and by[("openvino", "npu", "medium")]["status"] == "unverified" and by[("openvino", "npu", "small")]["status"] == "ok"
     assert by[("openvino", "cpu", "small")]["installed"] is False and by[("openvino", "cpu", "small")]["size_mb"] == 257
     assert by[("openvino", "npu", "large-v3-turbo")]["size_mb"] == 1628
 
@@ -233,7 +233,9 @@ def test_listing_marks_install_state_and_per_hardware_status(models):
     assert turbo["installed"] and turbo["size_mb"] == 828 and turbo["hardware"]["npu"]["status"] == "refused" and "int8" in turbo["hardware"]["npu"]["reason"]
     assert turbo["hardware"]["gpu"]["status"] == "refused" and "dedizierte" in turbo["hardware"]["gpu"]["reason"]
     small = next(r for r in rows if (r["backend"], r["model"], r["variant"]) == ("openvino", "small", "fp16"))
-    assert not small["installed"] and small["hardware"]["npu"]["status"] == "unverified" and small["hardware"]["cpu"]["status"] == "ok"
+    assert not small["installed"] and small["hardware"]["npu"]["status"] == "ok" and small["hardware"]["cpu"]["status"] == "ok"
+    medium = next(r for r in rows if (r["backend"], r["model"], r["variant"]) == ("openvino", "medium", "fp16"))
+    assert medium["hardware"]["npu"]["status"] == "unverified"
     assert {r["backend"] for r in rows} == {"openvino", "faster-whisper"} and len(rows) == 12 + 6
 
 

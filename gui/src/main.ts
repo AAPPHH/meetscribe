@@ -272,6 +272,9 @@ class StartView {
     const line = $("summary");
     line.textContent = problem ? `${text} · ${problem}` : text;
     line.classList.toggle("warn", Boolean(problem));
+    const s = this.settings.value;
+    const mic = TEXT.micFixed.find(([v]) => v === s.mic)?.[1] ?? s.mic;
+    $("summary-input").textContent = `Mikrofon: ${mic} · Sprecher trennen: ${s.diarize ? "ja" : "nein"}`;
   }
 
   options() {

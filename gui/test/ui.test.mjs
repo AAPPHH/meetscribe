@@ -376,6 +376,19 @@ test("die erste Seite zeigt eine ruhige Zeile mit der aufgelösten Wahl", async 
   assert.equal(document.querySelectorAll("#view-idle select").length, 0);
 });
 
+test("die erste Seite nennt Mikrofon und Sprechertrennung, auch nach einer Änderung in den Einstellungen", async () => {
+  const ui = await boot({ list_models: () => modelsInfo() }, { mic: "laptop", diarize: false });
+  assert.equal(ui.$("summary-input").textContent, "Mikrofon: Laptop · Sprecher trennen: nein");
+  assert.equal(ui.$("summary").textContent, "NPU · large-v3-turbo · OpenVINO");
+  await openSettings();
+  ui.$("set-diarize").checked = true;
+  ui.$("set-diarize").dispatchEvent(new dom.window.Event("change"));
+  await flush();
+  assert.equal(ui.$("summary-input").textContent, "Mikrofon: Laptop · Sprecher trennen: ja");
+  await change(ui, "set-mic", "dji");
+  assert.equal(ui.$("summary-input").textContent, "Mikrofon: DJI · Sprecher trennen: ja");
+});
+
 test("ohne Antwort der Engine zeigt die Zeile die gespeicherte Wahl und die Einstellungen sagen es", async () => {
   const ui = await boot({}, { device: "cpu" });
   assert.equal(ui.$("summary").textContent, "CPU · Automatisch · OpenVINO");

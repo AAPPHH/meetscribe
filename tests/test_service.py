@@ -593,3 +593,36 @@ def test_transcription_refuses_a_mapped_network_drive(env, fast, monkeypatch):
     with pytest.raises(ServiceError, match="Netzlaufwerke"):
         svc.begin_transcription(r"Z:\meeting.wav", CollectWire(), in_thread)
     assert seen == ["Z:\\"]
+
+
+def test_closing_the_service_discards_the_running_meeting_at_once_not_after_the_window(env, fast, monkeypatch):
+    monkeypatch.setitem(pipeline.SETTINGS, "window_s", 10.0)
+    monkeypatch.setattr(pipeline.AudioLoader, "load", staticmethod(lambda path, rate=None: np.full(16000 * 60, 0.1, dtype="float32")))
+    SlowEngine.gate = threading.Event()
+    svc, wire = Service(env["store"], EngineCache(idle_s=60)), CollectWire()
+    svc.begin_transcription(env["audio"], wire, in_thread, diarize=False)
+    deadline = time.monotonic() + 15
+    while not env["store"].hot_files() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert env["store"].hot_files()
+    svc.close()
+    assert not env["store"].hot_files() and not svc.run.finished.is_set()
+    SlowEngine.gate.set()
+    assert svc.run.finished.wait(20) and svc.run.code == 130
+    assert not env["store"].hot_files() and svc.meetings() == []
+    SlowEngine.gate = None
+
+
+def test_closing_the_service_after_some_windows_leaves_no_incomplete_meeting(env, fast, monkeypatch):
+    monkeypatch.setitem(pipeline.SETTINGS, "window_s", 10.0)
+    monkeypatch.setattr(pipeline.AudioLoader, "load", staticmethod(lambda path, rate=None: np.full(16000 * 60, 0.1, dtype="float32")))
+    SlowEngine.gate = None
+    svc, wire = Service(env["store"], EngineCache(idle_s=60)), CollectWire()
+    svc.begin_transcription(env["audio"], wire, in_thread, diarize=False)
+    deadline = time.monotonic() + 15
+    while not svc.meetings() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert svc.meetings() and not svc.meetings()[0]["complete"]
+    svc.close()
+    assert not env["store"].hot_files() and svc.meetings() == []
+    assert svc.run.finished.wait(20) and svc.run.code == 130 and not env["store"].hot_files()

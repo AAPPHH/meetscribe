@@ -11,7 +11,7 @@ import threading
 import time
 import unicodedata
 from bisect import bisect_left
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from datetime import date, datetime
 from pathlib import Path
 
@@ -344,12 +344,25 @@ class Cancelled(KeyboardInterrupt):
 class StopSignal:
     def __init__(self):
         self.event = threading.Event()
+        self.hooks = []
 
     def start(self):
         return self
 
+    @contextmanager
+    def on_set(self, action):
+        self.hooks.append(action)
+        try:
+            if self.event.is_set():
+                action()
+            yield
+        finally:
+            self.hooks.remove(action)
+
     def set(self):
         self.event.set()
+        for action in list(self.hooks):
+            action()
 
     def is_set(self):
         return self.event.is_set()
@@ -740,7 +753,7 @@ class TranscribeJob:
             self.plan.chain, lambda step: self.engines.get(step, self.models, self.language), self.fallback, self.reporter,
             drop=lambda step: self.engines.drop(step, self.models, self.language),
         )
-        with self.store.writer(meeting_id, title=self.title, meeting_date=self.day, language=self.language, discard_on_error=True) as writer:
+        with self.store.writer(meeting_id, title=self.title, meeting_date=self.day, language=self.language, discard_on_error=True) as writer, self.cancel.on_set(writer.abort):
             summary = Transcriber(runner, cancel=self.cancel).run(audio, turns, writer)
         if not summary["segments"]:
             self.store.discard(meeting_id)

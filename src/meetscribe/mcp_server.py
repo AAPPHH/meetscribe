@@ -18,7 +18,7 @@ from meetscribe.backends import BACKEND_CHOICES, HARDWARE_CHOICES, Hardware
 from meetscribe.service import OFFLINE_ENV, EngineCache, Service, backend_report, engine_version, hardware_report
 from meetscribe.store import ID_PATTERN, Json, LockBusy, MeetingNotFound, Store, make_config
 
-MCP = {"name": "meetscribe", "log_level": "WARNING", "jobs_kept": 20, "wait_max_s": 60.0, "close_wait_s": 10.0, "detail_chars": 2000}
+MCP = {"name": "meetscribe", "log_level": "WARNING", "jobs_kept": 20, "wait_max_s": 60.0, "close_wait_s": 1.5, "detail_chars": 2000}
 TEXT = {
     "instructions": (
         "Meetscribe liefert lokal transkribierte Besprechungen: Archiv durchsuchen, Transkripte und Protokolle lesen, Sprecher benennen, "

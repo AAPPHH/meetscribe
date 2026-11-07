@@ -623,3 +623,17 @@ def test_rotate_from_two_processes_moves_each_meeting_once(store):
     counts = [int(w.communicate(timeout=60)[0]) for w in workers]
     assert sorted(counts) == [0, 6] and not store.hot_files() and len(store.cold_files()) == 6
     assert Query(store).execute("SELECT count(*) FROM segments")[1] == [(18,)]
+
+
+
+def test_an_aborted_writer_closes_and_discards_its_file_at_once_and_ignores_later_appends(store):
+    with store.writer("m9", title="T", meeting_date="2026-03-04", language="de", discard_on_error=True) as w:
+        assert w.append(segs(0.0)) == 3 and store.hot_path("m9").exists()
+        w.abort()
+        assert not store.hot_path("m9").exists() and w.append(segs(10.0)) == 0
+        w.abort()
+    assert store.hot_files() == []
+    with store.writer("m8", title="T", meeting_date="2026-03-04", language="de") as w:
+        w.append(segs(0.0))
+    w.abort()
+    assert store.hot_path("m8").exists() and HotFile(store.hot_path("m8")).is_complete()

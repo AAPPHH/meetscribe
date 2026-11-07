@@ -333,6 +333,8 @@ class TranscriptWriter:
         self.next_id = 0
         self.file = None
         self.stream = None
+        self.guard = threading.Lock()
+        self.state = "new"
 
     def __enter__(self):
         if self.store.exists(self.meta["meeting_id"]):
@@ -344,22 +346,36 @@ class TranscriptWriter:
             raise DuplicateMeetingError(f"meeting_id already exists: {self.meta['meeting_id']}") from None
         self.stream = ipc.new_stream(self.file, SCHEMA)
         self.file.flush()
+        self.state = "open"
         return self
 
-    def __exit__(self, exc_type, exc, tb):
-        failed = exc_type is not None
-        try:
+    def abort(self):
+        with self.guard:
+            if self.state != "open":
+                return
+            self.state = "aborted"
+            self.file.close()
             try:
-                if not failed:
-                    self.stream.close()
-            finally:
-                self.file.close()
-        except BaseException:
-            failed = True
-            raise
-        finally:
-            if failed and self.discard_on_error:
                 self.store.discard(self.meta["meeting_id"])
+            except OSError:
+                pass
+
+    def __exit__(self, exc_type, exc, tb):
+        with self.guard:
+            failed = exc_type is not None or self.state == "aborted"
+            self.state = "closed"
+            try:
+                try:
+                    if not failed:
+                        self.stream.close()
+                finally:
+                    self.file.close()
+            except BaseException:
+                failed = True
+                raise
+            finally:
+                if failed and self.discard_on_error:
+                    self.store.discard(self.meta["meeting_id"])
         return False
 
     def _row(self, seg, now):
@@ -373,6 +389,10 @@ class TranscriptWriter:
         return row
 
     def append(self, segments):
+        with self.guard:
+            return self._append(segments) if self.state == "open" else 0
+
+    def _append(self, segments):
         now = datetime.now(timezone.utc)
         saved = self.next_id
         try:

@@ -19,44 +19,17 @@ Die Installation hat zwei Teile, die du einmalig machst: zuerst die Engine mit d
 - Windows 11 (64 Bit). Entwickelt und gemessen nur auf Windows 11 mit Core Ultra 7 258V, Arc 140V, 32 GB RAM.
 - Intel Core Ultra mit NPU. Ohne NPU läuft es über den Fallback auf iGPU oder CPU. Optional (zweites Backend): eine NVIDIA-Karte mit CUDA 12 für faster-whisper auf der GPU; faster-whisper auf der CPU braucht nichts davon.
 
-### Engine einrichten
+### Engine und Modelle
 
-1. [uv](https://docs.astral.sh/uv/) installieren. Es holt Python 3.12 selbst.
-2. ffmpeg installieren, z. B. mit `winget install Gyan.FFmpeg`. Danach muss `ffmpeg -version` in einem neuen Terminal funktionieren (ffmpeg muss im PATH liegen). Es wird zum Dekodieren jeder Audiodatei gebraucht.
-3. Intel-NPU-Treiber und Intel-Arc-Grafiktreiber installieren. Beides wird nicht automatisch installiert.
-   - NPU-Treiber: https://www.intel.com/content/www/us/en/download/794734/intel-npu-driver-windows.html (aktuell 32.0.100.5540; gemessen wurde mit 32.0.100.4240).
-   - Arc-Grafiktreiber: https://www.intel.com/content/www/us/en/download/785597/intel-arc-iris-xe-graphics-windows.html (gemessen mit 32.0.101.8132). Der generische Intel-Treiber überschreibt den Treiber des Geräteherstellers; im Zweifel dessen Seite prüfen.
-4. Für die Sprechertrennung (nur einmalig bei `setup`): ein Hugging-Face-Konto anlegen, auf https://huggingface.co/pyannote/speaker-diarization-community-1 die Nutzungsbedingungen akzeptieren und ein Zugriffstoken (Lesezugriff) erzeugen. Das Token kommt in die Umgebungsvariable `HF_TOKEN`. Ohne das geht die App nur mit ausgeschaltetem „Sprecher trennen“.
-5. PowerShell im Projektordner öffnen (dem Ordner mit `pyproject.toml`) und die Engine installieren:
-
-```
-uv tool install --editable .
-```
-
-6. Token setzen und die Modelle laden, z. B. in PowerShell:
-
-```
-$env:HF_TOKEN = "hf_..."
-meetscribe setup
-```
-
-Die Installation muss editierbar sein (`--editable`): Modelle (`models\`), Daten (`data\`) und Protokolle (`protokolle\`) liegen relativ zum Projektordner, nicht relativ zum Aufrufort. Ist `meetscribe` danach nicht im PATH, hilft `uv tool update-shell` und ein neues Terminal.
-
-`setup` ist der einzige Befehl, der selbst das Netz nutzt. Er lädt:
-
-- `OpenVINO/whisper-large-v3-turbo-fp16-ov` (NPU) und `OpenVINO/whisper-large-v3-turbo-int8-ov` (iGPU/CPU) nach `models\`,
-- bei gesetztem `HF_TOKEN` das Diarisierungsmodell `pyannote/speaker-diarization-community-1`,
-- und wärmt danach den NPU-Compile-Cache (`models\ov_cache`) auf. Das dauert einmalig mehrere Minuten (beim ersten Lauf ohne Cache gemessen: 265 s); danach lädt das Modell in etwa 3 bis 4 s.
+Die Engine richtest du einmalig im Projektordner ein: Python-Umgebung, ffmpeg, Treiber für NPU und Grafik, optional das Zugriffstoken für die Sprechertrennung und der Modell-Download. Das sind Eingaben in der Konsole und stehen deshalb im Entwicklerteil unter „Engine einrichten“. Weitere Whisper-Modelle lädst du danach in der App (Einstellungen, „Modell herunterladen“); der Reiter „Prüfung“ zeigt, was noch fehlt.
 
 Speicherbedarf, gemessen im Projektordner: virtuelle Umgebung 1,4 GB, Whisper fp16 1,6 GB, Whisper int8 0,8 GB, Compile-Cache 3,8 GB. Die Größe des Diarisierungsmodells wurde nicht gemessen. Dazu kommen Aufnahmen: Audio wird nie gelöscht.
-
-Schlägt der Whisper-Download fehl, endet `setup` mit Fehler. Fehlt nur das Diarisierungsmodell, gibt `setup` eine Meldung aus und endet ohne Fehler.
 
 ### App installieren
 
 Den Installer `Meetscribe_0.1.0_x64-setup.exe` ausführen. Er enthält nur die Oberfläche. Wie du ihn aus dem Quellcode baust, steht unter „Für Fortgeschrittene“; er liegt danach in `gui\src-tauri\target\release\bundle\nsis\`.
 
-Die App findet die Engine über ihre Einstellungen (Reiter „Einstellungen“, Abschnitt „Engine“). Mit der Installation oben steht `meetscribe` im PATH, und die App findet es von selbst (genaue Reihenfolge unter „Engine finden“). Findet sie die Engine nicht, trägst du dort den Pfad zu `meetscribe.exe` oder den Projektordner ein. Der Reiter „Prüfung“ zeigt, welche Engine läuft und was noch fehlt.
+Die App findet die Engine über ihre Einstellungen (Reiter „Einstellungen“, Abschnitt „Engine“). Mit der Engine-Installation steht `meetscribe` im PATH, und die App findet es von selbst (genaue Reihenfolge unter „Engine finden“). Findet sie die Engine nicht, trägst du dort den Pfad zu `meetscribe.exe` oder den Projektordner ein. Der Reiter „Prüfung“ zeigt, welche Engine läuft und was noch fehlt.
 
 Deinstallieren: Der Deinstallationsdialog hat das Feld „Anwendungsdaten löschen“. Ohne Haken, und immer bei der stillen Deinstallation (`/S`), bleiben `HKCU\Software\meetscribe\Meetscribe` (der Installationspfad), `%APPDATA%\de.meetscribe.gui` (Einstellungen, `pending.json`, `engine.log`) und `%LOCALAPPDATA%\de.meetscribe.gui` (WebView2-Daten) zurück; so steht es in der Vorlage des Tauri-Installers (`installer.nsi`, tauri-bundler 2.10.4), eine stille Deinstallation hat genau diese Reste hinterlassen. Wer alles entfernen will, setzt den Haken oder löscht diese Einträge von Hand. Daten, Modelle und Protokolle der Engine liegen woanders und bleiben immer.
 
@@ -110,7 +83,7 @@ Grenzen: Stirbt die App selbst (Absturz, Task-Manager), merkt die Engine das sof
 
 ## Einstellungen
 
-Der Reiter „Einstellungen“ hat drei Abschnitte. Die Auswahlfelder, das Mikrofon und „Sprecher trennen“ werden sofort gespeichert („Gespeichert.“); die Engine-Felder mit „Speichern“.
+Der Reiter „Einstellungen“ hat vier Abschnitte; der vierte, „Mit Claude verbinden“, ist unter „MCP-Schnittstelle“ beschrieben. Die Auswahlfelder, das Mikrofon und „Sprecher trennen“ werden sofort gespeichert („Gespeichert.“); die Engine-Felder mit „Speichern“.
 
 ### Spracherkennung: Backend, Hardware, Modell
 
@@ -122,7 +95,7 @@ Es gibt drei Auswahlfelder. Der Standard ist überall „Automatisch“, die Wah
 
 Eine Zeile darunter nennt, was damit läuft, etwa „Läuft auf NPU · large-v3-turbo · OpenVINO.“
 
-`auto` nimmt die erste passende Hardware in der Reihenfolge NPU, GPU, iGPU, CPU, für die das Modell installiert ist (fehlt es auf einer, steht eine Warnung). Fällt die Transkription mitten im Lauf aus, geht es in derselben Reihenfolge weiter. Ein Rückfall zeigt sich während des Laufs in der Warnliste und in der Zeile „Läuft auf“, das Ergebnis („Verarbeitet mit: ...“) nennt, was wirklich lief. Bei fertigen Besprechungen steht in `meetings`, im Protokoll und in der Spalte `backend`, welches Backend lief. Besprechungen aus der Zeit davor haben dort `NULL`; ihr `device` `GPU` meint die iGPU.
+`auto` nimmt die erste passende Hardware in der Reihenfolge NPU, GPU, iGPU, CPU, für die das Modell installiert ist (fehlt es auf einer, steht eine Warnung). Fällt die Transkription mitten im Lauf aus, geht es in derselben Reihenfolge weiter. Ein Rückfall zeigt sich während des Laufs in der Warnliste und in der Zeile „Läuft auf“, das Ergebnis („Verarbeitet mit: ...“) nennt, was wirklich lief. Bei fertigen Besprechungen steht in der Besprechungsliste, im Protokoll und im Archiv (Spalte `backend`), welches Backend lief. Besprechungen aus der Zeit davor haben dort `NULL`; ihr `device` `GPU` meint die iGPU.
 
 Varianten je Hardware: NPU fp16, iGPU und CPU int8 (fp16 ist dort auch möglich), faster-whisper int8 auf der CPU und float16 auf CUDA. Das Standardmodell bleibt large-v3-turbo.
 
@@ -130,24 +103,24 @@ Bei der Hardware ist `igpu` die integrierte Grafik und `gpu` eine dedizierte Kar
 
 #### Ausgegraute Auswahl
 
-Nicht vorhandene Hardware und unmögliche Kombinationen sind ausgegraut und mit „nicht vorhanden“ oder „nicht möglich“ beschriftet. Der Grund steht im Tooltip und in der Zeile darunter. Was sich nicht kombinieren lässt, wird so schon vor der Aufnahme sichtbar (auf der Kommandozeile abgelehnt, auf Deutsch):
+Nicht vorhandene Hardware und unmögliche Kombinationen sind ausgegraut und mit „nicht vorhanden“ oder „nicht möglich“ beschriftet. Der Grund steht im Tooltip und in der Zeile darunter. Was sich nicht kombinieren lässt, wird so schon vor der Aufnahme sichtbar (abgelehnt, mit deutschem Grund):
 
 | Kombination | Ergebnis |
 |---|---|
-| int8 auf der NPU (`--model large-v3-turbo:int8 --device npu`) | abgelehnt: ZE_RESULT_ERROR_DEVICE_LOST gemessen |
+| int8 auf der NPU (Modell large-v3-turbo, Variante int8, Hardware NPU) | abgelehnt: ZE_RESULT_ERROR_DEVICE_LOST gemessen |
 | faster-whisper auf NPU oder iGPU | abgelehnt: läuft nur auf CPU und NVIDIA-CUDA |
 | faster-whisper auf GPU ohne NVIDIA-Karte | abgelehnt: „Keine NVIDIA-Karte (CUDA) gefunden.“ |
-| Backend nicht installiert | abgelehnt mit dem Befehl `uv sync --extra faster-whisper` |
+| Backend nicht installiert | abgelehnt, mit dem Hinweis, es nachzuinstallieren (siehe „Engine einrichten“) |
 | OpenVINO auf `gpu` ohne dedizierte Intel-Karte | läuft auf der iGPU, mit Hinweis |
 | anderes Modell als large-v3-turbo und small auf der NPU | erlaubt, aber „auf dieser Hardware ungeprüft“ (nicht gemessen; schlägt das Laden fehl, greift der Rückfall) |
 
-`--device gpu` meinte bisher die integrierte Grafik. Gibt es keine dedizierte Karte, läuft es weiter auf der iGPU und gibt eine Hinweiszeile aus; gespeicherte Einstellungen der Oberfläche und `MEETSCRIBE_DEVICE=gpu` bleiben so gültig. Künftig `igpu` angeben.
+Eine gespeicherte Wahl „GPU“ meinte bisher die integrierte Grafik. Gibt es keine dedizierte Karte, läuft es weiter auf der iGPU und die App weist darauf hin; gespeicherte Einstellungen bleiben so gültig. Künftig „iGPU“ wählen.
 
 Gemessen auf der NPU (OpenVINO fp16): large-v3-turbo und small kompilieren und laufen. tiny, base, medium und large-v3 wurden nicht geladen und sind deshalb nur als ungeprüft markiert; ein gemessener Fehlschlag wird im Katalog mit `"npu": "fail"` eingetragen und dann abgelehnt. Modelle werden nur aus lokalen Ordnern geladen (`models\`); Netzzugriff hat weiterhin nur `setup`.
 
 #### Modell herunterladen
 
-Ein nicht installiertes Modell steht in der Liste mit „nicht installiert“ und seiner Größe. Wählst du es, zeigt die App einen Hinweis („Das Modell ... ist noch nicht installiert. Download: ...“) und den Knopf „Herunterladen“ mit Fortschrittsbalken („... von etwa ...“), Fehleranzeige („Download fehlgeschlagen“) und „Einzelheiten“. Bei Erfolg steht dort „Fertig, das Modell ist installiert.“ Der Download läuft über `meetscribe setup --model ... --events`. Download und Aufnahme oder Verarbeitung schließen sich gegenseitig aus: während des einen startet das andere nicht und die App nennt den Grund.
+Ein nicht installiertes Modell steht in der Liste mit „nicht installiert“ und seiner Größe. Wählst du es, zeigt die App einen Hinweis („Das Modell ... ist noch nicht installiert. Download: ...“) und den Knopf „Herunterladen“ mit Fortschrittsbalken („... von etwa ...“), Fehleranzeige („Download fehlgeschlagen“) und „Einzelheiten“. Bei Erfolg steht dort „Fertig, das Modell ist installiert.“ Der Download läuft in einem Kindprozess der Engine (das ist die einzige Stelle, an der die App das Netz nutzt). Download und Aufnahme oder Verarbeitung schließen sich gegenseitig aus: während des einen startet das andere nicht und die App nennt den Grund.
 
 ### Aufnahme: Mikrofon und Sprechertrennung
 
@@ -170,13 +143,13 @@ Die App sucht die Engine in dieser Reihenfolge:
 4. neben der Anwendung,
 5. zuletzt `uv run --project <Projektordner> meetscribe`.
 
-Auf einem anderen Rechner zuerst die Engine wie unter „Installation“ einrichten und danach in den Einstellungen den Pfad zu `meetscribe.exe` oder den Projektordner eintragen. Daten, Modelle und Protokolle verwaltet die Engine wie beschrieben (`MEETSCRIBE_DATA`, `MEETSCRIBE_MODELS`, `MEETSCRIBE_REPORTS`). Läufe über die App starten die Engine direkt aus der App, nicht über Ray.
+Auf einem anderen Rechner zuerst die Engine wie unter „Engine einrichten“ im Entwicklerteil einrichten und danach in den Einstellungen den Pfad zu `meetscribe.exe` oder den Projektordner eintragen. Daten, Modelle und Protokolle verwaltet die Engine wie beschrieben (`MEETSCRIBE_DATA`, `MEETSCRIBE_MODELS`, `MEETSCRIBE_REPORTS`). Läufe über die App starten die Engine direkt aus der App, nicht über Ray.
 
 Die App legt ihre eigenen Dateien in `%APPDATA%\de.meetscribe.gui` ab (oder in dem Ordner aus `MEETSCRIBE_GUI_CONFIG`): `settings.json`, `pending.json` (eine noch nicht fertig verarbeitete Aufnahme) und `engine.log` (stderr der laufenden Engine, ungekürzt; die Datei wird bei jedem Start der Engine neu angelegt).
 
 ### Gemessen
 
-Dieselbe Datei (80,3 s synthetisches Deutsch, 167 Referenzwörter), Sprechertrennung aus, `--no-fallback`, als Ray-Job mit 4 CPUs und 4 GB angefordert, Core Ultra 7 258V. „Gerät“, „Modell“ und „Backend“ sind die gespeicherten Werte der Zeilen. Zeit = gesamte Jobdauer (Python-Start, Modell laden, Erkennen) in Sekunden, auf 2 s genau; erster und zweiter Lauf, der erste enthält Compile und Kernel-Aufbau, wo noch kein Cache da war. WER nach Kleinschreibung und ohne Satzzeichen; die Fehler sind Zahlenformate („120.000“ gegen „einhundertzwanzigtausend“, „14“ gegen „vierzehn“) und Satzzeichen.
+Dieselbe Datei (80,3 s synthetisches Deutsch, 167 Referenzwörter), Sprechertrennung aus, ohne Rückfall auf andere Hardware, als Ray-Job mit 4 CPUs und 4 GB angefordert, Core Ultra 7 258V. „Gerät“, „Modell“ und „Backend“ sind die gespeicherten Werte der Zeilen. Zeit = gesamte Jobdauer (Python-Start, Modell laden, Erkennen) in Sekunden, auf 2 s genau; erster und zweiter Lauf, der erste enthält Compile und Kernel-Aufbau, wo noch kein Cache da war. WER nach Kleinschreibung und ohne Satzzeichen; die Fehler sind Zahlenformate („120.000“ gegen „einhundertzwanzigtausend“, „14“ gegen „vierzehn“) und Satzzeichen.
 
 | Modell | Variante | Backend | Gerät | Zeit 1. Lauf | Zeit 2. Lauf | WER |
 |---|---|---|---|---|---|---|
@@ -213,15 +186,15 @@ NPU-Besonderheiten:
 
 ## Mikrofone
 
-Die Namen unten sind die der Kommandozeile (`--mic`); in der App entsprechen ihnen „DJI“, „Laptop“ und „Beide Mikrofone“ im Feld „Mikrofon“.
+In der App wählst du das Mikrofon im Feld „Mikrofon“: „Automatisch“, „DJI“, „Laptop“, „Beide Mikrofone“ oder einen erkannten Eingang mit seinem Namen.
 
-- DJI Mic Mini 2: der Empfänger wird per USB-C angeschlossen und erscheint als Audioeingang. `--mic dji` und die automatische Wahl suchen im Gerätenamen nach `dji`, `mic mini`, `mic 2` oder `wireless mic`. Heißt der Empfänger anders, mit `meetscribe devices` den Namen nachsehen und `--mic <Namensteil>` verwenden; in der App wählst du den Eingang mit seinem Namen im Feld „Mikrofon“ (nach „Neu einlesen“).
-- Laptopmikrofon: gefunden über Namen wie `Intel Smart Sound`, `Mikrofonarray` oder `Microphone Array`; sonst über `--mic <Namensteil>` bzw. den Namen in der App.
+- DJI Mic Mini 2: der Empfänger wird per USB-C angeschlossen und erscheint als Audioeingang. „DJI“ und die automatische Wahl suchen im Gerätenamen nach `dji`, `mic mini`, `mic 2` oder `wireless mic`. Heißt der Empfänger anders, wählst du den Eingang mit seinem Namen im Feld „Mikrofon“ (nach „Neu einlesen“).
+- Laptopmikrofon: gefunden über Namen wie `Intel Smart Sound`, `Mikrofonarray` oder `Microphone Array`; sonst wählst du den Eingang mit seinem Namen in der App.
 - Gibt es mehrere Einträge für dasselbe Gerät, wird die API in der Reihenfolge WASAPI, DirectSound, MME, WDM-KS bevorzugt.
-- `--mic both` („Beide Mikrofone“) nimmt DJI und Laptop gleichzeitig in getrennte Dateien (`<Name>.dji.flac`, `<Name>.laptop.flac`) und erzeugt `<Name>.mix.flac`. Der Mix bildet je Datei den Kanalmittelwert und streckt beide Aufnahmen linear auf die Länge der längeren, um einen Taktunterschied der beiden Geräte auszugleichen; dann werden sie gemittelt. Das setzt voraus, dass beide gleichzeitig starten. Transkribiert wird der Mix. Fällt ein Eingang aus (Schreibfehler, Audio bleibt aus), gibt es keinen Mix; verwendet wird dann die Datei des gesunden Eingangs, sonst die längere. Die Aufnahme endet selbst erst, wenn kein Eingang mehr gesund ist; ein gesunder zweiter Eingang läuft weiter.
-- Handyaufnahme: Datei übertragen und in der App unter „Vorhandene Aufnahme statt Mikrofon (optional)“ wählen (Kommandozeile: `meetscribe start datei.m4a`).
+- „Beide Mikrofone“ nimmt DJI und Laptop gleichzeitig in getrennte Dateien (`<Name>.dji.flac`, `<Name>.laptop.flac`) und erzeugt `<Name>.mix.flac`. Der Mix bildet je Datei den Kanalmittelwert und streckt beide Aufnahmen linear auf die Länge der längeren, um einen Taktunterschied der beiden Geräte auszugleichen; dann werden sie gemittelt. Das setzt voraus, dass beide gleichzeitig starten. Transkribiert wird der Mix. Fällt ein Eingang aus (Schreibfehler, Audio bleibt aus), gibt es keinen Mix; verwendet wird dann die Datei des gesunden Eingangs, sonst die längere. Die Aufnahme endet selbst erst, wenn kein Eingang mehr gesund ist; ein gesunder zweiter Eingang läuft weiter.
+- Handyaufnahme: Datei übertragen und in der App unter „Vorhandene Aufnahme statt Mikrofon (optional)“ wählen.
 - Die Aufnahme behält alle Kanäle des Eingangs; die Transkription arbeitet auf einem Mono-Mix (ffmpeg, 16 kHz). Sender TX1 und TX2 des DJI-Systems kommen möglicherweise als linker und rechter Kanal an; das ist nicht geprüft. Die Kanäle sind in der FLAC-Datei erhalten, werden aber nicht getrennt ausgewertet.
-- Deckel offen lassen. Während Aufnahme, Transkription und Setup-Warmup hält meetscribe den Rechner per `SetThreadExecutionState` wach. Das verhindert nur den Ruhezustand durch Inaktivität, nicht das Zuklappen des Deckels, den Netzschalter oder einen kritischen Akkustand. `record` und `start` weisen darauf hin.
+- Deckel offen lassen. Während Aufnahme, Transkription und Setup-Warmup hält meetscribe den Rechner per `SetThreadExecutionState` wach. Das verhindert nur den Ruhezustand durch Inaktivität, nicht das Zuklappen des Deckels, den Netzschalter oder einen kritischen Akkustand.
 - Lässt sich der Eingang nicht öffnen (Mikrofonzugriff in den Windows-Datenschutzeinstellungen gesperrt, Gerät von einem anderen Programm belegt), bricht der Start mit einer deutschen Meldung ab und hinterlässt keine Datei; ein neuer Versuch funktioniert danach normal. „Aufnahme läuft“ erscheint erst, wenn der Eingang wirklich geöffnet ist.
 
 ## Datenhaltung
@@ -234,22 +207,23 @@ Standardmäßig unter dem Projektordner; `MEETSCRIBE_DATA`, `MEETSCRIBE_MODELS` 
 | `data\cold\year=JJJJ\month=MM\<id>.parquet` | archivierte Besprechungen, Parquet |
 | `data\archive\<id>.arrow` | Original der heißen Datei nach dem Archivieren (nicht gelöscht) |
 | `data\speakers.parquet` | Sprecherzuordnung |
-| `data\start.lock` | Sperrdatei, die einen zweiten gleichzeitigen `start` verhindert |
-| `data\aufnahmen\` | Aufnahmen von `start` |
+| `data\start.lock` | Sperrdatei, die eine zweite gleichzeitige Aufnahme oder Verarbeitung verhindert, auch zwischen App und MCP-Schnittstelle |
+| `data\speakers.lock`, `data\rotate.lock` | Sperrdateien für das Schreiben der Sprecherzuordnung und das Archivieren; sie machen beides zwischen mehreren Prozessen sicher |
+| `data\aufnahmen\` | Aufnahmen der App |
 | `protokolle\` | Markdown-Protokolle |
 | `models\` | Whisper-Modelle, Diarisierungsmodell, `ov_cache\` |
 
-DuckDB liest heiße und kalte Dateien als eine Sicht (`segments`) und verbindet die Sprecherzuordnung (`segments_named`). Namen ändern nur `speakers.parquet`, nie die Rohdaten. Eine unvollständige heiße Datei (nur noch bei hartem Prozessabbruch, etwa Absturz, Stromausfall oder beendetem Prozess; bei Fehlern und Strg+C wird sie entfernt) wird bei `rotate` ohne `--force` übersprungen, erscheint in `meetings` mit `complete = false` (Tabelle: `NEIN`), bekommt im Protokoll die Zeile `Status: unvollständig` und lässt sich mit `meetscribe discard <ID>` entfernen. `start` rotiert zuletzt automatisch alles, was vollständig und älter als 30 Tage ist (Alter nach Änderungsdatum der Datei).
+DuckDB liest heiße und kalte Dateien als eine Sicht (`segments`) und verbindet die Sprecherzuordnung (`segments_named`). Namen ändern nur `speakers.parquet`, nie die Rohdaten. Eine unvollständige heiße Datei (nur noch bei hartem Prozessabbruch, etwa Absturz, Stromausfall oder beendetem Prozess; bei Fehlern und Abbruch wird sie entfernt) wird beim Archivieren ohne Zwang übersprungen, erscheint in der Besprechungsliste als „unvollständig“, bekommt im Protokoll die Zeile `Status: unvollständig` und lässt sich in der App über „Erneut versuchen“ oder „Vergessen“ aufräumen. Die App archiviert zuletzt automatisch alles, was vollständig und älter als 30 Tage ist (Alter nach Änderungsdatum der Datei).
 
 Audio wird nicht automatisch gelöscht, auch nicht nach der Archivierung. `data\`, `models\`, `protokolle\` und gängige Audioendungen stehen in `.gitignore`.
 
 ## Hinweise
 
-- Offline: Nur `setup` (und der Modell-Download in der App, der `setup` aufruft) greift auf das Netz zu. Alle anderen Befehle setzen die Hugging-Face-Offline-Variablen und senden nichts; `sql` startet keine Erweiterungsinstallation und lädt keine Erweiterung (siehe `sql`). Es gibt keine Cloud-Dienste. OpenVINO sendet beim bloßen Import von sich aus Nutzungsdaten an Google Analytics; meetscribe importiert es deshalb mit `CI=true` in der Umgebung (nur für die Dauer des Imports, danach wird der alte Wert wiederhergestellt), womit diese Telemetrie aus bleibt. Mit einer Sperre auf Socket-Ebene ergaben `models`, `devices`, `check`, `meetings` und Transkriptionsläufe mit OpenVINO und faster-whisper keinen einzigen Verbindungsversuch.
+- Offline: Nur der Modell-Download (in der App „Herunterladen“) greift auf das Netz zu. Alles andere setzt die Hugging-Face-Offline-Variablen und sendet nichts; die SQL-Abfragen der MCP-Schnittstelle können weder Dateien lesen noch Erweiterungen laden. Es gibt keine Cloud-Dienste. OpenVINO sendet beim bloßen Import von sich aus Nutzungsdaten an Google Analytics; meetscribe importiert es deshalb mit `CI=true` in der Umgebung (nur für die Dauer des Imports, danach wird der alte Wert wiederhergestellt), womit diese Telemetrie aus bleibt. Mit einer Sperre auf Socket-Ebene ergaben Abfragen der Engine und Transkriptionsläufe mit OpenVINO und faster-whisper keinen einzigen Verbindungsversuch; dasselbe gilt für eine echte Sitzung der MCP-Schnittstelle mit Transkription (siehe „MCP-Schnittstelle“).
 - Aufnahme und Einwilligung: In Deutschland ist das heimliche Aufnehmen des nichtöffentlich gesprochenen Wortes strafbar (§ 201 StGB). Vor der Aufnahme sollten alle Beteiligten zustimmen. Das ist keine Rechtsberatung.
 - Personenbezogene Daten liegen unverschlüsselt auf der Platte: Aufnahmen, Transkripte, Protokolle, Sprecherzuordnung. Wer das braucht, muss das Laufwerk verschlüsseln.
 - Kein Sprachmodell im Einsatz: Das Protokoll enthält Transkript und Redezeiten, aber keine Zusammenfassung, keine Beschlüsse und keine Aufgaben.
-- Sprechertrennung: Die Label (`SPEAKER_00`, ...) gelten nur innerhalb einer Besprechung; es gibt keine Wiedererkennung über Besprechungen hinweg. Bei ähnlichen Stimmen oder wechselnder Entfernung zum Mikrofon werden Sprecher verwechselt oder aufgespalten; `--speakers N` hilft, wenn die Zahl bekannt ist (nur Kommandozeile). Die Trennung läuft auf der CPU; ihre Dauer wurde nicht gemessen.
+- Sprechertrennung: Die Label (`SPEAKER_00`, ...) gelten nur innerhalb einer Besprechung; es gibt keine Wiedererkennung über Besprechungen hinweg. Bei ähnlichen Stimmen oder wechselnder Entfernung zum Mikrofon werden Sprecher verwechselt oder aufgespalten; Die Trennung läuft auf der CPU; ihre Dauer wurde nicht gemessen.
 - Überlappende Rede: Ein Wort wird genau einem Sprecher zugeordnet, und Whisper erkennt einen einzigen Sprachstrom. Wo mehrere gleichzeitig sprechen, geht Text verloren oder landet beim falschen Sprecher.
 - Die Transkription ist nicht fehlerfrei; Eigennamen, Fachbegriffe und Zahlen vor Verwendung prüfen.
 
@@ -258,18 +232,18 @@ Audio wird nicht automatisch gelöscht, auch nicht nach der Archivierung. `data\
 Nicht an echter Hardware oder echten Eingaben geprüft:
 
 - Die Vollständigkeitsprüfung des Diarisierungs-Snapshots ist nur mit handgeschriebenem YAML getestet; das echte Layout von `pyannote/speaker-diarization-community-1` wurde nicht bestätigt. Geprüft werden die `$model/`-Verweise in `config.yaml` (Kommentare werden ignoriert): Ein Verweis auf eine Datei muss existieren, ein Verweis auf einen Ordner muss `pytorch_model.bin` enthalten, `plda` zusätzlich `plda.npz` und `xvec_transform.npz` (so lädt pyannote 4.0.7 diese Ordner). Weitere Ordnernamen werden wie Modellordner (`pytorch_model.bin`) behandelt.
-- Sprechertrennung mit dem echten pyannote-Modell, auch ohne Token oder lokalen Snapshot: Alle echten Läufe liefen mit `--no-diarize`. Die Diarisierung ist nur in Tests (ohne echtes Modell) abgedeckt.
+- Sprechertrennung mit dem echten pyannote-Modell, auch ohne Token oder lokalen Snapshot: Alle echten Läufe liefen ohne Sprechertrennung. Die Diarisierung ist nur in Tests (ohne echtes Modell) abgedeckt.
 - Der echte DJI-Empfänger: Die Namensmuster für den USB-Eingang (`dji`, `mic mini`, `mic 2`, `wireless mic`) sind Annahmen. Ebenso unbekannt: ob TX1 und TX2 als linker und rechter Kanal ankommen.
-- `--mic both` auf echter Hardware, einschließlich des streckenden Mixes.
+- „Beide Mikrofone“ auf echter Hardware, einschließlich des streckenden Mixes.
 - Aufnahme mit dem echten Laptopmikrofon und die Namensmuster dafür. Ebenso die Fehlererkennung (Schreibfehler, ausbleibende Audiodaten, nicht öffenbarer Eingang): geprüft nur mit Ersatzobjekten für `sounddevice`; ob die Meldungen und der Schwellwert von 5 s bei echten Geräten passen, ist offen.
 - Die interaktive Sprecherabfrage in einer echten Konsole (nur mit simuliertem Terminal getestet) und das Öffnen des Protokolls mit `os.startfile` (nur über einen Ersatz aufgerufen).
-- `setup` gegen das Netz.
+- Der Modell-Download gegen das Netz.
 - Keep-awake: Aufruf und Freigabe sind getestet, dass es Modern Standby tatsächlich verhindert, wurde nicht beobachtet.
 - Der NPU-Compile-Cache: Der erste NPU-Lauf brauchte 265 s, obwohl `models\ov_cache` schon existierte. Wie oft der Cache nach `setup` trifft, ist unklar. Er ist inzwischen 3,8 GB groß. Ob ein Treiberwechsel ihn ungültig macht, wurde nicht geprüft.
 - Die WER stammt aus synthetischem Testaudio (siehe „Gemessen“); echte Besprechungen sind nicht vermessen.
 - Messungen nur auf einem Gerät (Core Ultra 7 258V). Andere Core-Ultra-Generationen sind nicht geprüft.
 - Strg+C während der Aufnahme wurde mit einem simulierten Rekorder und einem echten Konsolen-Ereignis geprüft, nicht mit echter Aufnahme.
-- `--events` und `--stdin-stop`: mit simuliertem Rekorder und echten Pipes getestet, nicht mit echter Aufnahme. Die App wurde mit der Ersatz-Engine und mit echten Läufen aus Dateien bedient, eine Aufnahme mit dem echten Mikrofon über die App nicht. Ausgaben nativer Bibliotheken direkt auf den Dateideskriptor 1 werden nicht nach stderr umgeleitet.
+- Die Ereignisleitung der Engine (Ereignisse, Beenden der Aufnahme über die Leitung): mit simuliertem Rekorder und echten Pipes getestet, nicht mit echter Aufnahme. Die App wurde mit der Ersatz-Engine und mit echten Läufen aus Dateien bedient, eine Aufnahme mit dem echten Mikrofon über die App nicht. Ausgaben nativer Bibliotheken direkt auf den Dateideskriptor 1 werden nicht nach stderr umgeleitet.
 - Die langlebige Engine: Aufnahme vom echten Mikrofon, Sprechertrennung mit echtem Modell und ein Wechsel des Mikrofons im laufenden Betrieb (Neueinlesen der Eingänge) sind nicht geprüft. Der Abbruch einer Verarbeitung durch Schließen der Leitung wurde nur mit Ersatz-Engine gesehen; im echten Lauf gilt die Grenze von bis zu 30 s bei langen nativen Aufrufen. Eine Abfrage mitten im Modellladen kann einige Sekunden warten (2,5 s gemessen). Die Hardware-Abfrage während der App-Läufe lieferte nur eine Probe (25 % CPU, 6,1 GB frei).
 - Android: kein APK gebaut, nichts auf einem Gerät oder Emulator gesehen (siehe „Android“).
 
@@ -277,104 +251,48 @@ Nicht an echter Hardware oder echten Eingaben geprüft:
 
 Alles Folgende ist für Entwickler und für die Arbeit in der Konsole. Die App braucht es nicht.
 
-### Kommandozeile: start
+### Kommandozeile
+
+Die Kommandozeile `meetscribe` ist die interne und die Testschnittstelle der Engine, nicht für den Alltag gedacht und hier nicht dokumentiert (`meetscribe --help` listet die Befehle). App und MCP-Server sprechen dieselbe Dienstschicht an (`src\meetscribe\service.py`) und starten keine Befehle; die Tests rufen die Befehle auf.
+
+### Engine einrichten
+
+Einmalig, in einer Konsole. Die App und die MCP-Schnittstelle brauchen die Engine in diesem Zustand.
+
+1. [uv](https://docs.astral.sh/uv/) installieren. Es holt Python 3.12 selbst.
+2. ffmpeg installieren, z. B. mit `winget install Gyan.FFmpeg`. Danach muss `ffmpeg -version` in einem neuen Terminal funktionieren (ffmpeg muss im PATH liegen). Es wird zum Dekodieren jeder Audiodatei gebraucht.
+3. Intel-NPU-Treiber und Intel-Arc-Grafiktreiber installieren. Beides wird nicht automatisch installiert.
+   - NPU-Treiber: https://www.intel.com/content/www/us/en/download/794734/intel-npu-driver-windows.html (aktuell 32.0.100.5540; gemessen wurde mit 32.0.100.4240).
+   - Arc-Grafiktreiber: https://www.intel.com/content/www/us/en/download/785597/intel-arc-iris-xe-graphics-windows.html (gemessen mit 32.0.101.8132). Der generische Intel-Treiber überschreibt den Treiber des Geräteherstellers; im Zweifel dessen Seite prüfen.
+4. Für die Sprechertrennung (nur einmalig bei `setup`): ein Hugging-Face-Konto anlegen, auf https://huggingface.co/pyannote/speaker-diarization-community-1 die Nutzungsbedingungen akzeptieren und ein Zugriffstoken (Lesezugriff) erzeugen. Das Token kommt in die Umgebungsvariable `HF_TOKEN`. Ohne das geht die App nur mit ausgeschaltetem „Sprecher trennen“.
+5. PowerShell im Projektordner öffnen (dem Ordner mit `pyproject.toml`) und die Engine installieren:
 
 ```
-meetscribe start
+uv tool install --editable .
 ```
 
-Das prüft zuerst alles Nötige, nimmt auf (Ende mit Strg+C), transkribiert, fragt nach Sprechernamen, schreibt das Protokoll nach `protokolle\` und öffnet es. Mit vorhandener Datei, etwa einer Handyaufnahme:
+6. Token setzen und die Modelle laden, z. B. in PowerShell:
 
 ```
-meetscribe start besprechung.m4a --title "Projektrunde"
+$env:HF_TOKEN = "hf_..."
+meetscribe setup
 ```
 
-`meetscribe start [AUDIO]` ist der normale Weg in der Konsole.
+Die Installation muss editierbar sein (`--editable`): Modelle (`models\`), Daten (`data\`) und Protokolle (`protokolle\`) liegen relativ zum Projektordner, nicht relativ zum Aufrufort. Ist `meetscribe` danach nicht im PATH, hilft `uv tool update-shell` und ein neues Terminal.
 
-Ablauf:
+`setup` ist der einzige Befehl, der selbst das Netz nutzt. Er lädt:
 
-1. Vorprüfung vor jeder Aufnahme: ffmpeg, Whisper-Modell, Diarisierungsmodell (außer mit `--no-diarize`; geprüft wird `config.yaml` und jede darin mit `$model/` referenzierte lokale Datei, ein abgebrochener `setup` fällt also hier auf, mit dem Hinweis `setup` erneut auszuführen oder `--no-diarize` zu nutzen) und, wenn aufgenommen wird, der Audioeingang. Schlägt etwas fehl, bricht `start` mit einer deutschen Meldung ab und nichts wird aufgenommen.
-2. Aufnahme bis Strg+C. Der Eingang wird automatisch gewählt (DJI, sonst Laptopmikrofon) und als `Eingang: <Name> [API]` ausgegeben. Strg+C beendet nur die Aufnahme; die Verarbeitung läuft danach normal weiter. `Aufnahme laeuft` erscheint erst, wenn der Eingang wirklich geöffnet ist. Lässt er sich nicht öffnen (Mikrofonzugriff in den Windows-Datenschutzeinstellungen gesperrt, Gerät von einem anderen Programm belegt), bricht `start` mit einer deutschen Meldung ab und hinterlässt keine Datei; ein neuer Aufruf funktioniert danach normal. Während der Aufnahme wird jeder Eingang überwacht: ein Schreibfehler oder mehr als 5 s ohne Audiodaten (Einstellung `stall_s` in `RECORDING`) ergibt sofort eine Warnzeile. Die Aufnahme endet selbst erst, wenn kein Eingang mehr gesund ist; bei `--mic both` läuft ein gesunder zweiter Eingang weiter und seine Datei wird statt des Mix verwendet. Bei Überläufen (Audio-Aussetzer) gibt `start` wie `record` die Anzahl aus.
-3. Transkription und Sprechertrennung. Blieb von der Aufnahme nur ein gestörter Teil (siehe oben), wird dieser mit einer Warnung transkribiert; gibt es nichts Brauchbares, endet `start` mit `Keine brauchbare Aufnahme gespeichert ...` und Exit-Code 1, vorhandene Dateien bleiben erhalten. Wird keine Sprache erkannt (stummes Mikrofon, leere Datei), gibt es kein Protokoll und keine Besprechung im Archiv; `start` meldet das, nennt das erhaltene Audio und endet mit Exit-Code 1.
-4. Benennung der Sprecher, nur wenn die Eingabe ein Terminal ist: je Sprecherlabel wird der längste Satz gezeigt, Enter überspringt. Ohne Terminal entfällt das still. `UNKNOWN` wird nicht abgefragt.
-5. Protokoll nach `protokolle\<Datum>_<Titel>.md` (bei gleichem Namen `-2`, `-3`, ...; UTF-8). Es wird mit dem Standardprogramm geöffnet, wenn die Eingabe ein Terminal ist und `--no-open` fehlt. Schlägt das Öffnen fehl, gibt es eine Warnzeile mit dem Pfad des Protokolls; der Lauf geht weiter und endet mit Exit-Code 0.
-6. Zuletzt wird archiviert: Besprechungen, die älter als 30 Tage sind, wandern ins Parquet-Archiv. Schlägt das fehl, gibt es eine Warnzeile, der Lauf gilt trotzdem als erfolgreich; scheitert die Rotation einzelner Besprechungen, gibt es je Besprechung eine Warnzeile mit der ID und dem Grund. Unvollständige und leere Dateien werden dabei still übersprungen.
+- `OpenVINO/whisper-large-v3-turbo-fp16-ov` (NPU) und `OpenVINO/whisper-large-v3-turbo-int8-ov` (iGPU/CPU) nach `models\`,
+- bei gesetztem `HF_TOKEN` das Diarisierungsmodell `pyannote/speaker-diarization-community-1`,
+- und wärmt danach den NPU-Compile-Cache (`models\ov_cache`) auf. Das dauert einmalig mehrere Minuten (beim ersten Lauf ohne Cache gemessen: 265 s); danach lädt das Modell in etwa 3 bis 4 s.
 
-Die Aufnahme liegt unter `data\aufnahmen\<JJJJ-MM-TT_HHMMSS>.flac` (bei Kollision `-2`) und wird nie gelöscht. Schlägt die Verarbeitung fehl oder wird sie mit Strg+C abgebrochen, gibt `start` `Audio erhalten: <Pfad>` und eine fertige Zeile `Erneut versuchen: meetscribe start <Pfad> ...` aus und endet mit Exit-Code 1 (bei Strg+C 130). Eine dabei halb geschriebene Besprechung wird wieder entfernt (auch bei `transcribe`), der erneute Versuch bekommt dieselbe ID. Scheitert erst die Nachbearbeitung (Sprechernamen speichern, Protokoll schreiben, etwa weil `MEETSCRIBE_REPORTS` auf eine Datei zeigt oder `speakers.parquet` gesperrt ist) oder wird dabei Strg+C gedrückt, ist die Besprechung schon vollständig gespeichert: `start` gibt dann `Audio erhalten`, `Besprechung gespeichert: <ID>` und `Protokoll erneut erzeugen: meetscribe report <ID>` aus (Exit-Code 1, bei Strg+C 130), ohne Traceback. Dann nicht erneut `start` aufrufen, das legt eine zweite Besprechung mit `-2` an.
+Schlägt der Whisper-Download fehl, endet `setup` mit Fehler. Fehlt nur das Diarisierungsmodell, gibt `setup` eine Meldung aus und endet ohne Fehler.
 
-`meetscribe start datei.m4a` überspringt Aufnahme und Eingangsprüfung. Alles, was ffmpeg lesen kann, funktioniert. Die Datei wird nicht verändert oder kopiert. Ist die Datei nicht vorhanden oder ein Ordner, meldet `start` das in der Vorprüfung auf Deutsch (`Audiodatei nicht gefunden: ...`), bevor etwas aufgenommen oder geladen wird. Ein Titel darf höchstens 80 Zeichen lang sein; längere werden in der Vorprüfung abgelehnt, weil aus ihm Besprechungs-ID und Protokolldateiname entstehen. Beginnt ein Dateiname mit `-`, vor ihn `--` setzen (`meetscribe start --no-open -- --datei.wav`); Programme, die Werte durchreichen, sollten das immer tun.
+Für die MCP-Schnittstelle legt die Installation ein zweites Programm neben `meetscribe` an (`meetscribe-mcp`, siehe „MCP-Schnittstelle“). Wurde die Engine vor dieser Version installiert, einmal neu installieren (`uv tool install --editable . --force` bzw. `uv sync`), damit es entsteht.
 
-Optionen: `--title`, `--mic dji|laptop|both|<Namensteil>`, `--backend auto|openvino|faster-whisper`, `--device auto|npu|gpu|igpu|cpu`, `--model NAME`, `--no-fallback`, `--speakers N` (Sprecherzahl vorgeben), `--no-diarize`, `--no-open`. Titel ohne Angabe: Dateiname der Aufnahme bzw. der Datei. Datum der Besprechung ist immer das heutige Datum. Die Sprache ist bei `start` fest Deutsch.
+### Ereignisse der Verarbeitung
 
-### Backend, Hardware und Modell wählen
-
-Täglich nichts: `meetscribe start` und der große Knopf der App wählen automatisch. Wer will, wählt mit `--backend`, `--device` und `--model` (bei `start` und `transcribe`; Umgebungsvariablen `MEETSCRIBE_BACKEND` und `MEETSCRIBE_DEVICE`). `meetscribe models` zeigt, was es gibt, und `meetscribe setup --model NAME` lädt ein Modell. Beispiele:
-
-```
-meetscribe models
-meetscribe setup --model small
-meetscribe start --device igpu --model small
-meetscribe setup --backend faster-whisper --model large-v3-turbo
-meetscribe start --backend faster-whisper --device cpu
-```
-
-Ein Katalog im Code (`CATALOG` in `src\meetscribe\backends.py`) ist die einzige Quelle für Kommandozeile und App: Backends mit ihren Geräten, logische Modelle (tiny, base, small, medium, large-v3, large-v3-turbo), Varianten mit Hugging-Face-Repo und ungefährer Größe. Ein dritter Backend braucht eine Engine-Klasse mit `ready` und `transcribe` und einen Katalogeintrag. Bei der Hardware zeigt `meetscribe devices` alle Karten.
-
-Ein Ordner, den `--model` statt eines Katalognamens bekommt, wird wie die Variante behandelt, wenn sein Name dem eines Katalogeintrags entspricht (etwa `whisper-large-v3-turbo-int8-ov`: dann gilt auch hier, dass int8 auf der NPU abgelehnt wird); bei jedem anderen Ordner ist die Variante unbekannt und es gibt keine Prüfung. Gehört ein Ordner zu einem anderen Backend (etwa ein CTranslate2-Ordner bei OpenVINO), nennt der Hinweis das so.
-
-Bei `auto` fällt ein Lauf mitten in der Transkription in derselben Reihenfolge (NPU, GPU, iGPU, CPU) zurück (`fallback`-Ereignis und Warnzeile, je Segment steht das tatsächliche Gerät in der Spalte `device`); mit `--no-fallback` bricht der Lauf ab.
-
-faster-whisper ist ein optionales Extra (`uv sync --extra faster-whisper`, bei der Werkzeuginstallation `uv tool install --editable ".[faster-whisper]"`), die Grundinstallation wächst nicht. Es liefert dieselben Wörter mit Zeitstempeln und Segmenten über dieselbe Schnittstelle (`transcribe` gibt `words` und `chunks` zurück); Fenster, Zuordnung zu Sprechern, Speicherung und Protokoll sind unverändert. Auf Windows läuft es in derselben Umgebung wie PyTorch (CPU) und OpenVINO (Import beider und Lauf geprüft, siehe unten). Für CUDA braucht CTranslate2 die CUDA-12-Bibliotheken (cuBLAS, cuDNN 9) im Suchpfad; das wurde mangels NVIDIA-Karte nicht geprüft.
-
-### Nachschlagen
-
-```
-meetscribe meetings
-meetscribe search Budget
-meetscribe search Budget --speaker Anna --limit 50
-meetscribe report
-meetscribe report 20261105-projektrunde --out C:\temp\protokoll.md
-```
-
-`search` ist eine Teilstring-Suche ohne Beachtung der Groß-/Kleinschreibung (kein Index, keine Wortstämme) über alle Segmente; `--meeting` und `--speaker` (Label oder Name) schränken ein. `report` ohne ID nimmt die zuletzt erstellte Besprechung und schreibt auf die Konsole oder mit `--out` in eine Datei.
-
-### Weitere Befehle
-
-| Befehl | Zweck |
-|---|---|
-| `meetscribe devices [--json]` | Audioeingänge (Index, Name, API, Kanäle, Rate), erkannte Hardware mit Typ (integriert oder dediziert) und welches Backend sie bedient, und welche Backends installiert sind; prüft z. B. ob der DJI-Empfänger sichtbar ist. JSON: `inputs`, `inputs_error`, `openvino` (wie bisher) sowie `hardware` (`id`, `device`, `name`, `type`, `cuda`, `backends`, mehrere Karten je eine Zeile), `kinds` (je npu, gpu, igpu, cpu: `present`, `name`, `reason`) und `backends` (`installed`, `reason`) |
-| `meetscribe models [--json]` | Katalog: Modell, Backend, Variante, Größe, ob installiert, und je NPU, GPU, iGPU, CPU `ok`, `ungeprüft` oder `nein`. JSON: `models` (mit `hardware` je Eintrag samt Grund), `backends`, `hardware` und `choices`, eine Zeile je Kombination aus Backend, Hardware und Modell (auch `auto`) mit `ok`, `reason`, `resolved` (was wirklich laufen würde), `size_mb`, `installed`, `status` und `notices`; daraus füllt die App ihre Auswahlfelder |
-| `meetscribe setup --model NAME [--backend B] [--device D] [--events]` | nur dieses Modell laden (`NAME` optional mit `:Variante`, z. B. `small:int8`); ohne `--device` alle Varianten, die das Modell für das Backend braucht; eine Kombination, die nicht zusammenpasst (etwa `--backend faster-whisper --device npu` oder `small:int8 --device npu`), wird mit Grund abgelehnt (Exit-Code 1, mit `--events` ein `error`), statt still nichts zu laden; mit `--events` Fortschritt als `{"event": "download", "repo", "bytes", "total"}` (`total` ist die Katalogsgröße, ungefähr), am Ende `done` oder `error`. Ohne `--model` unverändert wie unter „Installation“ |
-| `meetscribe check` | ffmpeg, Whisper-Modelle, pyannote-Modell und `HF_TOKEN` prüfen, mit Lösung je fehlendem Punkt (Exit-Code 1, wenn etwas fehlt); mit `--json` eine Liste `{"id", "label", "ok", "fix", "scope"}` (Exit-Code 0); `scope` ist `diarize` bei den Zeilen, die nur mit Sprechertrennung nötig sind, sonst `null`. Ein Whisper-Modell gilt als vorhanden, wenn jede `.xml` nicht leer ist und eine nicht leere `.bin` daneben liegt |
-| `meetscribe serve` | langlebige Engine für die App und spätere Clients: JSON-RPC 2.0 über stdin/stdout (siehe „Engine-Protokoll“); nicht für den Handbetrieb |
-| `meetscribe discard ID` | unvollständige Besprechung (Rest eines harten Abbruchs) entfernen; vollständige lehnt der Befehl ab |
-| `meetscribe record --out datei.flac [--mic ...] [--seconds N]` | nur aufnehmen, Standard-Mikrofon `laptop`; eine vorhandene Zieldatei wird nicht überschrieben, der Befehl bricht ab; gestörte Eingänge werden wie bei `start` sofort gemeldet, danach endet der Befehl mit Exit-Code 1 |
-| `meetscribe transcribe datei [...]` | nur transkribieren und ablegen, ohne Protokoll und ohne Sprecherabfrage |
-| `meetscribe rotate [--older-than-days N] [--force]` | heiße Dateien ins Archiv verschieben (Standard 0 Tage: alle vollständigen) |
-| `meetscribe stats [--meeting ID]` | Redezeit, Anteil, Segmente und Wörter je Sprecher |
-| `meetscribe speakers show\|set\|unset` | Sprecherzuordnung ansehen und ändern |
-| `meetscribe sql "..."` | beliebige SQL-Abfrage |
-
-`transcribe` kennt zusätzlich `--language`, `--date`, `--meeting-id`, `--min-speakers` und `--max-speakers`, die `start` nicht kennt. `--backend`, `--device`, `--model` und `--no-fallback` kennen beide. `rotate` wird von `transcribe` nicht automatisch aufgerufen, nur von `start`.
-
-### Maschinenlesbare Ausgabe (für die App)
-
-Mit der globalen Option `--json` (vor dem Befehl: `meetscribe --json meetings`) geben `meetings`, `search`, `stats`, `speakers show`, `report`, `sql` und `devices` ein JSON-Dokument auf stdout aus. Ohne die Option bleibt die Ausgabe unverändert. Die Ausgabe ist reines ASCII (Umlaute als `\uXXXX`), Zahlen und Listen behalten ihren Typ, Daten und Zeiten sind ISO-Strings, NaN und Unendlich werden zu `null`. Fehler bleiben Text auf stderr mit Exit-Code 1.
-
-| Befehl | JSON |
-|---|---|
-| `meetings`, `search`, `stats`, `speakers show` | Liste von Objekten mit allen Spalten der Abfrage (`stats`: `share` als Bruchteil 0 bis 1, `labels` als Liste; `meetings`: `complete` ist `false` bei einer unvollständigen heißen Datei, neueste zuerst: nach Datum, am selben Tag nach Anlagezeit; `search`: `complete` je Treffer) |
-| `sql` | `{"columns": [...], "rows": [[...]]}` (Spaltennamen dürfen doppelt vorkommen) |
-| `report` | `{"meeting_id": ..., "path": <Zieldatei oder null>, "markdown": ...}` |
-| `devices` | `{"inputs": [{"index", "name", "api", "channels", "rate"}], "inputs_error": <Text oder null>, "openvino": [{"device", "name"}]}` |
-
-`meetscribe start --events` schreibt statt der Konsolenausgabe eine JSON-Zeile je Ereignis auf stdout (was Bibliotheken sonst auf stdout schreiben, geht nach stderr). Es gibt keine Sprecherabfrage und das Protokoll wird nicht geöffnet. `--stdin-stop` beendet die Aufnahme, sobald eine Zeile (mit Zeilenumbruch) auf stdin ankommt oder stdin geschlossen wird; die Aufnahme bleibt erhalten und die Verarbeitung läuft normal weiter. Das ersetzt Strg+C für Elternprozesse ohne Konsole. Beide Optionen sind unabhängig voneinander nutzbar.
-
-Mit `--events` endet die Verarbeitung, sobald niemand mehr die Ereignisse liest (stdout nicht mehr beschreibbar, etwa weil die App hart beendet wurde). Die Engine sendet dazu während der Verarbeitung alle 2 s `{"event": "alive"}`; schlägt ein Schreiben fehl, bricht sie wie bei Strg+C ab, entfernt die unfertige Besprechung und endet mit Exit-Code 130. Reagiert der Lauf nicht binnen 30 s (langer nativer Aufruf), beendet sich der Prozess hart; dann kann eine unvollständige Besprechung bleiben. War der Leser schon vor der Verarbeitung weg (etwa bei einem Abbruch während der Aufnahme), bleibt das Audio erhalten und wird nicht verarbeitet. `start` erlaubt nur einen Lauf zugleich: Eine Sperrdatei `data\start.lock` (das Betriebssystem gibt sie beim Prozessende frei) lässt einen zweiten Start mit „Es läuft bereits eine Aufnahme oder Verarbeitung“ scheitern.
-
-Auf Windows wertet `meetscribe` Argumente nicht selbst nach `~`, `%VAR%` und `*`/`?` aus; Titel, Sprechernamen, Suchbegriffe und Pfade kommen so an, wie sie übergeben wurden (eine Shell wie Git Bash kann weiterhin selbst auswerten).
-
-Ereignisse, ein Objekt je Zeile mit dem Schlüssel `event`:
+Die Verarbeitung meldet sich mit diesen Ereignissen (im Engine-Protokoll als `run.event`, ein Objekt mit dem Schlüssel `event`):
 
 ```
 {"event": "preflight"}
@@ -386,51 +304,13 @@ Ereignisse, ein Objekt je Zeile mit dem Schlüssel `event`:
 {"event": "error", "message": "Verarbeitung fehlgeschlagen: ...", "detail": "voller Fehlertext", "audio": "C:\\...\\2026-11-05_101500.flac", "meeting_id": null, "retry": "meetscribe start C:\\...flac --device npu --no-open --events", "exit_code": 1}
 ```
 
-`recording` entfällt bei vorhandener Datei. Bei `--mic both` nennt `input` beide Geräte mit ` + ` und `path` den Mix. `transcribing` nennt zusätzlich die geplante Wahl: `backend`, `device` (NPU, GPU, iGPU oder CPU), `model` und `variant`. `fallback` (`from`, `to`, `backend`) kommt bei jedem Rückfall, begleitet von einem `warning` mit dem Grund. `done` enthält `ran`: `backend`, `backends`, `devices` (was wirklich lief), `model`, `variant` (die Variante, die als erste wirklich lief, nach einem Rückfall also nicht die geplante) und `variants` (je Gerät in `devices` die Variante), `stored` (die gespeicherten Modellnamen), `requested`, `fallback` und `text` (etwa `iGPU · large-v3-turbo · OpenVINO`). `warning` steht für Eingangsprobleme, Überläufe, unvollständige Aufnahme, Geräte-Rückfall und Rotationsfehler. `done` ist das letzte Ereignis eines erfolgreichen Laufs (Exit-Code 0); `labels` enthält je Sprecher (ohne `UNKNOWN`) den längsten Satz, höchstens 140 Zeichen; Namen setzt die App danach mit `speakers set`. `transcribing` nennt die ID, unter der die Besprechung angelegt wird; bricht der Lauf hart ab (Prozess beendet), bleibt eine unvollständige Datei mit dieser ID zurück, die `meetscribe discard <ID>` entfernt. `speakers` in `done` ist die Zahl der gespeicherten Sprecher, ohne Trennung also 1 (`UNKNOWN`), wie in `meetings`. `error` ist das letzte Ereignis bei Exit-Code 1 oder 130; `message` ist auf 400 Zeichen gekürzt, `detail` enthält den vollen Fehlertext (bis 4000 Zeichen). Vor der Aufnahme (Vorprüfung) sind `audio`, `meeting_id` und `retry` `null`. Schlägt erst die Nachbearbeitung fehl, ist die Besprechung gespeichert: `meeting_id` ist gesetzt und `retry` ist `meetscribe report <ID>` (nicht erneut `start`).
-
-### Sprecher benennen (Kommandozeile)
-
-```
-meetscribe speakers show
-meetscribe speakers set SPEAKER_00 Anna
-meetscribe speakers unset SPEAKER_00
-meetscribe report
-```
-
-Ohne `--meeting ID` gilt die zuletzt erstellte Besprechung. Die Zuordnung steht in einer eigenen Datei; die Rohdaten bleiben unverändert.
-
-### sql
-
-Verfügbare Sichten: `segments` (Rohdaten, heiß und kalt vereint), `segments_named` (zusätzlich `display_name`: zugeordneter Name, sonst das Label) und `speakers` (Zuordnungstabelle).
-
-```
-meetscribe sql "SELECT display_name, count(*) AS segmente, round(sum(end_s - start_s)) AS sekunden FROM segments_named WHERE meeting_date >= DATE '2026-11-01' GROUP BY display_name ORDER BY sekunden DESC"
-```
-
-Schema von `segments`:
-
-| Spalte | Typ |
-|---|---|
-| meeting_id | VARCHAR (Format `JJJJMMTT-titel`) |
-| title | VARCHAR |
-| meeting_date | DATE |
-| seg_id | INTEGER |
-| start_s, end_s | DOUBLE (Sekunden ab Aufnahmebeginn) |
-| speaker | VARCHAR (`SPEAKER_00`, ... oder `UNKNOWN`) |
-| text | VARCHAR |
-| language, model, device, backend | VARCHAR (`backend`: `openvino` oder `faster-whisper`, bei Dateien aus der Zeit vor der Spalte `NULL`; `device`: NPU, GPU, iGPU oder CPU) |
-| words | Liste von (text, start_s, end_s), Zeitstempel je Wort |
-| created_at | TIMESTAMP WITH TIME ZONE (UTC) |
-
-`speakers`: `meeting_id`, `label`, `name`.
-
-DuckDB-Erweiterungen werden weder automatisch installiert noch automatisch geladen (`autoinstall_known_extensions` und `autoload_known_extensions` sind aus) und die Konfiguration ist gesperrt, `SET` auf diese Einstellungen schlägt also fehl. Ein Aufruf wie `read_parquet('https://...')` bricht deshalb ohne Netzzugriff mit der DuckDB-Fehlermeldung ab (`requires the extension httpfs`, Exit-Code 1, kein Traceback). Lokale Dateien, etwa `read_parquet('C:/pfad/datei.parquet')`, und die Sichten funktionieren weiter. Zusätzlich lehnt `sql` jede Anweisung `INSTALL`, `FORCE INSTALL` und `LOAD` sowie `UPDATE EXTENSIONS` ab (Meldung `... gesperrt`, Exit-Code 1), bevor DuckDB etwas ausführt; ein Test mit lokalem HTTP-Server bestätigt, dass dabei keine Anfrage entsteht. Nicht geprüft ist, ob DuckDB außerhalb dieser Anweisungen Erweiterungen nachladen kann (`load_extension` gibt es in DuckDB 2.0.0 nicht). Schon auf dem Rechner liegende Erweiterungen (`%USERPROFILE%\.duckdb\extensions`) werden von `sql` nicht geladen.
+`recording` entfällt bei vorhandener Datei. Bei zwei Mikrofonen nennt `input` beide Geräte mit ` + ` und `path` den Mix. `transcribing` nennt zusätzlich die geplante Wahl: `backend`, `device` (NPU, GPU, iGPU oder CPU), `model` und `variant`. `fallback` (`from`, `to`, `backend`) kommt bei jedem Rückfall, begleitet von einem `warning` mit dem Grund. `done` enthält `ran`: `backend`, `backends`, `devices` (was wirklich lief), `model`, `variant` (die Variante, die als erste wirklich lief, nach einem Rückfall also nicht die geplante) und `variants` (je Gerät in `devices` die Variante), `stored` (die gespeicherten Modellnamen), `requested`, `fallback` und `text` (etwa `iGPU · large-v3-turbo · OpenVINO`). `warning` steht für Eingangsprobleme, Überläufe, unvollständige Aufnahme, Geräte-Rückfall und Rotationsfehler. `done` ist das letzte Ereignis eines erfolgreichen Laufs (Exit-Code 0); `labels` enthält je Sprecher (ohne `UNKNOWN`) den längsten Satz, höchstens 140 Zeichen; Namen setzt die App danach über `speakers.set`. `transcribing` nennt die ID, unter der die Besprechung angelegt wird; bricht der Lauf hart ab (Prozess beendet), bleibt eine unvollständige Datei mit dieser ID zurück, die `discard` entfernt. `speakers` in `done` ist die Zahl der gespeicherten Sprecher, ohne Trennung also 1 (`UNKNOWN`), wie in `meetings`. `error` ist das letzte Ereignis bei Exit-Code 1 oder 130; `message` ist auf 400 Zeichen gekürzt, `detail` enthält den vollen Fehlertext (bis 4000 Zeichen). Vor der Aufnahme (Vorprüfung) sind `audio`, `meeting_id` und `retry` `null`. Schlägt erst die Nachbearbeitung fehl, ist die Besprechung gespeichert: `meeting_id` ist gesetzt und `retry` nennt den Befehl zum erneuten Erzeugen des Protokolls (nicht erneut aufnehmen).
 
 ### Engine-Protokoll (JSON-RPC)
 
 `meetscribe serve` ist die langlebige Engine der App. Sie spricht JSON-RPC 2.0 über stdin und stdout, eine Nachricht je Zeile (UTF-8, ein JSON-Objekt, keine Stapel). stdout gehört dem Protokoll: Alles, was Bibliotheken dorthin schreiben, geht nach stderr (die App legt es in `engine.log`). Beim Start setzt die Engine die Offline-Variablen; sie greift nie auf das Netz zu. Nur der Modell-Download läuft in einem Kindprozess (`meetscribe setup --events`), dessen Zeilen sie als Benachrichtigungen weiterreicht. Schließt der Client stdin, beendet sich die Engine: Eine Aufnahme wird gespeichert und nicht verarbeitet, eine Verarbeitung abgebrochen (die unfertige Besprechung entfernt sie dabei, wenn der Abbruch rechtzeitig greift; sonst bleibt sie, und `meeting.settle` räumt sie auf).
 
-Die Logik steckt in einer Dienstschicht (`meetscribe/service.py`, Klasse `Service`), die der RPC-Server, die Kommandozeilenbefehle und ein späterer MCP-Server gemeinsam aufrufen. Die Kommandozeile bleibt als interne und Testschnittstelle erhalten und liefert dieselben Ergebnisse wie bisher.
+Die Logik steckt in einer Dienstschicht (`meetscribe/service.py`, Klasse `Service`), die der RPC-Server, die Kommandozeilenbefehle und der MCP-Server gemeinsam aufrufen. Die Kommandozeile bleibt als interne und Testschnittstelle erhalten und liefert dieselben Ergebnisse wie bisher.
 
 Handshake: Das Erste ist `initialize`; davor antworten alle Methoden mit Code -32002. Weicht die Protokollversion ab, kommt Code -32001 mit deutschem Text.
 
@@ -500,6 +380,89 @@ Gemessen (Windows 11, Core Ultra 7 258V, `long_de.wav` 80,3 s, Sprechertrennung 
 „Vorher“ beim Laden: Ein frischer Python-Prozess baute die Engine genauso, wie ein Lauf es tut (`OpenVinoEngine`), zweimal nacheinander, als Ray-Job mit 2 CPUs und 4 GB. „Nachher“: drei Läufe derselben Datei in einer laufenden App; Läufe über die App starten die Engine direkt aus der App, nicht über Ray. Eine Datei, ein Rechner, keine Wiederholungen für die Streuung. Während der Transkription antwortete die Engine auf Abfragen in 14 bis 28 ms; nur die erste Abfrage im ersten Lauf, mitten im Modellladen, brauchte 2,5 s.
 
 
+### MCP-Schnittstelle
+
+Der MCP-Server (`meetscribe-mcp`, Modul `meetscribe.mcp_server`) macht das Archiv für KI-Assistenten wie Claude lesbar und erlaubt wenige, bewusst gewählte Änderungen. Er nutzt das offizielle MCP-Python-SDK (`mcp` 2.x, Transport stdio), läuft in derselben virtuellen Umgebung wie die Engine, ruft die gemeinsame Dienstschicht auf und startet keine Befehle der Kommandozeile. Er läuft nur, solange der MCP-Client ihn gestartet hat, und endet mit ihm.
+
+#### Einrichten
+
+In der App: Reiter „Einstellungen“, Abschnitt „Mit Claude verbinden“. Dort stehen der genaue Befehl für Claude Code und der JSON-Block für Claude Desktop, mit den echten Pfaden dieses Rechners und mit einem Knopf zum Kopieren. Die App schreibt selbst nichts in die Konfiguration von Claude; du fügst die Angaben ein.
+
+- Claude Code: den angezeigten Befehl in einer Konsole ausführen. Er hat die Form `claude mcp add --scope user meetscribe -- <Pfad>\meetscribe-mcp.exe` (bei gesetzten Archivvariablen mit `-e NAME=Wert`, wie in der App angezeigt). Prüfen mit `claude mcp list`.
+- Claude Desktop: den JSON-Block in `claude_desktop_config.json` einfügen (Einstellungen, Entwickler, „Konfiguration bearbeiten“; ist dort schon ein Eintrag `mcpServers`, nur `meetscribe` ergänzen) und Claude Desktop neu starten.
+
+Der Server arbeitet auf demselben Archiv wie die App (Standard: `data\` im Projektordner; `MEETSCRIBE_DATA`, `MEETSCRIBE_MODELS` und `MEETSCRIBE_REPORTS` gelten wie sonst, die App zeigt sie im Befehl mit an, wenn sie gesetzt sind). Findet die App die Engine nur über `uv`, steht dort `uv run --project <Ordner> meetscribe-mcp`.
+
+#### Werkzeuge
+
+Alle Beschreibungen sind deutsch, alle Eingaben sind typisiert und begrenzt. Ohne `meeting_id` gilt die zuletzt erstellte Besprechung.
+
+| Werkzeug | Eingaben | Zweck |
+|---|---|---|
+| `list_meetings` | keine | alle Besprechungen, neueste zuerst, mit `complete` |
+| `search` | `term`, `meeting_id`, `speaker`, `limit` (1 bis 200, Standard 20) | Teilstring-Suche ohne Beachtung der Groß- und Kleinschreibung |
+| `get_transcript` | `meeting_id`, `speaker`, `offset`, `limit` (1 bis 1000, Standard 200) | Segmente mit Zeit, Sprechername und Text, seitenweise (`next_offset`) |
+| `get_minutes` | `meeting_id` | das Protokoll als Markdown |
+| `speaker_stats` | `meeting_id` | Redezeit, Anteil, Segmente und Wörter je Sprecher |
+| `set_speaker_name` | `label`, `name`, `meeting_id` | Namen einem Sprecher-Label zuordnen |
+| `transcribe_start` | `audio` (Pfad, muss eine vorhandene Datei sein), `title`, `diarize`, `speakers`, `device`, `backend`, `model` | Transkription einer vorhandenen Datei starten, antwortet sofort mit einer `job`-ID |
+| `transcribe_status` | `job`, `wait_s` (0 bis 60) | `state` (`running`, `done`, `failed`, `cancelled`), Phase, Dauer; bei `done` Besprechung, Segmente, Sprecher-Labels mit Beispielsatz, genutztes Gerät |
+| `transcribe_cancel` | `job` | laufenden Auftrag abbrechen |
+| `list_models` | keine | Modellkatalog mit Installationsstand und Eignung je Hardware |
+| `list_hardware` | keine | erkannte NPU, GPU, iGPU, CPU und Backends |
+| `query_sql` | `sql`, `limit` (1 bis 1000, Standard 200) | genau eine lesende SELECT-Abfrage |
+
+Die Transkription läuft als Auftrag: `transcribe_start` liefert eine Job-ID, `transcribe_status` zeigt den Stand (mit `wait_s` wartet der Aufruf bis zu so viele Sekunden auf das Ende), `transcribe_cancel` bricht ab. Es läuft immer nur ein Auftrag, auch gegenüber der App; ein zweiter Start meldet das auf Deutsch. Ein Abbruch wirkt zwischen zwei Abschnitten (die Erkennung arbeitet in Fenstern von etwa 5 min) und spätestens, wenn das laufende Fenster fertig ist; die Sprechertrennung selbst lässt sich nicht unterbrechen. Eine abgebrochene Besprechung wird verworfen, die Audiodatei bleibt unberührt. Wie die App legt auch dieser Weg das Markdown-Protokoll in `protokolle\` ab (`report_file` im Ergebnis); beim Beenden des Servers wird ein laufender Auftrag abgebrochen.
+
+#### Schreibgeschützte SQL
+
+`query_sql` erzwingt die Beschränkung in DuckDB selbst, nicht über Textprüfungen:
+
+- DuckDBs Parser muss genau eine Anweisung vom Typ SELECT liefern; alles andere (CREATE, INSERT, DROP, COPY, ATTACH, INSTALL, LOAD, SET, PRAGMA, CALL, mehrere Anweisungen) wird mit deutscher Meldung abgelehnt.
+- Die Abfrage läuft in einer Transaktion `READ ONLY`; Schreiben schlägt in DuckDB fehl.
+- Die Verbindung ist ohne Dateizugriff konfiguriert (`enable_external_access=false`); erlaubt ist nur der Ordner `data\cold` des Archivs. Erweiterungen werden weder installiert noch geladen, die Konfiguration ist gesperrt, der Speicher ist auf 1 GB und die Rechenzeit auf 20 s begrenzt, die Zeilenzahl ist begrenzt (`truncated` zeigt, dass mehr da waren).
+
+Sichten: `segments` (Rohdaten, heiß und kalt vereint), `segments_named` (zusätzlich `display_name`: zugeordneter Name, sonst das Label) und `speakers` (Zuordnungstabelle).
+
+Schema von `segments`:
+
+| Spalte | Typ |
+|---|---|
+| meeting_id | VARCHAR (Format `JJJJMMTT-titel`) |
+| title | VARCHAR |
+| meeting_date | DATE |
+| seg_id | INTEGER |
+| start_s, end_s | DOUBLE (Sekunden ab Aufnahmebeginn) |
+| speaker | VARCHAR (`SPEAKER_00`, ... oder `UNKNOWN`) |
+| text | VARCHAR |
+| language, model, device, backend | VARCHAR (`backend`: `openvino` oder `faster-whisper`, bei Dateien aus der Zeit vor der Spalte `NULL`; `device`: NPU, GPU, iGPU oder CPU) |
+| words | Liste von (text, start_s, end_s), Zeitstempel je Wort |
+| created_at | TIMESTAMP WITH TIME ZONE (UTC) |
+
+`speakers`: `meeting_id`, `label`, `name`.
+
+#### Bewusst ausgeschlossen
+
+- Keine Aufnahme und kein Mikrofon: Ein Assistent soll nie von sich aus mithören. Aufnehmen bleibt dem Knopf in der App vorbehalten. Es gibt auch kein Werkzeug, das Eingabegeräte auflistet.
+- Kein Einrichten und kein Download: Das ist der einzige Weg ins Netz und soll nicht aus einem Gespräch heraus auslösbar sein; der Server selbst hat keinen Netzzugriff.
+- Kein Löschen, Verwerfen oder Archivieren (`rotate`, `discard`): Das Archiv soll sich über Claude nicht verkleinern lassen. Ein abgebrochener Auftrag verwirft nur seine eigene, unfertige Besprechung.
+- Kein Schreiben außer Sprechernamen: Die Rohdaten des Transkripts bleiben unverändert. Die Namen liegen in einer eigenen Datei und lassen sich mit der App wieder ändern.
+- Pfade für die Transkription müssen eine vorhandene Datei sein; sonst gibt es nie einen Aufnahmeweg.
+
+#### Warnung: Gesprächstext ist unvertrauenswürdige Eingabe
+
+Alles, was in Besprechungen gesagt wurde, kommt als Text zu Claude zurück: in Treffern, im Transkript, im Protokoll und in SQL-Ergebnissen. Wer in einer Besprechung etwas sagt wie „Ignoriere deine bisherigen Anweisungen und ...“, landet damit im Text, den ein KI-Assistent liest (Prompt-Injektion). Der Server weist Claude in den Werkzeugbeschreibungen darauf hin, dass Gesprächstext nur Inhalt und kein Auftrag ist, aber das ist kein sicherer Schutz. Wer Claude mit sensiblen Werkzeugen anderer Server kombiniert (E-Mail, Dateien, Shell), sollte Aktionen bestätigen lassen. Außerdem verlässt der Gesprächstext den Rechner, sobald Claude ihn liest: Claude Desktop und Claude Code senden ihn an die Cloud-Dienste des Anbieters. Der Server selbst bleibt offline, aber die Offline-Eigenschaft von meetscribe gilt für diesen Weg nicht mehr.
+
+#### Gleichzeitig mit der App
+
+Server und App dürfen zugleich auf dasselbe Archiv arbeiten. Dafür sind die Stellen, an denen mehrere Prozesse schreiben, über Sperrdateien abgesichert: die Startsperre (`start.lock`, nur ein Auftrag zugleich), das Schreiben der Sprecherzuordnung (`speakers.lock`; vorher ging bei zwei Schreibern ein Namen verloren, mit der Sperre nicht mehr, gemessen mit zwei Prozessen) und das Archivieren (`rotate.lock`). Temporäre Dateien tragen Prozess- und Thread-Kennung, ein kurz belegtes Ziel wird wiederholt. Lesen braucht keine Sperre: Jede Abfrage prüft Größe und Änderungszeit der Dateien und liest bei Änderung neu.
+
+#### Geprüft
+
+- pytest: jedes Werkzeug über einen Client im selben Prozess (Eingabeschemas, Fehler, Seitenweise, Sprechernamen, SQL-Ablehnungen, Auftrag mit Status, Abbruch, Startsperre eines fremden Prozesses), eine echte stdio-Sitzung hinter einer Socket-Sperre (kein Verbindungsversuch) und Schreiben von Sprechernamen aus zwei Prozessen.
+- Echte Sitzung (SDK-Client, stdio, Archiv mit einer echten Transkription von `long_de.wav` auf der iGPU, Sprechertrennung aus): Auflisten, Suchen, Protokoll lesen, Sprecher benennen, SQL (samt abgelehnter Anweisungen), dann Transkription derselben Datei auf der iGPU (4,3 s von Start bis Ende, Modellladen 0,73 s) und ein Abbruch. Einmal allein und einmal bei laufender App auf demselben Archiv: Die App sah die neuen Besprechungen und den vom Server gesetzten Namen, und ihr eigener Start während des Auftrags des Servers wurde mit der Meldung der Startsperre abgelehnt; danach lief ein App-Lauf normal. Die Socket-Sperre meldete in beiden Sitzungen 0 Verbindungsversuche. Eine Datei, ein Rechner, keine Wiederholungen. Nicht geprüft: Sprechertrennung über den Server (kein echtes Modell), ein echter Claude-Client, Claude Desktop.
+- Läufe, die der Server oder die App selbst starten, rechnen direkt im Prozess, nicht über Ray.
+
 ### Technik der Transkription
 
 Spracherkennung läuft über `openvino_genai.WhisperPipeline`. Gründe, die sich aus dem Code ergeben: eine API für NPU, GPU und CPU (nur der Gerätename ändert sich), Wortzeitstempel direkt aus der Pipeline, ein Compile-Cache über `CACHE_DIR`, und fertig konvertierte Modelle aus der Hugging-Face-Organisation `OpenVINO`. Vergleichsmessungen mit whisper.cpp oder optimum-intel wurden nicht gemacht. PyTorch wird nur für die Sprechertrennung (pyannote, immer auf der CPU) gebraucht. Zweites Backend ist faster-whisper (CTranslate2). Entscheidung: whisper.cpp-Bindungen waren nicht nötig, weil faster-whisper 1.2.1 mit ctranslate2 4.8.5, onnxruntime, PyTorch 2.15 (CPU) und openvino-genai 2026.4 in einer Windows-Umgebung zusammen installiert und importiert werden kann (`uv sync --extra faster-whisper`, alle Importe und pyannote funktionieren) und Wortzeitstempel direkt liefert. Der Vergleich der beiden steht in der ersten Tabelle unter „Gemessen“.
@@ -526,8 +489,8 @@ cargo tauri build
 
 ### Tests
 
-- Engine: `uv run pytest -q` (239 Tests, alle grün; sie prüfen Logik und Abläufe mit Ersatzobjekten, nicht die oben genannten Hardwarefälle).
-- App: `npm test` (38 Oberflächentests mit jsdom und einem Ersatz für die Tauri-Schnittstelle) und `cargo test` (32 Rust-Tests mit der Ersatz-Engine `examples\fake_engine`, die JSON-RPC spricht: Reihenfolge der Antworten, Absturz und Neustart, Fristen, Startfehler, Abbruch mit Prozessbaum).
+- Engine: `uv run pytest -q` (280 Tests, alle grün; sie prüfen Logik und Abläufe mit Ersatzobjekten, nicht die oben genannten Hardwarefälle).
+- App: `npm test` (43 Oberflächentests mit jsdom und einem Ersatz für die Tauri-Schnittstelle) und `cargo test` (33 Rust-Tests mit der Ersatz-Engine `examples\fake_engine`, die JSON-RPC spricht: Reihenfolge der Antworten, Absturz und Neustart, Fristen, Startfehler, Abbruch mit Prozessbaum).
 
 ### Android
 

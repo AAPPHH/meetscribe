@@ -110,18 +110,50 @@ fn missing_engine_message_names_no_developer_folder_and_a_bad_saved_project_is_r
 
 #[test]
 fn start_args_cover_recording_and_file_modes_and_keep_audio_out_of_option_parsing() {
-    let base = StartOptions { title: Some("  Runde ".into()), audio: None, mic: Some("DJI".into()), device: "gpu".into(), diarize: false };
+    let base = StartOptions { title: Some("  Runde ".into()), audio: None, mic: Some("DJI".into()), device: "gpu".into(), backend: None, model: None, diarize: false };
     assert_eq!(
         base.args(),
         ["start", "--events", "--no-open", "--device", "gpu", "--stdin-stop", "--mic", "DJI", "--title", "Runde", "--no-diarize"]
     );
-    let file = StartOptions { title: None, audio: Some(r"C:\a b\x.wav".into()), mic: Some("DJI".into()), device: "npu".into(), diarize: true };
+    let file = StartOptions { title: None, audio: Some(r"C:\a b\x.wav".into()), mic: Some("DJI".into()), device: "npu".into(), backend: None, model: None, diarize: true };
     assert_eq!(file.args(), ["start", "--events", "--no-open", "--device", "npu", "--", r"C:\a b\x.wav"]);
     let tricky = StartOptions { title: Some("T".into()), audio: Some("--events".into()), ..file.clone() };
     assert_eq!(tricky.args(), ["start", "--events", "--no-open", "--device", "npu", "--title", "T", "--", "--events"]);
-    let blank = StartOptions { title: Some(" ".into()), audio: Some("".into()), mic: Some("".into()), device: "cpu".into(), diarize: true };
+    let blank = StartOptions { title: Some(" ".into()), audio: Some("".into()), mic: Some("".into()), device: "cpu".into(), backend: None, model: None, diarize: true };
     assert_eq!(blank.args(), ["start", "--events", "--no-open", "--device", "cpu", "--stdin-stop"]);
     assert!(StartOptions { device: "tpu".into(), ..blank }.validate().is_err());
+}
+
+#[test]
+fn backend_and_model_choices_reach_the_engine_only_when_not_automatic() {
+    let base = StartOptions { title: None, audio: None, mic: None, device: "auto".into(), backend: None, model: None, diarize: true };
+    assert_eq!(base.args(), ["start", "--events", "--no-open", "--device", "auto", "--stdin-stop"]);
+    let auto = StartOptions { backend: Some("auto".into()), model: Some(" auto ".into()), ..base.clone() };
+    assert_eq!(auto.args(), base.args());
+    let chosen = StartOptions { device: "igpu".into(), backend: Some("faster-whisper".into()), model: Some("small:int8".into()), ..base.clone() };
+    assert_eq!(
+        chosen.args(),
+        ["start", "--events", "--no-open", "--device", "igpu", "--backend", "faster-whisper", "--model", "small:int8", "--stdin-stop"]
+    );
+    assert!(chosen.validate().is_ok());
+    for bad in ["--events", "-x", ".hidden", "a b", "a;b", "C:\\x"] {
+        assert!(StartOptions { model: Some(bad.into()), ..base.clone() }.validate().is_err(), "{bad}");
+        assert!(StartOptions { backend: Some(bad.into()), ..base.clone() }.validate().is_err(), "{bad}");
+    }
+    for device in ["auto", "npu", "gpu", "igpu", "cpu"] {
+        assert!(StartOptions { device: device.into(), ..base.clone() }.validate().is_ok(), "{device}");
+    }
+}
+
+#[test]
+fn downloads_pass_exactly_one_checked_model_to_setup() {
+    assert_eq!(
+        download_args("openvino", "small:int8").unwrap(),
+        ["setup", "--events", "--backend", "openvino", "--model", "small:int8"]
+    );
+    for (backend, model) in [("auto", "small"), ("openvino", "auto"), ("openvino", "--x"), ("", "small"), ("openvino", "a b")] {
+        assert!(download_args(backend, model).is_err(), "{backend} {model}");
+    }
 }
 
 #[test]
@@ -129,7 +161,7 @@ fn missing_or_misspelled_audio_is_refused_in_german_before_any_engine_starts() {
     let dir = scratch("audio");
     let real = dir.join("a.wav");
     std::fs::write(&real, b"x").unwrap();
-    let options = |audio: &str| StartOptions { title: None, audio: Some(audio.into()), mic: None, device: "npu".into(), diarize: true };
+    let options = |audio: &str| StartOptions { title: None, audio: Some(audio.into()), mic: None, device: "npu".into(), backend: None, model: None, diarize: true };
     assert!(options(&real.to_string_lossy()).validate().is_ok());
     for bad in [dir.join("fehlt.wav").to_string_lossy().to_string(), dir.to_string_lossy().to_string(), "--events".to_string()] {
         let err = options(&bad).validate().unwrap_err();
@@ -144,9 +176,14 @@ fn settings_roundtrip_and_defaults() {
     let dir = scratch("settings");
     let path = dir.join(SETTINGS_FILE);
     assert_eq!(Settings::load(&path), Settings::default());
-    let settings = Settings { engine: "x".into(), mic: "DJI".into(), device: "gpu".into(), diarize: false, ..Settings::default() };
+    let settings = Settings { engine: "x".into(), mic: "DJI".into(), device: "gpu".into(), backend: "faster-whisper".into(), model: "small".into(), diarize: false, ..Settings::default() };
     settings.save(&path).unwrap();
     assert_eq!(Settings::load(&path), settings);
+    assert_eq!((Settings::default().device.as_str(), Settings::default().backend.as_str(), Settings::default().model.as_str()), ("auto", "auto", "auto"));
+    std::fs::write(&path, r#"{"device":"gpu","mic":"DJI"}"#).unwrap();
+    assert_eq!(Settings::load(&path), Settings { device: "gpu".into(), mic: "DJI".into(), ..Settings::default() });
+    assert!(Settings { backend: "--x".into(), ..Settings::default() }.save(&path).is_err());
+    assert!(Settings { model: "".into(), ..Settings::default() }.save(&path).is_err());
     std::fs::write(&path, r#"{"device":"cpu"}"#).unwrap();
     assert_eq!(Settings::load(&path), Settings { device: "cpu".into(), ..Settings::default() });
     assert!(Settings { device: "tpu".into(), ..Settings::default() }.save(&path).is_err());
@@ -160,12 +197,19 @@ fn pending_run_follows_the_event_stream() {
     std::fs::write(&audio, b"x").unwrap();
     let audio_text = audio.to_string_lossy().to_string();
     let store = PendingStore { path: dir.join(PENDING_FILE) };
-    let options = StartOptions { title: Some("Runde".into()), audio: None, mic: None, device: "gpu".into(), diarize: false };
+    let options = StartOptions { title: Some("Runde".into()), audio: None, mic: None, device: "gpu".into(), backend: None, model: None, diarize: false };
     assert!(store.load().is_none());
     store.observe(&json!({ "event": "preflight" }), &options);
     assert!(store.load().is_none());
     store.observe(&json!({ "event": "recording", "path": audio_text }), &options);
-    let expected = Pending { audio: audio_text.clone(), meeting_id: None, title: Some("Runde".into()), device: "gpu".into(), diarize: false };
+    let expected = Pending { audio: audio_text.clone(), meeting_id: None, title: Some("Runde".into()), device: "gpu".into(), backend: None, model: None, diarize: false };
+    let chosen = StartOptions { backend: Some("faster-whisper".into()), model: Some("small".into()), ..options.clone() };
+    store.observe(&json!({ "event": "recording", "path": audio_text }), &chosen);
+    assert_eq!(store.load().map(|p| (p.backend, p.model)), Some((Some("faster-whisper".into()), Some("small".into()))));
+    std::fs::write(&store.path, format!(r#"{{"audio":{},"meeting_id":null,"title":null,"device":"npu","diarize":true}}"#, json!(audio_text))).unwrap();
+    assert_eq!(store.load().map(|p| (p.device, p.backend, p.model)), Some(("npu".into(), None, None)));
+    store.clear();
+    store.observe(&json!({ "event": "recording", "path": audio_text }), &options);
     assert_eq!(store.load(), Some(expected.clone()));
     store.observe(&json!({ "event": "transcribing", "audio": audio_text, "meeting_id": "m-1" }), &options);
     assert_eq!(store.load().unwrap().meeting_id.as_deref(), Some("m-1"));
@@ -308,15 +352,44 @@ fn kill_takes_the_whole_process_tree_with_it() {
     assert_eq!(session.info().meeting_id.as_deref(), Some("fake-1"));
 }
 
-#[test]
-fn concurrent_launches_leave_exactly_one_session() {
-    let dir = scratch("launch");
-    let state = Arc::new(AppState {
+fn app_state(dir: &Path) -> AppState {
+    AppState {
         settings_path: dir.join(SETTINGS_FILE),
         pending: PendingStore { path: dir.join(PENDING_FILE) },
         log_path: dir.join(LOG_FILE),
+        download_log_path: dir.join(DOWNLOAD_LOG_FILE),
         session: Mutex::new(None),
-    });
+        download: Mutex::new(None),
+    }
+}
+
+#[test]
+fn only_one_download_runs_at_a_time_and_none_during_a_session() {
+    let dir = scratch("downloads");
+    let state = Arc::new(app_state(&dir));
+    let spawn = || Session::spawn(fake_command("sleep", &["setup", "--events"]), Arc::new(|_, _| {}), None);
+    let threads: Vec<_> = (0..6)
+        .map(|_| {
+            let state = state.clone();
+            std::thread::spawn(move || state.start_download(spawn))
+        })
+        .collect();
+    let results: Vec<Result<(), String>> = threads.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert!(results.iter().filter_map(|r| r.as_ref().err()).all(|e| e == "Es läuft bereits ein Download."));
+    state.active_download().unwrap().kill().unwrap();
+    assert!(wait_for(200, || state.active_download().is_none()));
+    state.launch(|| Session::spawn(fake_command("sleep", &["start", "--events"]), Arc::new(|_, _| {}), None)).unwrap();
+    let err = state.start_download(spawn).unwrap_err();
+    assert!(err.contains("Während einer Aufnahme oder Verarbeitung"), "{err}");
+    state.active_session().unwrap().kill().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn concurrent_launches_leave_exactly_one_session() {
+    let dir = scratch("launch");
+    let state = Arc::new(app_state(&dir));
     let threads: Vec<_> = (0..6)
         .map(|_| {
             let state = state.clone();
@@ -371,7 +444,7 @@ impl PendingCase {
     }
 
     fn remember(&self, meeting_id: Option<&str>) {
-        self.store.write(&Pending { audio: self.audio.clone(), meeting_id: meeting_id.map(String::from), title: None, device: "gpu".into(), diarize: false });
+        self.store.write(&Pending { audio: self.audio.clone(), meeting_id: meeting_id.map(String::from), title: None, device: "gpu".into(), backend: None, model: None, diarize: false });
     }
 }
 
@@ -432,4 +505,22 @@ fn forgetting_removes_the_partial_meeting_but_never_a_complete_one() {
 fn heartbeat_events_never_reach_the_frontend() {
     let (events, _) = run_fake("", &["start", "x.wav", "--events"], None);
     assert_eq!(names(&events), ["preflight", "transcribing", "done", "exit"]);
+}
+
+#[test]
+fn a_download_session_streams_progress_then_done_and_reports_failures_with_detail() {
+    let (events, session) = run_fake("", &["setup", "--events", "--backend", "openvino", "--model", "small:int8"], None);
+    assert_eq!(names(&events), ["download", "done", "exit"]);
+    assert_eq!(events[0].1["total"], 257000000);
+    assert!(!session.active());
+    let (events, _) = run_fake("download_fail", &["setup", "--events", "--model", "small"], None);
+    assert_eq!(names(&events), ["download", "error", "exit"]);
+    assert!(events[1].1["detail"].as_str().unwrap().contains("offline"));
+    assert_eq!(events[2].1["terminal"], true);
+}
+
+#[test]
+fn engine_models_listing_runs_through_the_command_line() {
+    let engine = Engine { spec: EngineSpec { program: fake_engine(), args: vec![], source: "test".into() } };
+    assert_eq!(engine.json(&["--json", "models"]).unwrap()["default_model"], "large-v3-turbo");
 }

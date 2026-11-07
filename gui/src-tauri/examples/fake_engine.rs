@@ -22,8 +22,19 @@ fn main() {
         let accepted = args.len() == 3 && args[1] == "--" && args[2] != "m-fail";
         std::process::exit(if accepted { 0 } else { 1 });
     }
+    if args.first().map(String::as_str) == Some("setup") {
+        emit(r#"{"event":"download","repo":"OpenVINO/whisper-small-int8-ov","bytes":1000000,"total":257000000}"#);
+        if mode == "download_fail" {
+            emit(r#"{"event":"error","message":"Der Download ist fehlgeschlagen.","detail":"whisper OpenVINO/whisper-small-int8-ov: FEHLER OSError: offline","exit_code":1}"#);
+            std::process::exit(1);
+        }
+        emit(r#"{"event":"done","messages":["whisper OpenVINO/whisper-small-int8-ov: ok"]}"#);
+        return;
+    }
     if args.first().map(String::as_str) != Some("start") {
-        let text = if has("devices") {
+        let text = if has("models") {
+            r#"{"default_model":"large-v3-turbo","backends":[],"hardware":[],"models":[],"choices":[]}"#
+        } else if has("devices") {
             r#"{"inputs":[{"index":0,"name":"Fake Mikrofon","api":"MME","channels":1,"rate":16000}],"inputs_error":null,"openvino":[{"device":"CPU","name":"Fake CPU"}]}"#
         } else if has("report") {
             r##"{"meeting_id":"fake","path":null,"markdown":"# Fake\n\nProtokoll"}"##

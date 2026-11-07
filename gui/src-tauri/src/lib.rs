@@ -19,7 +19,11 @@ const ENV_CONFIG: &str = "MEETSCRIBE_GUI_CONFIG";
 const SETTINGS_FILE: &str = "settings.json";
 const PENDING_FILE: &str = "pending.json";
 const LOG_FILE: &str = "engine.log";
-const DEVICES: [&str; 3] = ["npu", "gpu", "cpu"];
+const HARDWARE: [&str; 5] = ["auto", "npu", "gpu", "igpu", "cpu"];
+const AUTO: &str = "auto";
+const DOWNLOAD_LOG_FILE: &str = "download.log";
+const DOWNLOAD_EVENT_NAME: &str = "download-event";
+const DOWNLOAD_EXIT_NAME: &str = "download-exit";
 const AUDIO_EXTENSIONS: [&str; 9] = ["wav", "flac", "mp3", "m4a", "ogg", "opus", "aac", "mp4", "webm"];
 const STDERR_TAIL: usize = 12;
 const POLL_MS: u64 = 50;
@@ -54,14 +58,34 @@ struct Settings {
     engine: String,
     repo: String,
     device: String,
+    backend: String,
+    model: String,
     mic: String,
     diarize: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { engine: String::new(), repo: String::new(), device: "npu".into(), mic: String::new(), diarize: true }
+        Settings { engine: String::new(), repo: String::new(), device: AUTO.into(), backend: AUTO.into(), model: AUTO.into(), mic: String::new(), diarize: true }
     }
+}
+
+fn safe_choice(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with(['-', '.'])
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':'))
+}
+
+fn check_choices(device: &str, backend: &str, model: &str) -> Result<(), String> {
+    if !HARDWARE.contains(&device) {
+        return Err(format!("Unbekanntes Gerät: {device}"));
+    }
+    for (label, value) in [("Backend", backend), ("Modell", model)] {
+        if !safe_choice(value) {
+            return Err(format!("Ungültige Angabe bei {label}: {value}"));
+        }
+    }
+    Ok(())
 }
 
 impl Settings {
@@ -70,9 +94,7 @@ impl Settings {
     }
 
     fn save(&self, path: &Path) -> Result<(), String> {
-        if !DEVICES.contains(&self.device.as_str()) {
-            return Err(format!("Unbekanntes Gerät: {}", self.device));
-        }
+        check_choices(&self.device, &self.backend, &self.model)?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("Einstellungen nicht gespeichert: {e}"))?;
         }
@@ -425,6 +447,10 @@ struct StartOptions {
     audio: Option<String>,
     mic: Option<String>,
     device: String,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     diarize: bool,
 }
 
@@ -437,10 +463,12 @@ impl StartOptions {
         Self::clean(&self.audio)
     }
 
+    fn choice(value: &Option<String>) -> String {
+        Self::clean(value).unwrap_or_else(|| AUTO.into())
+    }
+
     fn validate(&self) -> Result<(), String> {
-        if !DEVICES.contains(&self.device.as_str()) {
-            return Err(format!("Unbekanntes Gerät: {}", self.device));
-        }
+        check_choices(&self.device, &Self::choice(&self.backend), &Self::choice(&self.model))?;
         match self.audio() {
             Some(audio) if !Path::new(&audio).is_file() => Err(format!("Audiodatei nicht gefunden: {audio}")),
             _ => Ok(()),
@@ -450,6 +478,11 @@ impl StartOptions {
     fn args(&self) -> Vec<String> {
         let audio = self.audio();
         let mut args: Vec<String> = ["start", "--events", "--no-open", "--device", &self.device].map(String::from).to_vec();
+        for (flag, value) in [("--backend", Self::choice(&self.backend)), ("--model", Self::choice(&self.model))] {
+            if value != AUTO {
+                args.extend([flag.into(), value]);
+            }
+        }
         if audio.is_none() {
             args.push("--stdin-stop".into());
             if let Some(mic) = Self::clean(&self.mic) {
@@ -475,6 +508,10 @@ struct Pending {
     meeting_id: Option<String>,
     title: Option<String>,
     device: String,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     diarize: bool,
 }
 
@@ -559,6 +596,8 @@ impl PendingStore {
                     meeting_id: text("meeting_id"),
                     title: StartOptions::clean(&options.title),
                     device: options.device.clone(),
+                    backend: StartOptions::clean(&options.backend),
+                    model: StartOptions::clean(&options.model),
                     diarize: options.diarize,
                 });
             }
@@ -577,7 +616,9 @@ struct AppState {
     settings_path: PathBuf,
     pending: PendingStore,
     log_path: PathBuf,
+    download_log_path: PathBuf,
     session: Mutex<Option<Arc<Session>>>,
+    download: Mutex<Option<Arc<Session>>>,
 }
 
 impl AppState {
@@ -601,6 +642,31 @@ impl AppState {
     fn active_session(&self) -> Option<Arc<Session>> {
         self.session.lock().unwrap().clone().filter(|s| s.active())
     }
+
+    fn active_download(&self) -> Option<Arc<Session>> {
+        self.download.lock().unwrap().clone().filter(|s| s.active())
+    }
+
+    fn start_download(&self, spawn: impl FnOnce() -> Result<Arc<Session>, String>) -> Result<(), String> {
+        if self.active_session().is_some() {
+            return Err("Während einer Aufnahme oder Verarbeitung wird nichts heruntergeladen.".into());
+        }
+        let mut slot = self.download.lock().unwrap();
+        if slot.as_ref().is_some_and(|s| s.active()) {
+            return Err("Es läuft bereits ein Download.".into());
+        }
+        *slot = Some(spawn()?);
+        Ok(())
+    }
+}
+
+fn download_args(backend: &str, model: &str) -> Result<Vec<String>, String> {
+    for (label, value) in [("Backend", backend), ("Modell", model)] {
+        if !safe_choice(value) || value == AUTO {
+            return Err(format!("Ungültige Angabe bei {label}: {value}"));
+        }
+    }
+    Ok(["setup", "--events", "--backend", backend, "--model", model].map(String::from).to_vec())
 }
 
 fn config_dir(app: &tauri::App) -> PathBuf {
@@ -650,6 +716,28 @@ async fn search_text(state: State<'_, AppState>, term: String) -> Result<Value, 
 #[tauri::command]
 async fn get_report(state: State<'_, AppState>, meeting_id: String) -> Result<Value, String> {
     state.engine()?.json(&["--json", "report", "--", &meeting_id])
+}
+
+#[tauri::command]
+async fn list_models(state: State<'_, AppState>) -> Result<Value, String> {
+    state.engine()?.json(&["--json", "models"])
+}
+
+#[tauri::command]
+async fn download_model(app: AppHandle, state: State<'_, AppState>, backend: String, model: String) -> Result<(), String> {
+    let args = download_args(&backend, &model)?;
+    let engine = state.engine()?;
+    state.start_download(|| {
+        let sink: Sink = Arc::new(move |name, payload| {
+            let _ = app.emit(if name == EVENT_NAME { DOWNLOAD_EVENT_NAME } else { DOWNLOAD_EXIT_NAME }, payload);
+        });
+        Session::spawn(engine.command(&args), sink, Some(state.download_log_path.clone()))
+    })
+}
+
+#[tauri::command]
+fn download_state(state: State<'_, AppState>) -> Value {
+    json!({ "active": state.active_download().is_some() })
 }
 
 #[tauri::command]
@@ -762,6 +850,9 @@ async fn exit_app(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
             engine.discard(&id);
         }
     }
+    if let Some(download) = state.active_download() {
+        let _ = download.kill();
+    }
     app.exit(0);
     Ok(())
 }
@@ -776,7 +867,9 @@ pub fn run() {
                 settings_path: dir.join(SETTINGS_FILE),
                 pending: PendingStore { path: dir.join(PENDING_FILE) },
                 log_path: dir.join(LOG_FILE),
+                download_log_path: dir.join(DOWNLOAD_LOG_FILE),
                 session: Mutex::new(None),
+                download: Mutex::new(None),
             });
             let _ = std::fs::create_dir_all(&dir);
             Ok(())
@@ -799,6 +892,9 @@ pub fn run() {
             search_text,
             get_report,
             list_devices,
+            list_models,
+            download_model,
+            download_state,
             run_checks,
             start_session,
             stop_session,

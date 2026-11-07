@@ -225,6 +225,20 @@ def test_cancel_ends_the_job_discards_the_partial_meeting_and_keeps_the_audio(ap
     assert env["audio"].exists() and not [p for p in env["store"].hot_files() if p.stem not in ("m1", "m2")]
 
 
+def test_cancel_during_the_only_window_still_ends_with_no_meeting(app, env):
+    SlowEngine.gate = threading.Event()
+
+    async def script(call):
+        started = await call.ok("transcribe_start", audio=str(env["audio"]), diarize=False)
+        await anyio.sleep(0.5)
+        await call.ok("transcribe_cancel", job=started["job"])
+        SlowEngine.gate.set()
+        return await call.ok("transcribe_status", job=started["job"], wait_s=30), (await call.ok("list_meetings"))["meetings"]
+    final, meetings = drive(app, script)
+    assert final["state"] == "cancelled" and {m["meeting_id"] for m in meetings} == {"m1", "m2"}
+    assert {p.stem for p in env["store"].hot_files()} == {"m1", "m2"}
+
+
 def test_a_foreign_start_lock_fails_the_job_with_the_reason_and_frees_afterwards(app, env):
     lock = env["store"].config["data_dir"] / pipeline.START["lock_file"]
     code = "import sys; from meetscribe.pipeline import RunLock; lock = RunLock(sys.argv[1]).__enter__(); print('held', flush=True); sys.stdin.readline()"

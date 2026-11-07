@@ -602,6 +602,7 @@ class Transcriber:
             speakers.update(segment["speaker"] for segment in segments)
             if words:
                 floor = words[-1]["start_s"]
+        self.cancel.check()
         return {"segments": count, "speakers": len(speakers), "used": list(self.runner.used), "variants": list(self.runner.variants), "engines": ran}
 
 

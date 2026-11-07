@@ -350,7 +350,7 @@ def test_report_content(store):
     assert text.startswith("# Projekt K\u00fcche \u2013 04.03.2026\n")
     assert "- **Dauer:** 1:02:10" in text
     assert "- **Sprache:** de" in text and "- **Modell:** whisper-small" in text and "- **Ger\u00e4t:** NPU" in text
-    assert "| Anna \| Chefin | 00:15 | 78,9 % | 8 |" in text
+    assert "| Anna \\| Chefin | 00:15 | 78,9 % | 8 |" in text
     assert "| Björn | 00:04 | 21,1 % | 5 |" in text
     assert "**[00:00] Anna | Chefin:** Guten Morgen. Wir starten." in text
     assert "**[00:08] Bj\u00f6rn:** Sch\u00f6n, dass Sie da sind." in text

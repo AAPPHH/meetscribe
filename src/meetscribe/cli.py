@@ -5,6 +5,7 @@ from pathlib import Path
 
 import click
 
+from meetscribe.backends import BACKEND_CHOICES, CATALOG, HARDWARE_CHOICES, Catalog, Hardware, Selection
 from meetscribe.store import Json, MeetingNotFound, Query, Report, Store, make_config
 
 OFFLINE_ENV = {
@@ -12,8 +13,8 @@ OFFLINE_ENV = {
     "TRANSFORMERS_OFFLINE": "1",
     "PYANNOTE_METRICS_ENABLED": "0",
 }
-DEVICE_CHOICES = ("npu", "gpu", "cpu")
 TABLE = {"clip": 100, "float_digits": 2}
+STATUS_WORDS = {"ok": "ok", "unverified": "ungeprüft", "refused": "nein"}
 
 
 def reconfigure_streams():
@@ -100,6 +101,27 @@ def require_meeting(store, meeting_id):
     return meeting_id
 
 
+def selection_options(command):
+    options = [
+        click.option("--backend", type=click.Choice(BACKEND_CHOICES, case_sensitive=False), envvar="MEETSCRIBE_BACKEND", default="auto",
+                     show_default=True, help="Spracherkennungs-Backend (siehe 'meetscribe models')."),
+        click.option("--device", type=click.Choice(HARDWARE_CHOICES, case_sensitive=False), envvar="MEETSCRIBE_DEVICE", default="auto",
+                     show_default=True, help="Hardware; auto wählt npu, gpu, igpu, cpu in dieser Reihenfolge, Rückfall bei Fehlern."),
+        click.option("--model", default=None, help="Modell aus 'meetscribe models' (optional mit :Variante) oder Modellverzeichnis; Standard large-v3-turbo."),
+    ]
+    for option in reversed(options):
+        command = option(command)
+    return command
+
+
+JSON_FLAG = click.option("--json", "as_json", is_flag=True, help="Maschinenlesbare JSON-Ausgabe.")
+
+
+def want_json(as_json):
+    if as_json:
+        out().machine = True
+
+
 class Cli(click.Group):
     def main(self, *args, **kwargs):
         kwargs.setdefault("windows_expand_args", False)
@@ -117,28 +139,68 @@ def main(ctx, machine):
 
 
 @main.command(help="Modelle herunterladen (einziger Befehl mit Netzzugriff).")
-def setup():
+@click.option("--model", default=None, help="Nur dieses Modell laden (siehe 'meetscribe models'), optional mit :Variante.")
+@click.option("--backend", type=click.Choice(BACKEND_CHOICES, case_sensitive=False), default=None, help="Backend des Modells (Standard openvino).")
+@click.option("--device", type=click.Choice(HARDWARE_CHOICES, case_sensitive=False), default=None, help="Nur die Variante für diese Hardware laden.")
+@click.option("--events", is_flag=True, help="Fortschritt und Ergebnis als JSON-Zeilen auf stdout.")
+def setup(model, backend, device, events):
     for name in OFFLINE_ENV:
         os.environ.pop(name, None)
     from meetscribe import pipeline
+    reporter = pipeline.EventReporter() if events else pipeline.Reporter()
     models = pipeline.Models()
-    setup_job = pipeline.ModelSetup(models, os.environ.get("HF_TOKEN"))
-    messages, failed = setup_job.run()
-    for message in messages:
-        click.echo(message)
-    if pipeline.Models.whisper_ready(models.whisper_dir("npu")):
-        click.echo("NPU-Compile-Cache wird aufgewaermt; das dauert einmalig mehrere Minuten.")
+    setup_job = pipeline.ModelSetup(models, os.environ.get("HF_TOKEN"), reporter)
+    with contextlib.redirect_stdout(sys.stderr) if events else contextlib.nullcontext():
         try:
-            with pipeline.KeepAwake():
-                setup_job.warm("npu")
-        except Exception as exc:
-            click.echo(f"Warnung: NPU-Cache nicht aufgewaermt: {pipeline.Reason.of(exc)}", err=True)
+            messages, failed = setup_job.run(model, backend, device)
+        except click.ClickException as exc:
+            if not events:
+                raise
+            reporter.event("error", message=exc.message, detail=pipeline.Reason.detail(exc), exit_code=1)
+            raise click.exceptions.Exit(1) from exc
+        for message in messages:
+            click.echo(message)
+    if events:
+        if failed:
+            reporter.event("error", message="Der Download ist fehlgeschlagen.", detail="\n".join(messages), exit_code=1)
+            raise click.exceptions.Exit(1)
+        return reporter.event("done", messages=messages)
+    if not any((model, backend, device)):
+        try:
+            plan = Selection(models).resolve("openvino", "npu", fallback=False)
+        except click.ClickException:
+            plan = None
+        if plan and plan.installed:
+            click.echo("NPU-Compile-Cache wird aufgewaermt; das dauert einmalig mehrere Minuten.")
+            try:
+                with pipeline.KeepAwake():
+                    setup_job.warm(plan.primary)
+            except Exception as exc:
+                click.echo(f"Warnung: NPU-Cache nicht aufgewaermt: {pipeline.Reason.of(exc)}", err=True)
     if failed:
         raise click.ClickException("Whisper-Download fehlgeschlagen.")
 
 
-@main.command(help="Audio-Eingaenge und OpenVINO-Geraete auflisten.")
-def devices():
+def hardware_report(hardware):
+    rows = []
+    for kind in CATALOG["hardware_order"]:
+        found = [r for r in hardware.rows if r["id"] == kind]
+        rows.append({
+            "id": kind, "label": Catalog.label(kind), "present": bool(found), "name": found[0]["name"] if found else None,
+            "type": found[0]["type"] if found else None, "devices": [r["device"] for r in found],
+            "backends": sorted({b for r in found for b in r["backends"]}), "reason": None if found else CATALOG["hardware"][kind]["absent"],
+        })
+    return rows
+
+
+def backend_report():
+    return [{"id": b, "label": Catalog.backend_label(b), "installed": Catalog.installed(b), "reason": None if Catalog.installed(b) else Catalog.missing_reason(b)} for b in CATALOG["backend_order"]]
+
+
+@main.command(help="Audio-Eingaenge und erkannte Hardware (NPU, GPU, iGPU, CPU) auflisten.")
+@JSON_FLAG
+def devices(as_json):
+    want_json(as_json)
     from meetscribe import pipeline
     inputs, error = [], None
     try:
@@ -149,15 +211,42 @@ def devices():
         ]
     except Exception as exc:
         error = f"Audio-Eingaenge nicht lesbar: {pipeline.Reason.of(exc)}"
+    hardware = Hardware()
     openvino = pipeline.AudioDevices.openvino_devices()
     if out().machine:
-        return out().dump({"inputs": inputs, "inputs_error": error, "openvino": openvino})
+        return out().dump({
+            "inputs": inputs, "inputs_error": error, "openvino": openvino,
+            "hardware": hardware.rows, "kinds": hardware_report(hardware), "backends": backend_report(),
+        })
     if error:
         click.echo(error, err=True)
     else:
         Table(["index", "name", "api", "kanaele", "rate"], [[d["index"], d["name"], d["api"], d["channels"], d["rate"]] for d in inputs]).echo()
     click.echo()
-    Table(["openvino", "name"], [[r["device"], r["name"]] for r in openvino]).echo()
+    Table(["hardware", "geraet", "name", "typ", "backends"], [[Catalog.label(r["id"]), r["device"], r["name"], r["type"], ", ".join(r["backends"]) or "-"] for r in hardware.rows]).echo()
+    click.echo()
+    Table(["backend", "installiert", "hinweis"], [[b["label"], "ja" if b["installed"] else "nein", b["reason"]] for b in backend_report()]).echo()
+
+
+@main.command(name="models", help="Modelle aus dem Katalog mit Installationsstand, Groesse und Eignung je Hardware.")
+@JSON_FLAG
+def models_command(as_json):
+    want_json(as_json)
+    from meetscribe import pipeline
+    hardware = Hardware()
+    selection = Selection(pipeline.Models(), hardware)
+    rows = selection.listing()
+    if out().machine:
+        return out().dump({
+            "default_model": CATALOG["default_model"], "backends": backend_report(), "hardware": hardware_report(hardware),
+            "models": rows, "choices": selection.matrix(),
+        })
+    kinds = CATALOG["hardware_order"]
+    Table(
+        ["modell", "backend", "variante", "groesse", "installiert", *[Catalog.label(k) for k in kinds]],
+        [[r["model"], r["backend"], r["variant"], f"{r['size_mb']} MB", "ja" if r["installed"] else "nein", *[STATUS_WORDS[r["hardware"][k]["status"]] for k in kinds]] for r in rows],
+    ).echo()
+    click.echo("ok = geeignet, ungeprüft = nicht gemessen, nein = geht nicht (Grund: meetscribe models --json). Laden: meetscribe setup --model NAME [--backend B].")
 
 
 @main.command(name="check", help="Voraussetzungen pruefen (ffmpeg, Modelle, HF_TOKEN).")
@@ -198,9 +287,7 @@ def record(mic, out, seconds):
 
 @main.command(help="Audio transkribieren und im Archiv ablegen.")
 @click.argument("audio", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("--device", type=click.Choice(DEVICE_CHOICES, case_sensitive=False), envvar="MEETSCRIBE_DEVICE",
-              default="npu", show_default=True, help="Gewuenschtes Geraet; Fallback npu -> gpu -> cpu.")
-@click.option("--model", default=None, help="Modellverzeichnis (Pfad oder Name unter models/).")
+@selection_options
 @click.option("--language", default="de", show_default=True)
 @click.option("--title", default=None)
 @click.option("--date", "day", type=click.DateTime(formats=["%Y-%m-%d"]), default=None, help="Datum JJJJ-MM-TT.")
@@ -210,11 +297,11 @@ def record(mic, out, seconds):
 @click.option("--speakers", type=int, default=None)
 @click.option("--min-speakers", type=int, default=None)
 @click.option("--max-speakers", type=int, default=None)
-def transcribe(audio, device, model, language, title, day, meeting_id, no_diarize, no_fallback, speakers, min_speakers, max_speakers):
+def transcribe(audio, backend, device, model, language, title, day, meeting_id, no_diarize, no_fallback, speakers, min_speakers, max_speakers):
     from meetscribe import pipeline
     from meetscribe.store import DuplicateMeetingError
     job = pipeline.TranscribeJob(
-        get_store(), audio, device, language, model=model, title=title, day=day.date() if day else None,
+        get_store(), audio, device, language, model=model, backend=backend, title=title, day=day.date() if day else None,
         meeting_id=meeting_id, diarize=not no_diarize, fallback=not no_fallback,
         speakers=speakers, min_speakers=min_speakers, max_speakers=max_speakers,
     )
@@ -227,7 +314,7 @@ def transcribe(audio, device, model, language, title, day, meeting_id, no_diariz
         raise click.ClickException("Keine Sprache erkannt, nichts gespeichert.")
     click.echo(
         f"{result['meeting_id']}: {result['segments']} Segmente, {result['speakers']} Sprecher, "
-        f"Geraet angefordert: {result['requested']}, genutzt: {' -> '.join(result['used']) or '-'}"
+        f"Geraet angefordert: {result['requested']}, genutzt: {' -> '.join(result['used']) or '-'} ({result['ran']['text']})"
     )
 
 
@@ -235,18 +322,18 @@ def transcribe(audio, device, model, language, title, day, meeting_id, no_diariz
 @click.argument("audio", required=False, type=click.Path(path_type=Path))
 @click.option("--title", default=None)
 @click.option("--mic", default=None, help="dji, laptop, both oder Namensteil; Standard: DJI, sonst Laptop.")
-@click.option("--device", type=click.Choice(DEVICE_CHOICES, case_sensitive=False), envvar="MEETSCRIBE_DEVICE",
-              default="npu", show_default=True, help="Gewuenschtes Geraet; Fallback npu -> gpu -> cpu.")
+@selection_options
+@click.option("--no-fallback", is_flag=True, help="Bei Geraetefehler abbrechen statt auf die naechste Hardware auszuweichen.")
 @click.option("--speakers", type=int, default=None)
 @click.option("--no-diarize", is_flag=True, help="Keine Sprechertrennung (Sprecher UNKNOWN).")
 @click.option("--no-open", is_flag=True, help="Protokoll nicht oeffnen.")
 @click.option("--events", is_flag=True, help="Ereignisse als JSON-Zeilen auf stdout, ohne Rueckfragen und ohne Oeffnen des Protokolls.")
 @click.option("--stdin-stop", is_flag=True, help="Aufnahme beenden, sobald eine Zeile auf stdin ankommt oder stdin geschlossen wird.")
-def start(audio, title, mic, device, speakers, no_diarize, no_open, events, stdin_stop):
+def start(audio, title, mic, backend, device, model, no_fallback, speakers, no_diarize, no_open, events, stdin_stop):
     from meetscribe import pipeline
     reporter = pipeline.EventReporter() if events else None
     flow = pipeline.StartFlow(
-        get_store(), audio=audio, mic=mic, device=device, title=title, speakers=speakers,
+        get_store(), audio=audio, mic=mic, device=device, backend=backend, model=model, fallback=not no_fallback, title=title, speakers=speakers,
         diarize=not no_diarize, open_report=not no_open, tty=stdin_is_tty(), reporter=reporter, stdin_stop=stdin_stop,
     )
     with contextlib.redirect_stdout(sys.stderr) if events else contextlib.nullcontext(), pipeline.KeepAwake():

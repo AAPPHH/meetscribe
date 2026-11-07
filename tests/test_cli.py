@@ -17,7 +17,7 @@ import pytest
 import soundfile as sf
 from click.testing import CliRunner
 
-from meetscribe import cli, pipeline
+from meetscribe import backends, cli, pipeline
 from meetscribe.store import HotFile, Query, Store, make_config
 
 REAL_RECORDER = pipeline.Recorder
@@ -31,19 +31,26 @@ OFFLINE = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
 LAPTOP = {"name": "Mikrofonarray (Intel Smart Sound)", "hostapi": 0, "max_input_channels": 2, "default_samplerate": 16000.0}
 DJI = {"name": "DJI MIC MINI", "hostapi": 0, "max_input_channels": 2, "default_samplerate": 16000.0}
 ES_CONTINUOUS_SYSTEM = pipeline.AWAKE_FLAGS["continuous"] | pipeline.AWAKE_FLAGS["system_required"]
+NPU_DIR, INT8_DIR = "whisper-large-v3-turbo-fp16-ov", "whisper-large-v3-turbo-int8-ov"
+HARDWARE_ROWS = [
+    {"id": "cpu", "device": "CPU", "name": "Test CPU", "type": "integrated", "cuda": None, "backends": ["openvino", "faster-whisper"]},
+    {"id": "igpu", "device": "GPU", "name": "Test Arc", "type": "integrated", "cuda": None, "backends": ["openvino"]},
+    {"id": "npu", "device": "NPU", "name": "Test NPU", "type": "integrated", "cuda": None, "backends": ["openvino"]},
+]
 
 
-class FakeEngine:
+class FakeEngine(backends.OpenVinoEngine):
     fail_devices = ()
     constructed = []
     silent = False
 
-    def __init__(self, device, models, language, override=None):
-        self.device, self.model = device, "fake-model"
-        FakeEngine.constructed.append(device)
+    def __init__(self, step, models, language):
+        self.device, self.model = step.label, "fake-model"
+        self.hardware = step.hardware
+        FakeEngine.constructed.append(step.hardware)
 
     def transcribe(self, audio):
-        if self.device in FakeEngine.fail_devices:
+        if self.hardware in FakeEngine.fail_devices:
             raise RuntimeError("DEVICE_LOST")
         if FakeEngine.silent:
             return {"words": [], "chunks": []}
@@ -88,18 +95,21 @@ class FakeRecorder:
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     models = tmp_path / "models"
-    for spec in pipeline.MODELS.values():
-        (models / spec["dir"]).mkdir(parents=True, exist_ok=True)
-        (models / spec["dir"] / "openvino_model.xml").write_text("x")
-        (models / spec["dir"] / "openvino_model.bin").write_bytes(b"x")
+    for name in (NPU_DIR, INT8_DIR):
+        (models / name).mkdir(parents=True, exist_ok=True)
+        (models / name / "openvino_model.xml").write_text("x")
+        (models / name / "openvino_model.bin").write_bytes(b"x")
     monkeypatch.setenv("MEETSCRIBE_DATA", str(tmp_path / "data"))
     monkeypatch.setenv("MEETSCRIBE_MODELS", str(models))
-    monkeypatch.delenv("MEETSCRIBE_DEVICE", raising=False)
+    for name in ("MEETSCRIBE_DEVICE", "MEETSCRIBE_BACKEND"):
+        monkeypatch.delenv(name, raising=False)
     for name in (*OFFLINE, "HF_TOKEN"):
         monkeypatch.delenv(name, raising=False)
     FakeEngine.fail_devices, FakeEngine.constructed, FakeEngine.silent, FakeDiarizer.calls = (), [], False, []
     loaded = []
-    monkeypatch.setattr(pipeline, "WhisperEngine", FakeEngine)
+    monkeypatch.setitem(backends.ENGINES, "openvino", FakeEngine)
+    monkeypatch.setattr(backends.Hardware, "detect", classmethod(lambda cls: [dict(r, backends=list(r["backends"])) for r in HARDWARE_ROWS]))
+    monkeypatch.setattr(backends.Catalog, "installed", staticmethod(lambda backend: backend == "openvino"))
     monkeypatch.setattr(pipeline, "Diarizer", FakeDiarizer)
     monkeypatch.setattr(pipeline, "Recorder", FakeRecorder)
     FakeRecorder.started, FakeRecorder.interrupt_with = [], "signal"
@@ -132,7 +142,7 @@ def test_happy_path_transcribe_search_speakers_report_rotate(env):
     add_pyannote(env)
     result = transcribe(env, "--speakers", "2")
     assert result.exit_code == 0, result.output
-    assert "m1: 2 Segmente, 2 Sprecher" in result.output and "angefordert: NPU, genutzt: NPU" in result.output
+    assert "m1: 2 Segmente, 2 Sprecher" in result.output and "angefordert: Automatisch, genutzt: NPU" in result.output
     assert FakeDiarizer.calls == [{"speakers": 2, "min_speakers": None, "max_speakers": None}]
     assert HotFile(env["store"].hot_path("m1")).is_complete()
     first = invoke("search", "münchen")
@@ -170,11 +180,26 @@ def test_no_diarize_uses_unknown(env):
     assert invoke("sql", "SELECT DISTINCT speaker FROM segments").output.split()[-1] == "UNKNOWN"
 
 
+def clear_models(env, *names):
+    for name in names:
+        for path in (env["models"] / name).iterdir():
+            path.unlink()
+
+
 def test_missing_whisper_model_points_to_setup(env):
-    for path in (env["models"] / pipeline.MODELS["npu"]["dir"]).iterdir():
-        path.unlink()
+    clear_models(env, NPU_DIR, INT8_DIR)
     result = transcribe(env, "--no-diarize")
-    assert result.exit_code != 0 and "meetscribe setup" in result.output and env["loaded"] == []
+    assert result.exit_code != 0 and "meetscribe setup --model large-v3-turbo:fp16 --backend openvino" in result.output and env["loaded"] == []
+
+
+def test_auto_skips_hardware_without_model_and_says_so(env):
+    clear_models(env, NPU_DIR)
+    result = transcribe(env, "--no-diarize")
+    assert result.exit_code == 0, result.output
+    assert "NPU mit OpenVINO übersprungen" in result.output and "genutzt: iGPU" in result.output
+    assert FakeEngine.constructed == ["igpu"]
+    explicit = transcribe(env, "--no-diarize", "--device", "npu", meeting_id="m2")
+    assert explicit.exit_code != 0 and "fehlt" in explicit.output and FakeEngine.constructed == ["igpu"]
 
 
 def test_fallback_reported_and_per_row_device(env):
@@ -182,8 +207,8 @@ def test_fallback_reported_and_per_row_device(env):
     result = transcribe(env, "--no-diarize")
     assert result.exit_code == 0, result.output
     assert result.output.count("NPU fehlgeschlagen") == 1
-    assert "angefordert: NPU, genutzt: GPU" in result.output
-    assert invoke("sql", "SELECT DISTINCT device FROM segments").output.split()[-1] == "GPU"
+    assert "angefordert: Automatisch, genutzt: iGPU" in result.output
+    assert invoke("sql", "SELECT DISTINCT device FROM segments").output.split()[-1] == "iGPU"
 
 
 def test_no_fallback_flag_fails(env):
@@ -195,15 +220,16 @@ def test_no_fallback_flag_fails(env):
 
 
 def test_all_devices_failing_exits_nonzero_without_eos(env):
-    FakeEngine.fail_devices = ("npu", "gpu", "cpu")
+    FakeEngine.fail_devices = ("npu", "igpu", "cpu")
     result = transcribe(env, "--no-diarize")
-    assert result.exit_code != 0 and "Alle Geraete fehlgeschlagen" in result.output
+    assert result.exit_code != 0 and "Alle Geräte fehlgeschlagen" in result.output
     assert not env["store"].hot_path("m1").exists()
 
 
 def test_device_from_env_and_flag(env):
     result = invoke("transcribe", env["audio"], "--no-diarize", "--meeting-id", "b", env={"MEETSCRIBE_DEVICE": "gpu"})
-    assert "angefordert: GPU" in result.output and FakeEngine.constructed[-1] == "gpu"
+    assert "angefordert: GPU" in result.output and FakeEngine.constructed[-1] == "igpu"
+    assert result.output.count("keine dedizierte Grafikkarte") == 1
     result = invoke("transcribe", env["audio"], "--no-diarize", "--meeting-id", "c", "--device", "cpu", env={"MEETSCRIBE_DEVICE": "gpu"})
     assert "angefordert: CPU" in result.output and FakeEngine.constructed[-1] == "cpu"
 
@@ -235,11 +261,11 @@ def test_offline_env_set_for_commands_except_setup(env, monkeypatch):
         seen[repo] = (token, {name: os.environ.get(name) for name in OFFLINE})
 
     monkeypatch.setattr(pipeline.ModelSetup, "download", staticmethod(fake_download))
-    monkeypatch.setattr(pipeline.ModelSetup, "warm", lambda self, device="npu": None)
+    monkeypatch.setattr(pipeline.ModelSetup, "warm", lambda self, step: None)
     result = invoke("setup")
     assert result.exit_code == 0, result.output
-    assert set(seen) == {spec["repo"] for spec in pipeline.MODELS.values()} and len(seen) == 2
-    assert seen[pipeline.MODELS["npu"]["repo"]] == (None, {name: None for name in OFFLINE})
+    assert set(seen) == {"OpenVINO/whisper-large-v3-turbo-fp16-ov", "OpenVINO/whisper-large-v3-turbo-int8-ov"}
+    assert seen["OpenVINO/whisper-large-v3-turbo-fp16-ov"] == (None, {name: None for name in OFFLINE})
     assert "pyannote" in result.output and "fehlt" in result.output
 
 
@@ -324,8 +350,7 @@ def test_start_preflight_failure_records_nothing(env, monkeypatch):
     monkeypatch.setattr(pipeline.AudioDevices, "sounddevice_picker", staticmethod(lambda: pipeline.InputPicker([DJI], ["MME"])))
     nomic = start("--no-diarize", "--mic", "laptop")
     assert nomic.exit_code != 0 and "Kein Audio-Eingang" in nomic.output
-    for path in (env["models"] / pipeline.MODELS["npu"]["dir"]).iterdir():
-        path.unlink()
+    clear_models(env, NPU_DIR, INT8_DIR)
     nomodel = start("--no-diarize")
     assert nomodel.exit_code != 0 and "meetscribe setup" in nomodel.output
     assert FakeRecorder.started == [] and not recordings(env) and env["loaded"] == [] and not reports(env)
@@ -362,7 +387,7 @@ def test_start_ctrl_c_ends_recording_and_continues(env, monkeypatch, mode):
 
 
 def test_start_failure_after_recording_prints_retry_and_keeps_audio(env):
-    FakeEngine.fail_devices = ("npu", "gpu", "cpu")
+    FakeEngine.fail_devices = ("npu", "igpu", "cpu")
     result = start("--no-diarize", "--speakers", "2")
     assert result.exit_code == 1
     audio = recordings(env)[0]
@@ -377,7 +402,7 @@ def test_start_failure_after_recording_prints_retry_and_keeps_audio(env):
 
 
 def test_start_abort_leaves_no_partial_meeting(env):
-    FakeEngine.fail_devices = ("npu", "gpu", "cpu")
+    FakeEngine.fail_devices = ("npu", "igpu", "cpu")
     assert start("--no-diarize").exit_code == 1
     assert not env["store"].hot_files()
     FakeEngine.fail_devices = ()
@@ -398,7 +423,7 @@ def test_start_without_speech_explains_and_keeps_audio(env):
 
 
 def test_start_failure_with_spaces_quotes_retry(env):
-    FakeEngine.fail_devices = ("npu", "gpu", "cpu")
+    FakeEngine.fail_devices = ("npu", "igpu", "cpu")
     result = invoke("start", env["audio"], "--no-diarize", "--title", "Mein Treffen")
     assert result.exit_code == 1 and '--title "Mein Treffen"' in result.output and f'"{env["audio"]}"' in result.output
     assert env["audio"].exists() and FakeRecorder.started == []
@@ -515,7 +540,7 @@ def test_keep_awake_wraps_start_transcribe_and_setup(env, monkeypatch):
     assert invoke("setup").exit_code == 0
     assert calls == released
     calls.clear()
-    FakeEngine.fail_devices = ("npu", "gpu", "cpu")
+    FakeEngine.fail_devices = ("npu", "igpu", "cpu")
     assert start("--no-diarize").exit_code == 1
     assert calls == released
 
@@ -753,7 +778,7 @@ def test_json_devices_lists_inputs_and_openvino(env, monkeypatch):
     assert [d["name"] for d in data["inputs"]] == [LAPTOP["name"], DJI["name"]]
     assert data["inputs"][0] == {"index": 0, "name": LAPTOP["name"], "api": "MME", "channels": 2, "rate": 16000}
     human = invoke("devices").output
-    assert "kanaele" in human and "Intel NPU" in human
+    assert "kanaele" in human and "Test NPU" in human and "faster-whisper" in human
 
     def broken():
         raise OSError("kein Treiber")
@@ -772,11 +797,11 @@ def test_check_reports_missing_pieces_with_fixes(env, monkeypatch):
     human = invoke("check")
     assert human.exit_code == 1 and "NEIN" in human.output
     add_pyannote(env)
-    (env["models"] / pipeline.MODELS["npu"]["dir"] / "openvino_model.xml").unlink()
+    (env["models"] / NPU_DIR / "openvino_model.xml").unlink()
     monkeypatch.setattr(pipeline.shutil, "which", lambda name: None)
     rows = {r["id"]: r for r in parsed(invoke("--json", "check"))}
     assert rows["pyannote"]["ok"] and rows["hf_token"]["ok"] and not rows["ffmpeg"]["ok"] and "PATH" in rows["ffmpeg"]["fix"]
-    assert rows[f"whisper:{pipeline.MODELS['npu']['dir']}"]["ok"] is False
+    assert rows[f"whisper:{NPU_DIR}"]["ok"] is False
 
 
 def events_of(result):
@@ -869,7 +894,7 @@ def test_start_stdin_stop_ends_recording_when_stdin_closes_and_keeps_audio(env, 
 
 
 def test_start_stdin_stop_keeps_audio_when_processing_fails(env, monkeypatch):
-    FakeEngine.fail_devices = ("npu", "gpu", "cpu")
+    FakeEngine.fail_devices = ("npu", "igpu", "cpu")
     with StdinFeed(monkeypatch, b"", close=True):
         result = start("--events", "--stdin-stop", "--no-diarize")
     assert result.exit_code == 1
@@ -1070,18 +1095,153 @@ def test_truncated_meeting_is_flagged_in_listing_and_report_and_can_be_discarded
 def test_whisper_model_needs_nonempty_graph_and_weights(tmp_path):
     folder = tmp_path / "w"
     folder.mkdir()
-    assert not pipeline.Models.whisper_ready(folder)
+    assert not backends.OpenVinoEngine.ready(folder)
     (folder / "leer.xml").write_text("")
-    assert not pipeline.Models.whisper_ready(folder)
+    assert not backends.OpenVinoEngine.ready(folder)
     (folder / "leer.xml").write_text("<net/>")
-    assert not pipeline.Models.whisper_ready(folder)
+    assert not backends.OpenVinoEngine.ready(folder)
     (folder / "leer.bin").write_bytes(b"")
-    assert not pipeline.Models.whisper_ready(folder)
+    assert not backends.OpenVinoEngine.ready(folder)
     (folder / "leer.bin").write_bytes(b"w")
-    assert pipeline.Models.whisper_ready(folder)
+    assert backends.OpenVinoEngine.ready(folder)
 
 
 def test_check_marks_speaker_rows_as_diarize_scope(env):
     rows = {r["id"]: r for r in parsed(invoke("--json", "check"))}
     assert rows["pyannote"]["scope"] == rows["hf_token"]["scope"] == "diarize"
     assert rows["ffmpeg"]["scope"] is None
+
+
+def test_start_events_carry_the_plan_and_the_real_hardware(env):
+    events = events_of(start("--events", "--no-diarize", "--device", "igpu", env["audio"]))
+    assert names(events) == ["preflight", "transcribing", "done"]
+    assert {k: events[1][k] for k in ("backend", "device", "model", "variant")} == {"backend": "openvino", "device": "iGPU", "model": "large-v3-turbo", "variant": "int8"}
+    ran = events[2]["ran"]
+    assert ran["devices"] == ["iGPU"] and ran["backend"] == "openvino" and ran["requested"] == "iGPU" and ran["fallback"] is False
+    assert ran["text"] == "iGPU · large-v3-turbo · OpenVINO" and ran["stored"] == ["fake-model"]
+
+
+def test_start_events_show_a_fallback_as_warning_and_in_the_result(env):
+    FakeEngine.fail_devices = ("npu",)
+    events = events_of(start("--events", "--no-diarize", env["audio"]))
+    warning = next(e for e in events if e["event"] == "warning")
+    assert "NPU fehlgeschlagen" in warning["message"] and "Rückfall auf iGPU" in warning["message"]
+    ran = events[-1]["ran"]
+    assert ran["fallback"] is True and ran["devices"] == ["iGPU"] and ran["requested"] == "Automatisch"
+    assert ran["text"].startswith("iGPU · ")
+
+
+def test_start_refuses_impossible_choices_before_recording(env, monkeypatch):
+    uninstalled = start("--no-diarize", "--backend", "faster-whisper", "--device", "cpu")
+    assert uninstalled.exit_code != 0 and "faster-whisper ist nicht installiert. Installieren mit: uv sync --extra faster-whisper" in uninstalled.output
+    monkeypatch.setattr(backends.Catalog, "installed", staticmethod(lambda backend: True))
+    cases = (
+        (("--device", "npu", "--model", "large-v3-turbo:int8"), "int8 läuft auf der NPU nicht"),
+        (("--backend", "faster-whisper", "--device", "gpu"), "Keine NVIDIA-Karte (CUDA) gefunden"),
+        (("--backend", "faster-whisper", "--device", "npu"), "nur auf der CPU und auf NVIDIA-Karten"),
+        (("--model", "riesig"), "Unbekanntes Modell 'riesig'"),
+    )
+    for flags, reason in cases:
+        result = start("--no-diarize", *flags)
+        assert result.exit_code != 0 and reason in result.output, (flags, result.output)
+    refused = events_of(start("--events", "--no-diarize", "--backend", "faster-whisper", "--device", "gpu"))
+    assert names(refused) == ["preflight", "error"] and "NVIDIA" in refused[1]["message"]
+    assert FakeRecorder.started == [] and not recordings(env) and FakeEngine.constructed == []
+
+
+def test_start_no_fallback_flag_and_choices_reach_the_retry_command(env):
+    FakeEngine.fail_devices = ("npu", "igpu", "cpu")
+    events = events_of(start("--events", "--no-diarize", "--device", "igpu", "--model", "large-v3-turbo:int8", "--no-fallback", env["audio"]))
+    error = events[-1]
+    assert error["event"] == "error" and FakeEngine.constructed == ["igpu"]
+    assert "--device igpu" in error["retry"] and "--model large-v3-turbo:int8" in error["retry"] and "--no-fallback" in error["retry"]
+    assert "--backend" not in error["retry"]
+
+
+def test_legacy_gpu_choice_keeps_working_from_env_and_flag(env):
+    result = start("--no-diarize", "--no-open", env["audio"], env={"MEETSCRIBE_DEVICE": "gpu"})
+    assert result.exit_code == 0, result.output
+    assert result.output.count("keine dedizierte Grafikkarte") == 1 and FakeEngine.constructed == ["igpu"]
+    again = start("--no-diarize", "--no-open", "--device", "gpu", env["audio"])
+    assert again.output.count("keine dedizierte Grafikkarte") == 1
+
+
+def test_backend_choice_from_env_and_the_default_backend_is_stored(env):
+    result = invoke("transcribe", env["audio"], "--no-diarize", "--meeting-id", "m1", env={"MEETSCRIBE_BACKEND": "openvino"})
+    assert result.exit_code == 0, result.output
+    assert invoke("sql", "SELECT DISTINCT backend FROM segments").output.split()[-1] == "openvino"
+    assert "openvino" in parsed(invoke("--json", "sql", "SELECT backend FROM segments"))["rows"][0]
+    assert "**Backend:** openvino" in invoke("report").output
+
+
+def test_models_command_lists_catalog_with_state_size_and_fit(env):
+    text = invoke("models")
+    assert text.exit_code == 0, text.output
+    lines = {tuple(line.split()[:3]): line for line in text.output.splitlines() if line.split()[:1] and line.split()[0] in backends.CATALOG["models"]}
+    turbo = lines[("large-v3-turbo", "openvino", "fp16")].split()
+    assert turbo[3:5] == ["1628", "MB"] and turbo[5] == "ja"
+    assert "ungeprüft" in lines[("small", "openvino", "fp16")] and "nein" in lines[("small", "faster-whisper", "ct2")]
+    data = parsed(invoke("models", "--json"))
+    assert data["default_model"] == "large-v3-turbo" and len(data["models"]) == 18 and len(data["choices"]) == 105
+    assert [b["id"] for b in data["backends"]] == ["openvino", "faster-whisper"] and data["backends"][1]["installed"] is False
+    assert [h["id"] for h in data["hardware"]] == ["npu", "gpu", "igpu", "cpu"]
+    assert data["hardware"][1]["present"] is False and "dedizierte" in data["hardware"][1]["reason"] and data["hardware"][0]["present"] is True
+    assert parsed(invoke("--json", "models"))["default_model"] == "large-v3-turbo"
+    auto = next(c for c in data["choices"] if (c["backend"], c["hardware"], c["model"]) == ("auto", "auto", "auto"))
+    assert auto["ok"] and auto["resolved"]["device"] == "NPU" and auto["installed"] is True
+
+
+def test_devices_json_reports_hardware_with_type_and_serving_backends(env, monkeypatch):
+    monkeypatch.setattr(pipeline.AudioDevices, "openvino_devices", staticmethod(lambda: []))
+    data = parsed(invoke("devices", "--json"))
+    by = {r["device"]: r for r in data["hardware"]}
+    assert by["GPU"]["id"] == "igpu" and by["GPU"]["type"] == "integrated" and by["CPU"]["backends"] == ["openvino", "faster-whisper"]
+    assert [k["present"] for k in data["kinds"]] == [True, False, True, True]
+    assert data["backends"][0]["installed"] is True and "uv sync --extra faster-whisper" in data["backends"][1]["reason"]
+    assert parsed(invoke("--json", "devices"))["hardware"] == data["hardware"]
+
+
+def fake_download(seen):
+    def download(repo, target, token=None):
+        seen.append(repo)
+        target.mkdir(parents=True, exist_ok=True)
+        for name in ("openvino_model.xml", "openvino_model.bin"):
+            (target / name).write_bytes(b"x" * 10)
+
+    return staticmethod(download)
+
+
+def test_setup_model_downloads_only_that_model(env, monkeypatch):
+    seen, warmed = [], []
+    monkeypatch.setattr(pipeline.ModelSetup, "download", fake_download(seen))
+    monkeypatch.setattr(pipeline.ModelSetup, "warm", lambda self, step: warmed.append(step))
+    result = invoke("setup", "--model", "small", "--device", "cpu")
+    assert result.exit_code == 0, result.output
+    assert seen == ["OpenVINO/whisper-small-int8-ov"] and warmed == [] and "pyannote" not in result.output
+    assert (env["models"] / "whisper-small-int8-ov" / "openvino_model.xml").is_file()
+    assert invoke("setup", "--model", "riesig").exit_code != 0
+
+
+def test_setup_events_stream_progress_then_done_or_error(env, monkeypatch):
+    seen = []
+    monkeypatch.setattr(pipeline.ModelSetup, "download", fake_download(seen))
+    done = invoke("setup", "--events", "--model", "tiny:fp16")
+    events = events_of(done)
+    assert names(events)[-1] == "done" and events[-1]["messages"][0].startswith("whisper OpenVINO/whisper-tiny-fp16-ov: ok")
+    assert any(e["event"] == "download" and e["repo"] == "OpenVINO/whisper-tiny-fp16-ov" and e["total"] == 84_000_000 for e in events)
+    assert all(line.isascii() for line in done.stdout.splitlines())
+    monkeypatch.setattr(pipeline.ModelSetup, "download", staticmethod(lambda repo, target, token=None: (_ for _ in ()).throw(OSError("Netz nicht erreichbar"))))
+    failed = invoke("setup", "--events", "--model", "base:fp16")
+    last = events_of(failed)[-1]
+    assert failed.exit_code == 1 and last["event"] == "error" and "Netz nicht erreichbar" in last["detail"]
+    unknown = invoke("setup", "--events", "--model", "riesig")
+    assert unknown.exit_code == 1 and "Unbekanntes Modell" in events_of(unknown)[-1]["message"]
+
+
+def test_setup_without_model_does_what_it_did_before(env, monkeypatch):
+    seen, warmed = [], []
+    monkeypatch.setattr(pipeline.ModelSetup, "download", fake_download(seen))
+    monkeypatch.setattr(pipeline.ModelSetup, "warm", lambda self, step: warmed.append(step.hardware))
+    result = invoke("setup")
+    assert result.exit_code == 0 and seen == ["OpenVINO/whisper-large-v3-turbo-fp16-ov", "OpenVINO/whisper-large-v3-turbo-int8-ov"]
+    assert warmed == ["npu"] and "pyannote" in result.output

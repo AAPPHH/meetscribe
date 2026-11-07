@@ -11,7 +11,10 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from meetscribe import pipeline
+from pathlib import Path
+
+from meetscribe import backends, pipeline
+from meetscribe.backends import Step
 from meetscribe.pipeline import (
     ASRFailure, ASRRunner, PipelineError, Aligner, AudioError, AudioLoader, DeviceError, EventReporter, Heartbeat, InputPicker, Interrupt, KeepAwake, Mixer, Models, Naming,
     RecordingSession, RunLock, StdinWatcher, TranscribeJob, Transcriber, Windows,
@@ -19,6 +22,7 @@ from meetscribe.pipeline import (
 from meetscribe.store import HotFile, Query, ReportFile, Store, make_config
 
 RATE = 16000
+NPU_ROWS = [{"id": "npu", "device": "NPU", "name": "Test NPU", "type": "integrated", "cuda": None, "backends": ["openvino"]}]
 DEVICES = [
     {"name": "Mikrofonarray (Intel® Smart Sound Technologie)", "hostapi": 0, "max_input_channels": 2, "default_samplerate": 44100.0},
     {"name": "Mikrofonarray (Intel® Smart Sound Technologie)", "hostapi": 1, "max_input_channels": 2, "default_samplerate": 48000.0},
@@ -49,13 +53,21 @@ def small_windows():
     return Windows(window_s=2.0, search_s=0.2, frame_s=0.01, rate=RATE)
 
 
+def step(kind):
+    return Step("openvino", kind, {"device": kind.upper(), "cuda": None}, "fp16", {"mb": 1}, Path("x"), True, "ok")
+
+
+STEPS = [step(kind) for kind in ("npu", "igpu", "cpu")]
+
+
 class FakeEngine:
     calls = 0
+    backend = "openvino"
 
-    def __init__(self, device, fail_on=(), fail_construct=False):
+    def __init__(self, step, fail_on=(), fail_construct=False):
         if fail_construct:
             raise RuntimeError("compile failed\nsecond line")
-        self.device, self.model, self.fail_on = device, f"fake-{device}", fail_on
+        self.device, self.model, self.fail_on = step.label, f"fake-{step.hardware}", fail_on
 
     def transcribe(self, audio):
         FakeEngine.calls += 1
@@ -74,8 +86,8 @@ def store(tmp_path):
     return Store(make_config(tmp_path / "data"))
 
 
-def run_windows(store, factory, devices=("npu", "gpu", "cpu"), fallback=True, audio=None, turns=()):
-    runner = ASRRunner(devices, factory, fallback)
+def run_windows(store, factory, steps=STEPS, fallback=True, audio=None, turns=()):
+    runner = ASRRunner(steps, factory, fallback)
     transcriber = Transcriber(runner, windows=small_windows())
     audio = noise(5.0) if audio is None else audio
     with store.writer("m1", title="t", meeting_date="2026-01-02", language="de") as writer:
@@ -145,23 +157,24 @@ def test_aligner_overlapping_turns_sum_per_speaker():
 
 
 def test_fallback_mid_run_keeps_rows_and_device(store, capfd):
-    def factory(device):
-        return FakeEngine(device, fail_on=(2,) if device == "npu" else ())
+    def factory(step):
+        return FakeEngine(step, fail_on=(2,) if step.hardware == "npu" else ())
 
     summary, _ = run_windows(store, factory)
     err = capfd.readouterr().err.strip().splitlines()
-    assert len(err) == 1 and "NPU" in err[0] and "DEVICE_LOST" in err[0]
-    assert summary == {"segments": 3, "speakers": 1, "used": ["NPU", "GPU"]}
+    assert len(err) == 1 and "NPU" in err[0] and "DEVICE_LOST" in err[0] and "Rückfall auf iGPU (OpenVINO)" in err[0]
+    assert summary == {"segments": 3, "speakers": 1, "used": ["NPU", "iGPU"], "engines": [("openvino", "fake-npu"), ("openvino", "fake-igpu")]}
     assert HotFile(store.hot_path("m1")).is_complete()
-    rows = Query(store).execute("SELECT seg_id, start_s, device, model FROM segments ORDER BY seg_id")[1]
-    assert [r[2] for r in rows] == ["NPU", "GPU", "GPU"]
-    assert [r[3] for r in rows] == ["fake-npu", "fake-gpu", "fake-gpu"]
+    rows = Query(store).execute("SELECT seg_id, start_s, device, model, backend FROM segments ORDER BY seg_id")[1]
+    assert [r[2] for r in rows] == ["NPU", "iGPU", "iGPU"]
+    assert [r[3] for r in rows] == ["fake-npu", "fake-igpu", "fake-igpu"]
+    assert {r[4] for r in rows} == {"openvino"}
     starts = [r[1] for r in rows]
     assert starts == sorted(starts) and starts[1] > 2.0 and starts[2] > 4.0
 
 
 def test_fallback_on_construction_failure(store, capfd):
-    summary, _ = run_windows(store, lambda d: FakeEngine(d, fail_construct=d in ("npu", "gpu")))
+    summary, _ = run_windows(store, lambda s: FakeEngine(s, fail_construct=s.hardware in ("npu", "igpu")))
     assert len(capfd.readouterr().err.strip().splitlines()) == 2
     assert summary["used"] == ["CPU"]
     assert {r[0] for r in Query(store).execute("SELECT device FROM segments")[1]} == {"CPU"}
@@ -169,7 +182,7 @@ def test_fallback_on_construction_failure(store, capfd):
 
 def test_no_fallback_fails_and_keeps_earlier_rows(store, capfd):
     with pytest.raises(ASRFailure):
-        run_windows(store, lambda d: FakeEngine(d, fail_on=(2,)), devices=("npu",), fallback=False)
+        run_windows(store, lambda s: FakeEngine(s, fail_on=(2,)), steps=STEPS[:1], fallback=False)
     assert len(capfd.readouterr().err.strip().splitlines()) == 1
     table, complete = HotFile(store.hot_path("m1")).read()
     assert not complete and table.num_rows == 1
@@ -177,7 +190,7 @@ def test_no_fallback_fails_and_keeps_earlier_rows(store, capfd):
 
 def test_all_devices_fail_leaves_no_eos(store, capfd):
     with pytest.raises(ASRFailure):
-        run_windows(store, lambda d: FakeEngine(d, fail_construct=True))
+        run_windows(store, lambda s: FakeEngine(s, fail_construct=True))
     assert len(capfd.readouterr().err.strip().splitlines()) == 3
     assert not HotFile(store.hot_path("m1")).is_complete()
 
@@ -195,25 +208,15 @@ def test_words_fall_back_to_chunks():
 
 def test_silent_window_skipped(store):
     audio = np.concatenate([noise(2.0), np.zeros(2 * RATE, dtype="float32"), noise(1.0)])
-    summary, _ = run_windows(store, lambda d: FakeEngine(d), audio=audio)
+    summary, _ = run_windows(store, lambda s: FakeEngine(s), audio=audio)
     assert summary["segments"] == 2 and FakeEngine.calls == 2
-
-
-@pytest.mark.parametrize("device,fallback,expected", [
-    ("npu", True, ("npu", "gpu", "cpu")), ("gpu", True, ("gpu", "cpu")), ("cpu", True, ("cpu",)), ("gpu", False, ("gpu",)),
-])
-def test_device_chain(tmp_path, device, fallback, expected):
-    job = TranscribeJob(None, "a.wav", device.upper(), "de", models=Models(tmp_path), fallback=fallback)
-    assert job.chain == expected
 
 
 def test_model_paths(tmp_path):
     models = Models(tmp_path)
-    assert models.whisper_dir("npu") == tmp_path / pipeline.MODELS["npu"]["dir"]
-    assert "fp16" in pipeline.MODELS["npu"]["dir"] and "int8" in pipeline.MODELS["gpu"]["dir"] == pipeline.MODELS["cpu"]["dir"]
-    assert models.whisper_dir("cpu", "custom") == tmp_path / "custom"
     assert models.cache_dir == tmp_path / "ov_cache"
     assert not models.diarization_ready()
+    assert not models.ready("openvino", tmp_path / "missing")
 
 
 def write_snapshot(models, config, files=()):
@@ -276,13 +279,13 @@ def test_diarization_ready_without_model_references_or_config(tmp_path):
 def test_interrupted_diarization_setup_fails_preflight(tmp_path):
     models = Models(tmp_path)
     write_snapshot(models, SNAPSHOT_YAML)
-    (tmp_path / pipeline.MODELS["npu"]["dir"]).mkdir()
-    (tmp_path / pipeline.MODELS["npu"]["dir"] / "m.xml").write_text("x")
-    (tmp_path / pipeline.MODELS["npu"]["dir"] / "m.bin").write_bytes(b"x")
+    (tmp_path / "whisper-large-v3-turbo-fp16-ov").mkdir()
+    (tmp_path / "whisper-large-v3-turbo-fp16-ov" / "m.xml").write_text("x")
+    (tmp_path / "whisper-large-v3-turbo-fp16-ov" / "m.bin").write_bytes(b"x")
     with pytest.raises(PipelineError, match="Diarisierungsmodell fehlt.*unvollständig.*Sprecher trennen.*--no-diarize.*setup") as caught:
-        TranscribeJob(None, "a.wav", "npu", "de", models=models).check()
+        TranscribeJob(None, "a.wav", "npu", "de", models=models, hardware=backends.Hardware(NPU_ROWS)).check()
     assert "segmentation" in caught.value.detail and "segmentation" not in caught.value.message and "segmentation" in caught.value.format_message()
-    TranscribeJob(None, "a.wav", "npu", "de", models=models, diarize=False).check()
+    TranscribeJob(None, "a.wav", "npu", "de", models=models, diarize=False, hardware=backends.Hardware(NPU_ROWS)).check()
 
 
 def test_naming_slug_and_suffix(store):

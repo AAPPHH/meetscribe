@@ -19,15 +19,11 @@ import click
 import numpy as np
 import soundfile as sf
 
+from meetscribe import backends
+from meetscribe.backends import CATALOG, Catalog, Hardware, Selection
 from meetscribe.store import PROJECT_ROOT, Json, Query, Report, ReportFile, as_date
 
-DEVICES = ("npu", "gpu", "cpu")
-WHISPER_INT8 = {"repo": "OpenVINO/whisper-large-v3-turbo-int8-ov", "dir": "whisper-large-v3-turbo-int8-ov"}
-WHISPER_FP16 = {"repo": "OpenVINO/whisper-large-v3-turbo-fp16-ov", "dir": "whisper-large-v3-turbo-fp16-ov"}
-MODELS = {"npu": dict(WHISPER_FP16), "gpu": dict(WHISPER_INT8), "cpu": dict(WHISPER_INT8)}
 SETTINGS = {
-    "default_device": "npu",
-    "device_order": DEVICES,
     "language": "de",
     "sample_rate": 16000,
     "window_s": 300.0,
@@ -40,6 +36,7 @@ SETTINGS = {
     "unknown_speaker": "UNKNOWN",
     "models_env": "MEETSCRIBE_MODELS",
     "cache_subdir": "ov_cache",
+    "download_poll_s": 0.5,
     "reason_chars": 400,
     "detail_chars": 4000,
     "diarization": {
@@ -115,16 +112,9 @@ class Models:
     def diarization_dir(self):
         return self.root / SETTINGS["diarization"]["dir"]
 
-    def whisper_dir(self, device, override=None):
-        if override:
-            path = Path(override)
-            return path if path.exists() else self.root / override
-        return self.root / MODELS[device]["dir"]
-
     @staticmethod
-    def whisper_ready(path):
-        graphs = list(path.glob("*.xml")) if path.is_dir() else []
-        return bool(graphs) and all(g.stat().st_size and g.with_suffix(".bin").is_file() and g.with_suffix(".bin").stat().st_size for g in graphs)
+    def ready(backend, path):
+        return backends.ENGINES[backend].ready(path)
 
     def diarization_missing(self):
         diar = SETTINGS["diarization"]
@@ -150,26 +140,89 @@ class Models:
         return not self.diarization_missing()
 
 
+class DownloadProgress:
+    def __init__(self, target, total_mb, reporter, repo):
+        self.target, self.total, self.reporter, self.repo = Path(target), int((total_mb or 0) * 1_000_000), reporter, repo
+        self.done = threading.Event()
+        self.thread = None
+        self.last = -1
+
+    def size(self):
+        return sum(f.stat().st_size for f in self.target.rglob("*") if f.is_file()) if self.target.is_dir() else 0
+
+    def emit(self):
+        size = self.size()
+        if size != self.last:
+            self.last = size
+            self.reporter.event("download", repo=self.repo, bytes=size, total=self.total)
+
+    def _run(self):
+        while not self.done.wait(SETTINGS["download_poll_s"]):
+            self.emit()
+
+    def __enter__(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.done.set()
+        self.thread.join()
+        if exc_type is None:
+            self.emit()
+        return False
+
+
 class ModelSetup:
-    def __init__(self, models, token=None):
+    def __init__(self, models, token=None, reporter=None):
         self.models = models
         self.token = token
+        self.reporter = reporter or Reporter()
 
     @staticmethod
     def download(repo, target, token=None):
         from huggingface_hub import snapshot_download
         snapshot_download(repo_id=repo, local_dir=str(target), token=token)
 
-    def run(self):
+    def targets(self, model=None, backend=None, device=None):
+        backend = (backend or "auto").lower()
+        backend = CATALOG["backend_order"][0] if backend == "auto" else backend
+        if backend not in CATALOG["backends"]:
+            raise backends.SelectionError(f"Unbekanntes Backend '{backend}'. Verfügbar: {', '.join(CATALOG['backend_order'])}.")
+        name, variant = Selection.split(model or CATALOG["default_model"])
+        name = CATALOG["default_model"] if name == "auto" else name
+        if name not in CATALOG["models"]:
+            raise backends.SelectionError(f"Unbekanntes Modell '{name}'. Verfügbar: {', '.join(CATALOG['models'])}.")
+        variants = Catalog.variants(backend, name)
+        if variant and variant not in variants:
+            raise backends.SelectionError(f"Unbekannte Variante '{variant}' für {name}. Verfügbar: {', '.join(variants)}.")
+        kinds = [device] if device and device != "auto" else list(CATALOG["hardware_order"])
+        chosen = [variant] if variant else [spec["default"] for kind in kinds if (spec := Catalog.spec(backend, kind))]
+        return backend, name, list(dict.fromkeys(chosen))
+
+    def fetch(self, backend, model, variant):
+        entry = Catalog.entry(backend, model, variant)
+        target = self.models.root / Catalog.dir_name(entry)
+        with DownloadProgress(target, entry["mb"], self.reporter, entry["repo"]):
+            self.download(entry["repo"], target)
+        if not self.models.ready(backend, target):
+            raise PipelineError(f"Der Download von {entry['repo']} ist unvollständig: {target}")
+        return entry["repo"], target
+
+    def run(self, model=None, backend=None, device=None):
         messages, failed = [], False
-        for repo, name in {spec["repo"]: spec["dir"] for spec in MODELS.values()}.items():
-            target = self.models.root / name
+        explicit = any((model, backend, device))
+        backend, name, variants = self.targets(model, backend, device)
+        for variant in variants:
+            repo = Catalog.entry(backend, name, variant)["repo"]
             try:
-                self.download(repo, target)
+                _, target = self.fetch(backend, name, variant)
                 messages.append(f"whisper {repo}: ok ({target})")
             except Exception as exc:
                 failed = True
                 messages.append(f"whisper {repo}: FEHLER {Reason.of(exc)}")
+        if explicit:
+            return messages, failed
         diar = SETTINGS["diarization"]
         if self.token:
             try:
@@ -184,8 +237,8 @@ class ModelSetup:
             )
         return messages, failed
 
-    def warm(self, device="npu"):
-        engine = WhisperEngine(device, self.models, SETTINGS["language"])
+    def warm(self, step):
+        engine = backends.ENGINES[step.backend](step, self.models, SETTINGS["language"])
         engine.transcribe(np.zeros(SETTINGS["sample_rate"], dtype="float32"))
 
 
@@ -410,31 +463,10 @@ class Aligner:
         return segments
 
 
-class WhisperEngine:
-    def __init__(self, device, models, language, override=None):
-        path = models.whisper_dir(device, override)
-        if not Models.whisper_ready(path):
-            raise FileNotFoundError(f"Modell fehlt: {path}")
-        import openvino_genai
-        self.device, self.language, self.model = device, language, path.name
-        self.pipe = openvino_genai.WhisperPipeline(
-            str(path), device.upper(), word_timestamps=True, CACHE_DIR=str(models.cache_dir)
-        )
-
-    def transcribe(self, audio):
-        result = self.pipe.generate(
-            audio.tolist(), language=f"<|{self.language}|>", task="transcribe", return_timestamps=True, word_timestamps=True
-        )
-        return {
-            "words": [{"text": w.word, "start_s": w.start_ts, "end_s": w.end_ts} for w in (result.words or [])],
-            "chunks": [{"text": c.text, "start_s": c.start_ts, "end_s": c.end_ts} for c in (result.chunks or [])],
-        }
-
-
 class ASRRunner:
-    def __init__(self, devices, factory, fallback=True, reporter=None):
+    def __init__(self, steps, factory, fallback=True, reporter=None):
         self.reporter = reporter or Reporter()
-        self.devices = list(devices)
+        self.steps = list(steps)
         self.factory = factory
         self.fallback = fallback
         self.index = 0
@@ -443,23 +475,26 @@ class ASRRunner:
 
     def transcribe(self, audio):
         while True:
-            device = self.devices[self.index]
+            step = self.steps[self.index]
             try:
                 if self.engine is None:
-                    self.engine = self.factory(device)
+                    self.engine = self.factory(step)
                 result = self.engine.transcribe(audio)
             except Exception as exc:
                 self.engine = None
                 gc.collect()
-                self.reporter.warn(f"{device.upper()} fehlgeschlagen: {Reason.of(exc)}", prefix="")
                 self.index += 1
                 if not self.fallback:
-                    raise ASRFailure(f"Transkription auf {device.upper()} fehlgeschlagen (--no-fallback).") from exc
-                if self.index >= len(self.devices):
-                    raise ASRFailure("Alle Geraete fehlgeschlagen: " + ", ".join(d.upper() for d in self.devices)) from exc
+                    self.reporter.warn(f"{step.label} fehlgeschlagen: {Reason.of(exc)}", prefix="")
+                    raise ASRFailure(f"Transkription auf {step.label} fehlgeschlagen (--no-fallback).") from exc
+                if self.index >= len(self.steps):
+                    self.reporter.warn(f"{step.label} fehlgeschlagen: {Reason.of(exc)}", prefix="")
+                    raise ASRFailure("Alle Geräte fehlgeschlagen: " + ", ".join(s.label for s in self.steps)) from exc
+                following = self.steps[self.index]
+                self.reporter.warn(f"{step.label} fehlgeschlagen: {Reason.of(exc)}. Rückfall auf {following.label} ({Catalog.backend_label(following.backend)}).", prefix="")
                 continue
-            if device not in self.used:
-                self.used.append(device)
+            if step.label not in self.used:
+                self.used.append(step.label)
             return self.engine, result
 
 
@@ -484,7 +519,7 @@ class Transcriber:
         return words
 
     def run(self, audio, turns, writer):
-        rate, floor, count, speakers = self.windows.rate, 0.0, 0, set()
+        rate, floor, count, speakers, ran = self.windows.rate, 0.0, 0, set(), []
         for first, last in self.windows.split(audio):
             chunk = audio[first:last]
             if float(np.max(np.abs(chunk))) < SETTINGS["silence_peak"]:
@@ -492,13 +527,15 @@ class Transcriber:
             engine, result = self.runner.transcribe(chunk)
             words = self.words(result, first / rate, last / rate, floor)
             segments = self.aligner.align(words, turns)
+            if (engine.backend, engine.model) not in ran:
+                ran.append((engine.backend, engine.model))
             for segment in segments:
-                segment.update(device=engine.device.upper(), model=engine.model)
+                segment.update(device=engine.device, model=engine.model, backend=engine.backend)
             count += writer.append(segments)
             speakers.update(segment["speaker"] for segment in segments)
             if words:
                 floor = words[-1]["start_s"]
-        return {"segments": count, "speakers": len(speakers), "used": [d.upper() for d in self.runner.used]}
+        return {"segments": count, "speakers": len(speakers), "used": list(self.runner.used), "engines": ran}
 
 
 class Diarizer:
@@ -550,11 +587,13 @@ class Naming:
 
 class TranscribeJob:
     def __init__(self, store, audio, device, language, models=None, model=None, title=None, day=None, meeting_id=None,
-                 diarize=True, fallback=True, speakers=None, min_speakers=None, max_speakers=None, reporter=None):
-        self.reporter = reporter
+                 diarize=True, fallback=True, speakers=None, min_speakers=None, max_speakers=None, reporter=None,
+                 backend="auto", hardware=None):
+        self.reporter = reporter or Reporter()
         self.store = store
         self.audio = Path(audio)
-        self.device = device.lower()
+        self.device = (device or "auto").lower()
+        self.backend = (backend or "auto").lower()
         self.language = language
         self.models = models or Models()
         self.model = model
@@ -563,12 +602,18 @@ class TranscribeJob:
         self.requested_id = meeting_id
         self.diarize = diarize
         self.fallback = fallback
+        self.hardware = hardware
         self.speaker_options = {"speakers": speakers, "min_speakers": min_speakers, "max_speakers": max_speakers}
+        self.cached = None
 
     @property
-    def chain(self):
-        order = SETTINGS["device_order"]
-        return order[order.index(self.device):] if self.fallback else (self.device,)
+    def plan(self):
+        if self.cached is None:
+            self.hardware = self.hardware or Hardware()
+            self.cached = Selection(self.models, self.hardware).resolve(self.backend, self.device, self.model or "auto", self.fallback)
+            for notice in self.cached.notices:
+                self.reporter.warn(notice, prefix="")
+        return self.cached
 
     def check(self):
         missing = self.models.diarization_missing() if self.diarize else []
@@ -581,9 +626,30 @@ class TranscribeJob:
                 f"Fehlende Dateien: {', '.join(str(p) for p in missing)}\n"
                 f"Für 'meetscribe setup' den Zugriff auf {diar['repo']} bei huggingface.co akzeptieren und {diar['token_env']} setzen.",
             )
-        path = self.models.whisper_dir(self.device, self.model)
-        if not Models.whisper_ready(path):
-            raise PipelineError(f"Whisper-Modell fehlt ({path}). Bitte 'meetscribe setup' ausführen.")
+        step = self.plan.primary
+        if not step.installed:
+            variant = "" if step.variant == "custom" else f":{step.variant}"
+            raise PipelineError(
+                f"Das Modell {self.plan.model} ({Catalog.backend_label(step.backend)}, {step.variant}) fehlt: {step.path}. "
+                f"Bitte 'meetscribe setup --model {self.plan.model}{variant} --backend {step.backend}' ausführen."
+            )
+
+    def announce(self):
+        step = self.plan.primary
+        return {"backend": step.backend, "device": step.label, "model": self.plan.model, "variant": step.variant}
+
+    def ran(self, summary):
+        step = self.plan.primary
+        used = summary["used"]
+        fallback = bool(used) and used[0] != step.label or len(used) > 1
+        backends_used = list(dict.fromkeys(b for b, _ in summary["engines"]))
+        text = " · ".join([
+            " → ".join(used) or step.label, self.plan.model, " + ".join(Catalog.backend_label(b) for b in backends_used) or Catalog.backend_label(step.backend),
+        ])
+        return {
+            "backend": step.backend, "backends": backends_used, "devices": used, "model": self.plan.model, "variant": step.variant,
+            "stored": [m for _, m in summary["engines"]], "requested": self.plan.requested, "fallback": fallback, "text": text,
+        }
 
     def run(self):
         self.check()
@@ -597,12 +663,12 @@ class TranscribeJob:
         audio = AudioLoader.load(self.audio)
         turns = Diarizer(self.models).diarize(audio, **self.speaker_options) if self.diarize else []
         gc.collect()
-        runner = ASRRunner(self.chain, lambda d: WhisperEngine(d, self.models, self.language, self.model), self.fallback, self.reporter)
+        runner = ASRRunner(self.plan.chain, lambda step: backends.ENGINES[step.backend](step, self.models, self.language), self.fallback, self.reporter)
         with self.store.writer(meeting_id, title=self.title, meeting_date=self.day, language=self.language, discard_on_error=True) as writer:
             summary = Transcriber(runner).run(audio, turns, writer)
         if not summary["segments"]:
             self.store.discard(meeting_id)
-        return {**summary, "meeting_id": meeting_id, "requested": self.device.upper()}
+        return {**summary, "meeting_id": meeting_id, "requested": self.plan.requested, "ran": self.ran(summary)}
 
 
 class InputPicker:
@@ -934,13 +1000,18 @@ class Heartbeat:
 
 
 class StartFlow:
-    def __init__(self, store, audio=None, mic=None, device="npu", title=None, speakers=None, diarize=True,
-                 open_report=True, tty=False, models=None, picker=None, reporter=None, stdin_stop=False):
+    def __init__(self, store, audio=None, mic=None, device="auto", title=None, speakers=None, diarize=True,
+                 open_report=True, tty=False, models=None, picker=None, reporter=None, stdin_stop=False,
+                 backend="auto", model=None, fallback=True, hardware=None):
         self.reporter = reporter or Reporter()
         self.store = store
         self.audio = Path(audio) if audio else None
         self.mic = mic
-        self.device = device.lower()
+        self.device = (device or "auto").lower()
+        self.backend = (backend or "auto").lower()
+        self.model = model
+        self.fallback = fallback
+        self.hardware = hardware
         self.title = title
         self.speakers = speakers
         self.diarize = diarize
@@ -954,11 +1025,15 @@ class StartFlow:
         self.result = None
 
     def retry_command(self, audio):
-        parts = [START["program"], "start", str(audio), "--device", self.device]
-        for flag, value in (("--title", self.title), ("--speakers", self.speakers)):
-            if value is not None:
+        parts = [START["program"], "start", str(audio)]
+        for flag, value in (("--backend", self.backend), ("--device", self.device), ("--model", self.model), ("--title", self.title), ("--speakers", self.speakers)):
+            if value is not None and value != "auto":
                 parts += [flag, str(value)]
-        parts += [flag for flag, active in (("--no-diarize", not self.diarize), ("--no-open", not self.open_report), ("--events", self.reporter.machine)) if active]
+        parts += [
+            flag for flag, active in (
+                ("--no-fallback", not self.fallback), ("--no-diarize", not self.diarize), ("--no-open", not self.open_report), ("--events", self.reporter.machine),
+            ) if active
+        ]
         return subprocess.list2cmdline(parts)
 
     def recording_path(self):
@@ -979,8 +1054,9 @@ class StartFlow:
         AudioLoader.require()
         planned = self.audio or self.recording_path()
         self.job = TranscribeJob(
-            self.store, planned, self.device, SETTINGS["language"], models=self.models, title=self.title,
-            diarize=self.diarize, speakers=self.speakers, reporter=self.reporter,
+            self.store, planned, self.device, SETTINGS["language"], models=self.models, model=self.model, title=self.title,
+            diarize=self.diarize, speakers=self.speakers, reporter=self.reporter, backend=self.backend,
+            fallback=self.fallback, hardware=self.hardware,
         )
         self.job.check()
         if self.audio is not None:
@@ -1037,7 +1113,7 @@ class StartFlow:
         self.job.audio = Path(audio)
         self.job.requested_id = Naming.meeting_id(self.store, self.job.day, self.title or self.job.audio.stem)
         started = time.monotonic()
-        self.reporter.event("transcribing", audio=str(audio), meeting_id=self.job.requested_id)
+        self.reporter.event("transcribing", audio=str(audio), meeting_id=self.job.requested_id, **self.job.announce())
         try:
             with Heartbeat(self.reporter):
                 self.result = self.job.run()
@@ -1048,7 +1124,7 @@ class StartFlow:
         result = self.result
         self.reporter.say(
             f"{result['meeting_id']}: {result['segments']} Segmente, {result['speakers']} Sprecher, "
-            f"Geraet: {' -> '.join(result['used']) or '-'}, {time.monotonic() - started:.0f} s"
+            f"Geraet: {' -> '.join(result['used']) or '-'}, {result['ran']['text']}, {time.monotonic() - started:.0f} s"
         )
         return result["meeting_id"]
 
@@ -1107,7 +1183,7 @@ class StartFlow:
             self.rotate()
             self.reporter.event(
                 "done", meeting_id=meeting_id, report=str(path), audio=str(audio), segments=self.result["segments"],
-                speakers=self.result["speakers"], labels=[{"label": l, "sample": t} for l, t in self.samples(meeting_id)],
+                speakers=self.result["speakers"], ran=self.result["ran"], labels=[{"label": l, "sample": t} for l, t in self.samples(meeting_id)],
             )
         except (Exception, KeyboardInterrupt) as exc:
             self.fail(audio, exc, saved=meeting_id)
@@ -1141,10 +1217,12 @@ class SetupCheck:
         diar = SETTINGS["diarization"]
         rows = [self.row("ffmpeg", "ffmpeg", shutil.which("ffmpeg"), "ffmpeg installieren und in den PATH aufnehmen.")]
         dirs = {}
-        for device in DEVICES:
-            dirs.setdefault(MODELS[device]["dir"], []).append(device.upper())
+        backend, model = CATALOG["backend_order"][0], CATALOG["default_model"]
+        for kind in CATALOG["hardware_order"]:
+            entry = Catalog.entry(backend, model, Catalog.spec(backend, kind)["default"])
+            dirs.setdefault(Catalog.dir_name(entry), []).append(Catalog.label(kind))
         for name, devices in dirs.items():
-            ready = Models.whisper_ready(self.models.root / name)
+            ready = self.models.ready(backend, self.models.root / name)
             rows.append(self.row(f"whisper:{name}", f"Whisper-Modell ({'/'.join(devices)})", ready, f"'meetscribe setup' ausführen; es lädt {name} nach {self.models.root}."))
         ready = self.models.diarization_ready()
         rows.append(self.row("pyannote", "pyannote-Modell (Sprechertrennung)", ready, f"Schnelle Lösung: in den Einstellungen „Sprecher trennen“ ausschalten. Dauerhaft: {diar['token_env']} setzen und 'meetscribe setup' ausführen.", "diarize"))
@@ -1157,6 +1235,10 @@ class AudioDevices:
     def sounddevice_picker():
         import sounddevice as sd
         return InputPicker([dict(d) for d in sd.query_devices()], [dict(h) for h in sd.query_hostapis()])
+
+    @staticmethod
+    def hardware_rows():
+        return Hardware().rows
 
     @staticmethod
     def openvino_devices():

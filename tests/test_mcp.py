@@ -17,7 +17,7 @@ from meetscribe.service import EngineCache, Service
 from meetscribe.store import Store, make_config
 from test_cli import FakeRecorder, env, transcribe  # noqa: F401
 from test_service import SlowEngine, fast  # noqa: F401
-from test_store import SPEAKER_WORKER, write
+from test_store import SPEAKER_WORKER, make_orphan, start_writer, write
 
 TESTS = Path(__file__).parent
 GUARD = TESTS / "socket_guard_server.py"
@@ -357,3 +357,24 @@ def test_a_missing_diarization_model_names_the_tool_argument_not_a_command_line(
         return await call.ok("transcribe_status", job=started["job"], wait_s=30)
     final = drive(app, script)
     assert final["state"] == "failed" and "diarize=false" in final["message"] and "--no-diarize" not in final["message"] + final["detail"]
+
+
+def test_a_started_server_reaps_the_orphan_of_a_hard_killed_process_but_not_a_live_writers_file(tmp_path):
+    data, log = tmp_path / "data", tmp_path / "net.log"
+    store = Store(make_config(data))
+    write(store, "m1", title="Fertig", day="2026-03-04")
+    orphan = make_orphan(store)
+    live = start_writer(store, "live")
+
+    async def session():
+        async with Client(stdio_params(data, log)) as client:
+            return (await Caller(client).ok("list_meetings"))["meetings"]
+    try:
+        meetings = anyio.run(session)
+    finally:
+        live.stdin.close()
+        live.wait(30)
+        live.stdout.close()
+    flags = {m["meeting_id"]: m["complete"] for m in meetings}
+    assert orphan not in flags and not store.hot_path(orphan).exists() and flags["m1"] is True and flags["live"] is False
+    assert not log.exists() or log.read_text() == ""

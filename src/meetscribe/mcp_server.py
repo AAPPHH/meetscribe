@@ -243,6 +243,7 @@ class McpApp:
             run.finished.wait(MCP["close_wait_s"])
 
     def run(self):
+        self.service.reap()
         threading.Thread(target=self.service.warm, daemon=True, name="warm").start()
         try:
             self.server.run("stdio")

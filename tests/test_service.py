@@ -13,6 +13,7 @@ import pytest
 from meetscribe import backends, pipeline, service
 from meetscribe.service import EngineCache, RpcServer, Service, ServiceError, Wire
 from test_cli import FakeEngine, FakeRecorder, env, transcribe, truncated_meeting  # noqa: F401
+from test_store import make_orphan, start_writer
 
 LAUNCHER = Path(__file__).parent / "fake_engine_process.py"
 
@@ -450,10 +451,33 @@ def test_a_hard_kill_during_a_run_keeps_the_audio_and_the_next_engine_cleans_up(
     assert env["audio"].exists()
     fresh = Harness(Service(env["store"]))
     fresh.handshake()
-    assert fresh.call("meeting.state", meeting_id=meeting_id)["state"] == "partial"
-    assert fresh.call("meeting.settle", meeting_id=meeting_id)["state"] == "discarded"
-    assert fresh.call("meetings") == []
+    assert fresh.call("meeting.state", meeting_id=meeting_id)["state"] == "absent"
+    assert fresh.call("meeting.settle", meeting_id=meeting_id)["state"] == "absent"
+    assert not env["store"].hot_path(meeting_id).exists() and env["audio"].exists() and fresh.call("meetings") == []
     fresh.close()
+
+
+def test_the_next_engine_reaps_a_hard_killed_orphan_keeps_the_audio_and_the_retry_gives_one_meeting(engine_process, env):
+    orphan = make_orphan(env["store"])
+    assert env["store"].incomplete() == [orphan]
+    peer = engine_process()
+    assert env["store"].incomplete() == [] and peer.call("meeting.state", meeting_id=orphan)["state"] == "absent"
+    assert env["audio"].exists()
+    audio_run(peer, env)
+    assert peer.finished()["terminal"] is True
+    meetings = peer.call("meetings")
+    assert len(meetings) == 1 and meetings[0]["complete"] is True
+
+
+def test_an_engine_started_while_another_process_writes_leaves_that_file_alone(engine_process, env):
+    writer = start_writer(env["store"])
+    try:
+        peer = engine_process()
+        assert env["store"].hot_path("orphan").exists() and peer.call("meeting.state", meeting_id="orphan")["state"] == "partial"
+    finally:
+        writer.stdin.close()
+        assert writer.wait(30) == 0
+        writer.stdout.close()
 
 
 def test_closing_the_pipe_during_processing_aborts_the_run_and_removes_the_partial_meeting(engine_process, env):

@@ -1,5 +1,8 @@
+import importlib
 import importlib.util
+import os
 import platform
+import sys
 from pathlib import Path
 
 import click
@@ -74,6 +77,22 @@ VENDOR_INTEL = ("intel", "0x8086")
 CUDA_NAME = "NVIDIA-Karte {index} (CUDA)"
 
 
+class QuietImport:
+    @staticmethod
+    def module(name):
+        if name in sys.modules:
+            return sys.modules[name]
+        previous = os.environ.get("CI")
+        os.environ["CI"] = "true"
+        try:
+            return importlib.import_module(name)
+        finally:
+            if previous is None:
+                os.environ.pop("CI", None)
+            else:
+                os.environ["CI"] = previous
+
+
 class SelectionError(click.ClickException):
     def __init__(self, message, detail=None, reason=None):
         super().__init__(message)
@@ -134,8 +153,7 @@ class Hardware:
     @classmethod
     def openvino_rows(cls):
         try:
-            import openvino as ov
-            core = ov.Core()
+            core = QuietImport.module("openvino").Core()
             names = list(core.available_devices)
         except Exception:
             return []
@@ -396,7 +414,7 @@ class OpenVinoEngine:
         return bool(graphs) and all(g.stat().st_size and g.with_suffix(".bin").is_file() and g.with_suffix(".bin").stat().st_size for g in graphs)
 
     def __init__(self, step, models, language):
-        import openvino_genai
+        openvino_genai = QuietImport.module("openvino_genai")
         self.device, self.language, self.model = step.label, language, step.path.name
         self.pipe = openvino_genai.WhisperPipeline(
             str(step.path), step.row["device"], word_timestamps=True, CACHE_DIR=str(models.cache_dir)

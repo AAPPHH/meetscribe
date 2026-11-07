@@ -342,6 +342,41 @@ def test_targets_pick_the_variants_a_model_needs(models):
             job.targets(*bad)
 
 
+FAKE_OPENVINO = (
+    "import os\n"
+    "from pathlib import Path\n"
+    "Path({seen!r}).open('a').write('{name}=' + os.environ.get('CI', '') + '\\n')\n"
+    "class Core:\n"
+    "    available_devices = ['CPU']\n"
+    "    def get_property(self, *args):\n"
+    "        return 'x'\n"
+    "class WhisperPipeline:\n"
+    "    def __init__(self, *args, **kwargs):\n"
+    "        pass\n"
+)
+
+
+def test_openvino_imports_run_with_telemetry_switched_off_and_the_environment_restored(tmp_path, monkeypatch):
+    seen = tmp_path / "seen.txt"
+    for name in ("openvino", "openvino_genai"):
+        (tmp_path / f"{name}.py").write_text(FAKE_OPENVINO.format(seen=str(seen), name=name))
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delenv("CI", raising=False)
+    assert [r["id"] for r in Hardware.openvino_rows()] == ["cpu"]
+    assert pipeline.AudioDevices.openvino_devices()[0]["device"] == "CPU"
+    models = Models(tmp_path / "m")
+    fill(models.root, "whisper-large-v3-turbo-int8-ov")
+    plan = select(models, [CPU], hardware="cpu")
+    backends.ENGINES["openvino"](plan.primary, models, "de")
+    assert seen.read_text().splitlines() == ["openvino=true", "openvino_genai=true"]
+    assert "CI" not in backends.os.environ
+    monkeypatch.setenv("CI", "false")
+    monkeypatch.delitem(sys.modules, "openvino")
+    Hardware.openvino_rows()
+    assert backends.os.environ["CI"] == "false" and seen.read_text().splitlines()[-1] == "openvino=true"
+
+
 class Recorder:
     machine = False
     broken = False

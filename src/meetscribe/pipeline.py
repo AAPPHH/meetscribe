@@ -1243,8 +1243,7 @@ class AudioDevices:
 
     @staticmethod
     def openvino_devices():
-        import openvino as ov
-        core = ov.Core()
+        core = backends.QuietImport.module("openvino").Core()
         rows = []
         for name in core.available_devices:
             try:

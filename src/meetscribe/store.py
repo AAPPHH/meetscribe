@@ -287,13 +287,13 @@ class Store:
     def reap(self):
         reaped = []
         for path in self.hot_files():
-            hold = self.hold_path(path.stem)
             try:
+                hold = self.hold_path(path.stem)
                 with FileLock(hold, LOCKS["reap_wait_s"]):
                     if not HotFile(path).is_complete():
                         path.unlink()
                         reaped.append(path.stem)
-            except (LockBusy, OSError, pa.ArrowException):
+            except (LockBusy, OSError, ValueError, pa.ArrowException):
                 continue
             self.drop(hold)
         for hold in self.hot_dir.glob("*.lock"):

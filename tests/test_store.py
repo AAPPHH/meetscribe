@@ -737,6 +737,15 @@ def test_reap_removes_a_stale_lock_and_a_legacy_partial_file_without_one(store):
     assert store.reap() == ["legacy"] and not list(store.hot_dir.iterdir())
 
 
+def test_reap_skips_a_stray_file_with_an_invalid_id_and_still_discards_the_real_orphan(store):
+    write(store, "m1")
+    shutil.copy(store.hot_path("m1"), store.hot_dir / "m1 - Kopie.arrow")
+    make_orphan(store, "zz-orphan")
+    assert store.reap() == ["zz-orphan"]
+    assert not store.hot_path("zz-orphan").exists() and not store.hold_path("zz-orphan").exists()
+    assert store.hot_path("m1").exists() and (store.hot_dir / "m1 - Kopie.arrow").exists()
+
+
 def test_a_second_writer_for_a_held_meeting_is_a_duplicate_and_the_hold_is_released_after_failure(store):
     proc = start_writer(store)
     try:

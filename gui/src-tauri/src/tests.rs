@@ -387,6 +387,21 @@ fn only_one_download_runs_at_a_time_and_none_during_a_session() {
 }
 
 #[test]
+fn no_session_starts_during_a_download() {
+    let dir = scratch("session_vs_download");
+    let state = app_state(&dir);
+    state.start_download(|| Session::spawn(fake_command("sleep", &["setup", "--events"]), Arc::new(|_, _| {}), None)).unwrap();
+    let err = state.launch(|| Session::spawn(fake_command("sleep", &["start", "--events"]), Arc::new(|_, _| {}), None)).unwrap_err();
+    assert!(err.contains("Modell-Downloads"), "{err}");
+    assert!(state.active_session().is_none());
+    state.active_download().unwrap().kill().unwrap();
+    assert!(wait_for(200, || state.active_download().is_none()));
+    state.launch(|| Session::spawn(fake_command("sleep", &["start", "--events"]), Arc::new(|_, _| {}), None)).unwrap();
+    state.active_session().unwrap().kill().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn concurrent_launches_leave_exactly_one_session() {
     let dir = scratch("launch");
     let state = Arc::new(app_state(&dir));

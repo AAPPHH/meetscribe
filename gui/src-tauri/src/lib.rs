@@ -627,6 +627,10 @@ impl AppState {
         if slot.as_ref().is_some_and(|s| s.active()) {
             return Err("Es läuft bereits eine Sitzung.".into());
         }
+        let download = self.download.lock().unwrap();
+        if download.as_ref().is_some_and(|s| s.active()) {
+            return Err("Während eines Modell-Downloads startet keine Aufnahme oder Verarbeitung.".into());
+        }
         *slot = Some(spawn()?);
         Ok(())
     }
@@ -648,7 +652,8 @@ impl AppState {
     }
 
     fn start_download(&self, spawn: impl FnOnce() -> Result<Arc<Session>, String>) -> Result<(), String> {
-        if self.active_session().is_some() {
+        let session = self.session.lock().unwrap();
+        if session.as_ref().is_some_and(|s| s.active()) {
             return Err("Während einer Aufnahme oder Verarbeitung wird nichts heruntergeladen.".into());
         }
         let mut slot = self.download.lock().unwrap();

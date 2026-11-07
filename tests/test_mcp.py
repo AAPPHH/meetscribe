@@ -16,7 +16,7 @@ from meetscribe.mcp_server import TOOLS, McpApp
 from meetscribe.service import EngineCache, Service
 from meetscribe.store import Store, make_config
 from test_cli import FakeRecorder, env, transcribe  # noqa: F401
-from test_service import SlowEngine, fast  # noqa: F401
+from test_service import SlowEngine, fast, links, needs_windows  # noqa: F401
 from test_store import SPEAKER_WORKER, make_orphan, start_writer, write
 
 TESTS = Path(__file__).parent
@@ -357,6 +357,17 @@ def test_a_missing_diarization_model_names_the_tool_argument_not_a_command_line(
         return await call.ok("transcribe_status", job=started["job"], wait_s=30)
     final = drive(app, script)
     assert final["state"] == "failed" and "diarize=false" in final["message"] and "--no-diarize" not in final["message"] + final["detail"]
+
+
+@needs_windows
+def test_transcribe_start_refuses_a_junction_to_a_network_target_and_starts_nothing(app, env, links):
+    network = links("netz", "\\??\\UNC\\192.0.2.1\\share")
+
+    async def script(call):
+        return await call.fail("transcribe_start", audio=str(network / "x.wav")), await call.fail("transcribe_start", audio=str(network))
+    first, second = drive(app, script)
+    assert "Netzwerkpfade und Netzlaufwerke sind gesperrt" in first and "Netzwerkpfade und Netzlaufwerke sind gesperrt" in second
+    assert app.service.run is None
 
 
 def test_a_started_server_reaps_the_orphan_of_a_hard_killed_process_but_not_a_live_writers_file(tmp_path):

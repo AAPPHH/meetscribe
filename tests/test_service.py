@@ -679,3 +679,114 @@ def test_the_start_lock_message_names_the_app_and_claude_not_a_hard_kill(tmp_pat
         with pytest.raises(pipeline.PipelineError) as busy:
             pipeline.RunLock(tmp_path / "start.lock").__enter__()
     assert "in der App oder über Claude" in busy.value.message and "nach hartem Beenden der Oberfläche läuft" not in busy.value.message
+
+
+def make_junction(link, substitute):
+    import ctypes
+    import struct
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.restype = ctypes.c_void_p
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+    kernel.DeviceIoControl.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    os.mkdir(link)
+    name = substitute.encode("utf-16-le")
+    body = struct.pack("<HHHH", 0, len(name), len(name) + 2, 0) + name + b"\0\0\0\0"
+    buffer = struct.pack("<IHH", 0xA0000003, len(body), 0) + body
+    handle = kernel.CreateFileW(str(link), 0x40000000, 7, None, 3, 0x02200000, None)
+    ok = handle not in (None, ctypes.c_void_p(-1).value) and kernel.DeviceIoControl(handle, 0x900A4, buffer, len(buffer), None, 0, ctypes.byref(wintypes.DWORD()), None)
+    error = ctypes.get_last_error()
+    if handle not in (None, ctypes.c_void_p(-1).value):
+        kernel.CloseHandle(handle)
+    if not ok:
+        os.rmdir(link)
+        raise OSError(error, "junction")
+
+
+@pytest.fixture
+def links(tmp_path):
+    made = []
+
+    def make(name, substitute):
+        link = tmp_path / name
+        make_junction(link, substitute)
+        made.append(link)
+        return link
+    yield make
+    for link in made:
+        os.rmdir(link)
+
+
+needs_windows = pytest.mark.skipif(sys.platform != "win32", reason="Windows-Verknüpfungen")
+
+
+@needs_windows
+def test_local_path_refuses_junctions_to_a_network_target_on_every_component(links, tmp_path):
+    real = tmp_path / "echt"
+    real.mkdir()
+    (real / "a.wav").write_bytes(b"x")
+    network = links("netz", "\\??\\UNC\\192.0.2.1\\share")
+    deep = tmp_path / "tief"
+    deep.mkdir()
+    inner = links("tief\\sprung", "\\??\\UNC\\192.0.2.1\\share\\x")
+    via_local = links("lokal", "\\??\\" + str(real))
+    chained = links("kette", "\\??\\" + str(network))
+    backslashed = {k: str(v) for k, v in {"net": network, "inner": inner}.items()}
+    assert service.LocalPath.remote(network / "a.wav") and service.LocalPath.remote(network) and service.LocalPath.remote(str(network / "a" / "b" / "c.wav"))
+    assert service.LocalPath.remote(str(network).replace("\\", "/") + "/a.wav") and service.LocalPath.remote(backslashed["inner"] + "\\deep\\f.wav")
+    assert service.LocalPath.remote(chained / "a.wav") and service.LocalPath.remote(network / ".." / "netz" / "a.wav")
+    assert not service.LocalPath.remote(real / "a.wav") and not service.LocalPath.remote(via_local / "a.wav") and not service.LocalPath.remote(tmp_path / "gibt-es-nicht.wav")
+    assert not service.LocalPath.remote(r"C:\Windows\notepad.exe") and service.LocalPath.remote("\\\\192.0.2.1\\share\\a.wav") and service.LocalPath.remote("//server/share/a.wav")
+    assert deep.exists()
+
+
+@needs_windows
+def test_local_path_follows_a_link_loop_to_a_refusal_not_a_hang(links, tmp_path):
+    first = links("eins", "\\??\\" + str(tmp_path / "zwei"))
+    links("zwei", "\\??\\" + str(first))
+    assert service.LocalPath.remote(first / "a.wav")
+
+
+@needs_windows
+def test_local_path_resolves_subst_drives_by_their_target_and_refuses_remote_drive_types(tmp_path, monkeypatch):
+    real = tmp_path / "echt"
+    real.mkdir()
+    (real / "a.wav").write_bytes(b"x")
+    letter = next(c for c in "XYZWVUTSRQPONM" if not os.path.exists(c + ":\\"))
+    assert subprocess.run(["subst", letter + ":", str(real)], capture_output=True).returncode == 0
+    try:
+        assert not service.LocalPath.remote(letter + ":\\a.wav")
+        (real / "sub").mkdir()
+        assert not service.LocalPath.remote(letter + ":\\sub\\b.wav")
+    finally:
+        subprocess.run(["subst", letter + ":", "/D"], check=True, capture_output=True)
+    assert not os.path.exists(letter + ":\\")
+    monkeypatch.setattr(service.LocalPath, "drive_type", staticmethod(lambda root: service.DRIVE_REMOTE))
+    assert service.LocalPath.remote("C:\\Windows\\notepad.exe")
+
+
+@needs_windows
+def test_local_path_reads_a_symlink_the_same_way_as_a_junction(monkeypatch, tmp_path):
+    file = tmp_path / "link.wav"
+    file.write_bytes(b"x")
+    targets = {str(file): "\\\\?\\UNC\\192.0.2.1\\share\\a.wav"}
+    real = os.readlink
+    monkeypatch.setattr(service.os, "readlink", lambda path: targets[str(path)] if str(path) in targets else real(path))
+    assert service.LocalPath.remote(file)
+    targets[str(file)] = "other.wav"
+    (tmp_path / "other.wav").write_bytes(b"x")
+    assert not service.LocalPath.remote(file)
+    targets[str(file)] = "..\\" + tmp_path.name + "\\other.wav"
+    assert not service.LocalPath.remote(file)
+    targets[str(file)] = "\\??\\UNC\\192.0.2.1\\share\\a.wav"
+    assert service.LocalPath.remote(file)
+
+
+@needs_windows
+def test_begin_transcription_refuses_a_link_to_a_network_before_touching_the_file(links, env):
+    network = links("netz", "\\??\\UNC\\192.0.2.1\\share")
+    svc = Service(env["store"])
+    with pytest.raises(ServiceError, match="Netzwerkpfade und Netzlaufwerke sind gesperrt"):
+        svc.begin_transcription(str(network / "a.wav"), Wire(None, None), lambda work: None)
+    assert svc.run is None

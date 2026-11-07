@@ -34,6 +34,7 @@ SERVICE = {
     "workers": 8,
     "discard_tries": 4,
     "discard_wait_s": 0.3,
+    "link_depth": 40,
     "stderr_tail": 12,
     "shutdown_wait_s": 5.0,
     "choice": r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
@@ -77,16 +78,74 @@ SPEAKERS_SQL = (
 
 
 class LocalPath:
-    @staticmethod
-    def remote(audio):
-        text = str(audio).replace("/", "\\")
-        if text.startswith("\\\\"):
-            return True
-        drive = os.path.splitdrive(text)[0]
-        if sys.platform != "win32" or len(drive) != 2:
+    ANCHOR = re.compile(r"^([A-Za-z]:|\\\\\?\\Volume\{[^}]+\})(.*)$")
+    NETWORK_DEVICES = ("lanman", "mup", "webdav", "redirector")
+
+    @classmethod
+    def remote(cls, audio):
+        if sys.platform != "win32":
             return False
+        text = str(audio).replace("/", "\\")
+        return text.startswith("\\\\") or cls.walk(os.path.abspath(text), 0)
+
+    @classmethod
+    def walk(cls, path, depth):
+        match = cls.ANCHOR.match(path)
+        if depth > SERVICE["link_depth"] or match is None:
+            return True
+        anchor, rest = match.groups()
+        root = anchor + "\\"
+        if cls.drive_type(root) == DRIVE_REMOTE:
+            return True
+        mapped = cls.subst_target(anchor)
+        if mapped is not None:
+            return cls.follow(mapped, root, rest.lstrip("\\"), depth)
+        parts = [p for p in rest.split("\\") if p]
+        current = root
+        for index, part in enumerate(parts):
+            current = os.path.join(current, part)
+            try:
+                target = os.readlink(current)
+            except FileNotFoundError:
+                return False
+            except OSError:
+                continue
+            return cls.follow(target, os.path.dirname(current), "\\".join(parts[index + 1:]), depth)
+        return False
+
+    @classmethod
+    def follow(cls, target, base, rest, depth):
+        target = cls.plain(target)
+        if target.startswith("\\\\") and not target.startswith("\\\\?\\"):
+            return True
+        resolved = target if cls.ANCHOR.match(target) else os.path.join(base, target)
+        return cls.walk(os.path.join(os.path.normpath(resolved), rest) if rest else os.path.normpath(resolved), depth + 1)
+
+    @staticmethod
+    def plain(target):
+        if target.startswith("\\??\\"):
+            target = "\\\\?\\" + target[4:]
+        if target.upper().startswith("\\\\?\\UNC\\"):
+            return "\\\\" + target[8:]
+        return target[4:] if re.match(r"^\\\\\?\\[A-Za-z]:", target) else target
+
+    @staticmethod
+    def drive_type(root):
         import ctypes
-        return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == DRIVE_REMOTE
+        return ctypes.windll.kernel32.GetDriveTypeW(root)
+
+    @classmethod
+    def subst_target(cls, anchor):
+        if len(anchor) != 2:
+            return None
+        import ctypes
+        buffer = ctypes.create_unicode_buffer(1024)
+        if not ctypes.windll.kernel32.QueryDosDeviceW(anchor, buffer, len(buffer)):
+            return None
+        target = buffer.value
+        if target.startswith("\\??\\"):
+            return target
+        return "\\\\network" if any(name in target.lower() for name in cls.NETWORK_DEVICES) else None
 
 
 class ServiceError(pipeline.PipelineError):

@@ -24,6 +24,7 @@ faster-whisper = [
 
 [project.scripts]
 meetscribe = "meetscribe.cli:main"
+meetscribe-mcp = "meetscribe.mcp_server:main"
 
 [build-system]
 requires = ["hatchling"]

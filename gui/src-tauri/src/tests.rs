@@ -1,5 +1,7 @@
 use super::*;
+use engine::PROTOCOL;
 use std::collections::HashSet;
+use std::time::Duration;
 
 const BUILD_REPO: &str = r"C:\build\repo";
 
@@ -23,16 +25,6 @@ fn scratch(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
-}
-
-#[test]
-fn event_lines_skip_noise_and_keep_events() {
-    assert_eq!(parse_event(r#"  {"event":"recording","input":"DJI"}  "#).unwrap()["input"], "DJI");
-    assert!(parse_event("Warnung der Bibliothek").is_none());
-    assert!(parse_event(r#"{"kein":"event"}"#).is_none());
-    assert!(parse_event(r#"{"event":"kaputt"#).is_none());
-    assert!(parse_event(r#"{"event":5}"#).is_none());
-    assert!(parse_event("").is_none());
 }
 
 #[test]
@@ -61,13 +53,6 @@ fn run_info_remembers_audio_input_meeting_and_warnings() {
     info.absorb(&json!({ "event": "transcribing", "audio": r"C:\a\x.flac", "meeting_id": "m-1" }));
     info.absorb(&json!({ "event": "error", "message": "x" }));
     assert_eq!((info.meeting_id.as_deref(), info.warnings.as_slice()), (Some("m-1"), ["leise".to_string()].as_slice()));
-}
-
-#[test]
-fn json_output_tolerates_leading_noise() {
-    assert_eq!(parse_json_output("[1,2]\n").unwrap(), json!([1, 2]));
-    assert_eq!(parse_json_output("Rauschen\n{\"a\":1}\n").unwrap(), json!({ "a": 1 }));
-    assert!(parse_json_output("nur Text").is_err());
 }
 
 #[test]
@@ -109,54 +94,6 @@ fn missing_engine_message_names_no_developer_folder_and_a_bad_saved_project_is_r
 }
 
 #[test]
-fn start_args_cover_recording_and_file_modes_and_keep_audio_out_of_option_parsing() {
-    let base = StartOptions { title: Some("  Runde ".into()), audio: None, mic: Some("DJI".into()), device: "gpu".into(), backend: None, model: None, diarize: false };
-    assert_eq!(
-        base.args(),
-        ["start", "--events", "--no-open", "--device", "gpu", "--stdin-stop", "--mic", "DJI", "--title", "Runde", "--no-diarize"]
-    );
-    let file = StartOptions { title: None, audio: Some(r"C:\a b\x.wav".into()), mic: Some("DJI".into()), device: "npu".into(), backend: None, model: None, diarize: true };
-    assert_eq!(file.args(), ["start", "--events", "--no-open", "--device", "npu", "--", r"C:\a b\x.wav"]);
-    let tricky = StartOptions { title: Some("T".into()), audio: Some("--events".into()), ..file.clone() };
-    assert_eq!(tricky.args(), ["start", "--events", "--no-open", "--device", "npu", "--title", "T", "--", "--events"]);
-    let blank = StartOptions { title: Some(" ".into()), audio: Some("".into()), mic: Some("".into()), device: "cpu".into(), backend: None, model: None, diarize: true };
-    assert_eq!(blank.args(), ["start", "--events", "--no-open", "--device", "cpu", "--stdin-stop"]);
-    assert!(StartOptions { device: "tpu".into(), ..blank }.validate().is_err());
-}
-
-#[test]
-fn backend_and_model_choices_reach_the_engine_only_when_not_automatic() {
-    let base = StartOptions { title: None, audio: None, mic: None, device: "auto".into(), backend: None, model: None, diarize: true };
-    assert_eq!(base.args(), ["start", "--events", "--no-open", "--device", "auto", "--stdin-stop"]);
-    let auto = StartOptions { backend: Some("auto".into()), model: Some(" auto ".into()), ..base.clone() };
-    assert_eq!(auto.args(), base.args());
-    let chosen = StartOptions { device: "igpu".into(), backend: Some("faster-whisper".into()), model: Some("small:int8".into()), ..base.clone() };
-    assert_eq!(
-        chosen.args(),
-        ["start", "--events", "--no-open", "--device", "igpu", "--backend", "faster-whisper", "--model", "small:int8", "--stdin-stop"]
-    );
-    assert!(chosen.validate().is_ok());
-    for bad in ["--events", "-x", ".hidden", "a b", "a;b", "C:\\x"] {
-        assert!(StartOptions { model: Some(bad.into()), ..base.clone() }.validate().is_err(), "{bad}");
-        assert!(StartOptions { backend: Some(bad.into()), ..base.clone() }.validate().is_err(), "{bad}");
-    }
-    for device in ["auto", "npu", "gpu", "igpu", "cpu"] {
-        assert!(StartOptions { device: device.into(), ..base.clone() }.validate().is_ok(), "{device}");
-    }
-}
-
-#[test]
-fn downloads_pass_exactly_one_checked_model_to_setup() {
-    assert_eq!(
-        download_args("openvino", "small:int8").unwrap(),
-        ["setup", "--events", "--backend", "openvino", "--model", "small:int8"]
-    );
-    for (backend, model) in [("auto", "small"), ("openvino", "auto"), ("openvino", "--x"), ("", "small"), ("openvino", "a b")] {
-        assert!(download_args(backend, model).is_err(), "{backend} {model}");
-    }
-}
-
-#[test]
 fn missing_or_misspelled_audio_is_refused_in_german_before_any_engine_starts() {
     let dir = scratch("audio");
     let real = dir.join("a.wav");
@@ -169,6 +106,37 @@ fn missing_or_misspelled_audio_is_refused_in_german_before_any_engine_starts() {
     }
     assert!(StartOptions { audio: None, ..options("") }.validate().is_ok());
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn start_params_cover_recording_and_file_modes_and_keep_automatic_choices_out() {
+    let base = StartOptions { title: Some("  Runde ".into()), audio: None, mic: Some("DJI".into()), device: "gpu".into(), backend: None, model: None, diarize: false };
+    assert_eq!(base.params(), json!({ "device": "gpu", "diarize": false, "mic": "DJI", "title": "Runde" }));
+    let file = StartOptions { title: None, audio: Some(r"C:\a b\x.wav".into()), mic: Some("DJI".into()), device: "npu".into(), backend: None, model: None, diarize: true };
+    assert_eq!(file.params(), json!({ "device": "npu", "diarize": true, "audio": r"C:\a b\x.wav" }));
+    let blank = StartOptions { title: Some(" ".into()), audio: Some("".into()), mic: Some("".into()), device: "cpu".into(), backend: None, model: None, diarize: true };
+    assert_eq!(blank.params(), json!({ "device": "cpu", "diarize": true }));
+    assert!(StartOptions { device: "tpu".into(), ..blank }.validate().is_err());
+    let auto = StartOptions { backend: Some("auto".into()), model: Some(" auto ".into()), ..base.clone() };
+    assert_eq!(auto.params(), base.params());
+    let chosen = StartOptions { device: "igpu".into(), backend: Some("faster-whisper".into()), model: Some("small:int8".into()), mic: None, title: None, ..base.clone() };
+    assert_eq!(chosen.params(), json!({ "device": "igpu", "diarize": false, "backend": "faster-whisper", "model": "small:int8" }));
+    assert!(chosen.validate().is_ok());
+    for bad in ["--events", "-x", ".hidden", "a b", "a;b", r"C:\x"] {
+        assert!(StartOptions { model: Some(bad.into()), ..base.clone() }.validate().is_err(), "{bad}");
+        assert!(StartOptions { backend: Some(bad.into()), ..base.clone() }.validate().is_err(), "{bad}");
+    }
+    for device in ["auto", "npu", "gpu", "igpu", "cpu"] {
+        assert!(StartOptions { device: device.into(), ..base.clone() }.validate().is_ok(), "{device}");
+    }
+}
+
+#[test]
+fn downloads_pass_exactly_one_checked_model_to_the_engine() {
+    assert_eq!(download_params("openvino", "small:int8").unwrap(), json!({ "backend": "openvino", "model": "small:int8" }));
+    for (backend, model) in [("auto", "small"), ("openvino", "auto"), ("openvino", "--x"), ("", "small"), ("openvino", "a b")] {
+        assert!(download_params(backend, model).is_err(), "{backend} {model}");
+    }
 }
 
 #[test]
@@ -230,12 +198,6 @@ fn fake_engine() -> PathBuf {
     std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("examples").join(format!("fake_engine{EXE}"))
 }
 
-fn fake_command(mode: &str, args: &[&str]) -> Command {
-    let mut cmd = Command::new(fake_engine());
-    cmd.args(args).env("FAKE_ENGINE_MODE", mode).detached();
-    cmd
-}
-
 fn wait_for(limit: usize, mut done: impl FnMut() -> bool) -> bool {
     for _ in 0..limit {
         if done() {
@@ -251,291 +213,407 @@ fn process_alive(pid: u64) -> bool {
     String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
 }
 
-fn run_fake(mode: &str, args: &[&str], stop_after: Option<&str>) -> (Vec<(String, Value)>, Arc<Session>) {
-    let seen = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
-    let log = seen.clone();
-    let session = Session::spawn(fake_command(mode, args), Arc::new(move |name, payload| log.lock().unwrap().push((name.to_string(), payload))), None).unwrap();
-    if let Some(name) = stop_after {
-        wait_for(200, || seen.lock().unwrap().iter().any(|(_, v)| v["event"] == name));
-        wait_for(200, || session.stage() == Stage::Recording);
-        session.stop().unwrap();
-    }
-    wait_for(400, || !session.active());
-    let events = seen.lock().unwrap().clone();
-    (events, session)
+type Seen = Arc<Mutex<Vec<(String, Value)>>>;
+
+fn fake_spec(args: &[&str]) -> EngineSpec {
+    EngineSpec { program: fake_engine(), args: args.iter().map(|a| a.to_string()).collect(), source: "test".into() }
 }
 
-fn names(events: &[(String, Value)]) -> Vec<String> {
-    events.iter().map(|(n, v)| if n == EXIT_NAME { "exit".to_string() } else { v["event"].as_str().unwrap().to_string() }).collect()
+fn quick() -> Timeouts {
+    Timeouts { startup: Duration::from_secs(3), query: Duration::from_millis(400), probe: Duration::from_millis(400), shutdown: Duration::from_secs(2), ..Timeouts::default() }
+}
+
+struct Rig {
+    client: Arc<EngineClient>,
+    notes: Seen,
+}
+
+impl Rig {
+    fn new(args: &[&str], timeouts: Timeouts) -> Rig {
+        let notes: Seen = Arc::new(Mutex::new(vec![]));
+        let sink = notes.clone();
+        let notify: Notify = Arc::new(move |method, params| sink.lock().unwrap().push((method.to_string(), params)));
+        let spec = fake_spec(args);
+        Rig { client: EngineClient::new(Box::new(move || Ok(spec.clone())), notify, None, timeouts), notes }
+    }
+
+    fn pid(&self) -> u64 {
+        self.client.call("ping", json!({})).unwrap()["pid"].as_u64().unwrap()
+    }
+
+    fn noted(&self, method: &str) -> Vec<Value> {
+        self.notes.lock().unwrap().iter().filter(|(m, _)| m == method).map(|(_, p)| p.clone()).collect()
+    }
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        self.client.shutdown();
+    }
 }
 
 #[test]
-fn session_stop_line_ends_recording_and_processing_continues() {
-    let (events, session) = run_fake("", &["start", "--events", "--stdin-stop"], Some("recording"));
-    assert_eq!(names(&events), ["preflight", "recording", "warning", "transcribing", "done", "exit"]);
-    let exit = &events.last().unwrap().1;
+fn replies_are_matched_by_id_even_when_they_arrive_out_of_order() {
+    let rig = Rig::new(&[], Timeouts::default());
+    let order = Arc::new(Mutex::new(Vec::<String>::new()));
+    let threads: Vec<_> = [("a", 600), ("b", 10), ("c", 200)]
+        .into_iter()
+        .map(|(tag, ms)| {
+            let (client, order) = (rig.client.clone(), order.clone());
+            std::thread::spawn(move || {
+                if tag != "a" {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let reply = client.call("test.slow", json!({ "tag": tag, "ms": ms })).unwrap();
+                order.lock().unwrap().push(reply["tag"].as_str().unwrap().to_string());
+                reply["tag"].as_str().unwrap().to_string() == tag
+            })
+        })
+        .collect();
+    assert!(threads.into_iter().all(|t| t.join().unwrap()));
+    assert_eq!(*order.lock().unwrap(), ["b", "c", "a"]);
+    for n in 0..20 {
+        assert_eq!(rig.client.call("test.echo", json!({ "n": n })).unwrap()["n"], n);
+    }
+}
+
+#[test]
+fn noise_on_stdout_and_unknown_notifications_do_not_disturb_the_protocol() {
+    let rig = Rig::new(&[], Timeouts::default());
+    assert_eq!(rig.client.call("devices", json!({})).unwrap()["inputs"][0]["name"], "Fake Mikrofon");
+    assert_eq!(rig.client.call("report", json!({ "meeting_id": "fake" })).unwrap()["markdown"], "# Fake\n\nProtokoll");
+    assert_eq!(rig.client.info().unwrap()["protocol"], PROTOCOL);
+    assert!(rig.client.call("gibt.es.nicht", json!({})).unwrap_err().contains("Unbekannte Methode"));
+}
+
+#[test]
+fn a_crash_fails_the_call_with_the_engine_output_then_restarts_and_says_so() {
+    let rig = Rig::new(&[], Timeouts::default());
+    let before = rig.pid();
+    let error = rig.client.call("test.crash", json!({})).unwrap_err();
+    assert!(error.contains("unerwartet beendet") && error.contains("Code 7") && error.contains("Absturz im Test"), "{error}");
+    assert!(wait_for(200, || !rig.noted("engine.restarted").is_empty()));
+    assert_eq!(rig.noted("engine.crashed")[0]["code"], 7);
+    assert!(rig.noted("engine.crashed")[0]["stderr"].as_str().unwrap().contains("Absturz im Test"));
+    assert_eq!(rig.noted("engine.restarted")[0]["ok"], true);
+    let after = rig.pid();
+    assert_ne!(before, after);
+    assert!(wait_for(100, || !process_alive(before)));
+}
+
+#[test]
+fn a_read_only_query_is_repeated_once_when_the_engine_dies_under_it() {
+    let marker = scratch("once").join("marker");
+    let rig = Rig::new(&["--once", &marker.to_string_lossy()], Timeouts::default());
+    let before = rig.pid();
+    let hits = rig.client.call("search", json!({ "term": "crash!" })).unwrap();
+    assert_eq!(hits[0]["text"], "crash!");
+    assert_ne!(rig.pid(), before);
+    assert_eq!(rig.noted("engine.crashed").len(), 1);
+    assert!(marker.exists());
+}
+
+#[test]
+fn a_timeout_is_reported_and_an_engine_that_stays_silent_is_replaced() {
+    let rig = Rig::new(&[], quick());
+    let before = rig.pid();
+    let error = rig.client.call("test.hang", json!({})).unwrap_err();
+    assert!(error.contains("Zeitüberschreitung") && error.contains("test.hang"), "{error}");
+    assert!(wait_for(200, || !rig.noted("engine.restarted").is_empty()));
+    assert_eq!(rig.noted("engine.crashed").len(), 1);
+    assert_ne!(rig.pid(), before);
+    assert!(wait_for(100, || !process_alive(before)));
+}
+
+#[test]
+fn a_slow_but_healthy_engine_keeps_running_after_a_timeout() {
+    let rig = Rig::new(&[], quick());
+    let before = rig.pid();
+    assert!(rig.client.call("test.slow", json!({ "tag": "x", "ms": 900 })).unwrap_err().contains("Zeitüberschreitung"));
+    std::thread::sleep(Duration::from_millis(1200));
+    assert!(rig.noted("engine.crashed").is_empty());
+    assert_eq!(rig.pid(), before);
+}
+
+#[test]
+fn startup_failures_say_why_in_german_and_never_loop() {
+    let broken = Rig::new(&["--mode", "exit_at_start"], quick());
+    let error = broken.client.start().unwrap_err();
+    assert!(error.contains("ließ sich nicht starten") && error.contains("ModuleNotFoundError: meetscribe") && error.contains("Code 3"), "{error}");
+    let old = Rig::new(&["--mode", "old_protocol"], quick());
+    assert!(old.client.start().unwrap_err().contains("Protokollversionen"));
+    let silent = Rig::new(&["--mode", "silent_start"], Timeouts { startup: Duration::from_millis(400), ..quick() });
+    assert!(silent.client.start().unwrap_err().contains("nicht gemeldet"));
+    let missing = EngineClient::new(Box::new(|| Ok(EngineSpec::direct(r"C:\gibt\es\nicht.exe", "test"))), Arc::new(|_, _| {}), None, quick());
+    assert!(missing.start().unwrap_err().contains("nicht gestartet werden"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(broken.noted("engine.crashed").is_empty() && old.noted("engine.restarted").is_empty() && silent.noted("engine.crashed").is_empty());
+}
+
+#[test]
+fn an_engine_that_cannot_be_located_reports_the_locator_message() {
+    let client = EngineClient::new(Box::new(|| Err("Engine nicht gefunden. Pfad eintragen.".into())), Arc::new(|_, _| {}), None, quick());
+    assert_eq!(client.call("meetings", json!({})).unwrap_err(), "Engine nicht gefunden. Pfad eintragen.");
+}
+
+#[test]
+fn shutdown_leaves_no_engine_behind_and_refuses_new_starts() {
+    let rig = Rig::new(&[], Timeouts::default());
+    let pid = rig.pid();
+    assert!(process_alive(pid.into()));
+    rig.client.shutdown();
+    assert!(wait_for(100, || !process_alive(pid.into())));
+    assert!(rig.client.call("meetings", json!({})).unwrap_err().contains("wird beendet"));
+    assert!(rig.noted("engine.crashed").is_empty());
+}
+
+#[test]
+fn repeated_crashes_stop_the_automatic_restarts() {
+    let rig = Rig::new(&[], Timeouts::default());
+    for n in 1..=3 {
+        let _ = rig.client.call("test.crash", json!({}));
+        assert!(wait_for(400, || rig.noted("engine.restarted").len() == n));
+    }
+    let restarted = rig.noted("engine.restarted");
+    assert_eq!((restarted[0]["ok"].as_bool(), restarted[1]["ok"].as_bool(), restarted[2]["ok"].as_bool()), (Some(true), Some(true), Some(false)));
+    assert!(restarted[2]["error"].as_str().unwrap().contains("mehrfach"));
+    assert!(rig.client.call("ping", json!({})).is_ok());
+}
+
+struct App {
+    core: Arc<Core>,
+    engine: Arc<EngineClient>,
+    seen: Seen,
+    dir: PathBuf,
+}
+
+impl App {
+    fn new(name: &str, args: &[&str]) -> App {
+        let dir = scratch(name);
+        let core = Arc::new(Core::new(&dir));
+        let seen: Seen = Arc::new(Mutex::new(vec![]));
+        let (router, sink) = (core.clone(), seen.clone());
+        let notify: Notify = Arc::new(move |method, params| router.route(&|name, payload| sink.lock().unwrap().push((name.to_string(), payload)), method, params));
+        let spec = fake_spec(args);
+        let engine = EngineClient::new(Box::new(move || Ok(spec.clone())), notify, Some(dir.join(LOG_FILE)), Timeouts::default());
+        App { core, engine, seen, dir }
+    }
+
+    fn options(&self, audio: bool) -> StartOptions {
+        let file = self.dir.join("a.wav");
+        std::fs::write(&file, b"x").unwrap();
+        StartOptions { title: None, audio: audio.then(|| file.to_string_lossy().to_string()), mic: None, device: "npu".into(), backend: None, model: None, diarize: true }
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, v)| match name.as_str() {
+                EVENT_NAME | DOWNLOAD_EVENT_NAME => v["event"].as_str().unwrap().to_string(),
+                EXIT_NAME | DOWNLOAD_EXIT_NAME => "exit".to_string(),
+                other => other.to_string(),
+            })
+            .collect()
+    }
+
+    fn last(&self, name: &str) -> Value {
+        self.seen.lock().unwrap().iter().rev().find(|(n, _)| n == name).map(|(_, v)| v.clone()).unwrap()
+    }
+
+    fn idle(&self) -> bool {
+        wait_for(400, || !self.core.run.lock().unwrap().active)
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.engine.shutdown();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[test]
+fn a_recording_runs_through_the_engine_and_a_stop_line_ends_the_recording() {
+    let app = App::new("run_record", &[]);
+    launch(&app.core, &app.engine, app.options(false)).unwrap();
+    assert!(wait_for(400, || app.core.run.lock().unwrap().stage == Stage::Recording));
+    let state = app.core.run.lock().unwrap().state();
+    assert_eq!((state["active"].as_bool(), state["stage"].as_str(), state["input"].as_str()), (Some(true), Some("recording"), Some("Fake Mikrofon")));
+    assert_eq!(state["warnings"].as_array().unwrap().len(), 1);
+    assert_eq!(launch(&app.core, &app.engine, app.options(false)).unwrap_err(), SESSION_BUSY);
+    app.engine.call("run.stop", json!({})).unwrap();
+    assert!(app.idle());
+    assert_eq!(app.names(), ["preflight", "recording", "warning", "transcribing", "done", "exit"]);
+    let exit = app.last(EXIT_NAME);
     assert_eq!((exit["code"].as_i64(), exit["terminal"].as_bool()), (Some(0), Some(true)));
     assert_eq!(exit["audio"], r"C:\fake\aufnahme.flac");
-    assert!(!session.active() && session.stage() == Stage::Finished);
-    assert_eq!(events[4].1["labels"][0]["sample"], "Guten Morgen zusammen.");
-    assert!(session.stop().is_err());
+    assert_eq!(app.core.run.lock().unwrap().state()["active"], false);
+    assert_eq!(app.last(EVENT_NAME)["labels"][0]["sample"], "Guten Morgen zusammen.");
+    assert!(app.engine.call("run.stop", json!({})).unwrap_err().contains("keine Aufnahme"));
 }
 
 #[test]
-fn session_reports_failure_events_and_exit_code() {
-    let (events, _) = run_fake("preflight_fail", &["start", "--events"], None);
-    assert_eq!(names(&events), ["preflight", "error", "exit"]);
-    assert_eq!(events[2].1["code"], 1);
-    let (events, _) = run_fake("process_fail", &["start", "x.wav", "--events"], None);
-    assert_eq!(names(&events), ["preflight", "transcribing", "error", "exit"]);
-    assert!(events[2].1["retry"].as_str().unwrap().contains("--events"));
-    assert_eq!(events[2].1["audio"], r"C:\fake\aufnahme.flac");
-    assert_eq!(events[3].1["audio"], r"C:\fake\aufnahme.flac");
+fn failures_arrive_as_error_events_and_heartbeats_never_reach_the_frontend() {
+    let app = App::new("run_fail", &["--mode", "process_fail"]);
+    launch(&app.core, &app.engine, app.options(true)).unwrap();
+    assert!(app.idle());
+    assert_eq!(app.names(), ["preflight", "transcribing", "error", "exit"]);
+    let error = app.last(EVENT_NAME);
+    assert_eq!(error["audio"], r"C:\fake\aufnahme.flac");
+    assert!(error["retry"].as_str().unwrap().contains("--events"));
+    let early = App::new("run_early", &["--mode", "preflight_fail"]);
+    launch(&early.core, &early.engine, early.options(false)).unwrap();
+    assert!(early.idle());
+    assert_eq!(early.names(), ["preflight", "error", "exit"]);
+    assert_eq!(early.last(EXIT_NAME)["code"], 1);
 }
 
 #[test]
-fn crash_exit_still_carries_the_audio_path_and_stderr_is_logged_in_full() {
-    let dir = scratch("crash");
-    let log = dir.join(LOG_FILE);
-    let seen = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
-    let sink = seen.clone();
-    let session = Session::spawn(fake_command("crash", &["start", "--events", "--stdin-stop"]), Arc::new(move |n, p| sink.lock().unwrap().push((n.to_string(), p))), Some(log.clone())).unwrap();
-    assert!(wait_for(400, || !session.active()));
-    let exit = seen.lock().unwrap().last().unwrap().1.clone();
+fn a_crash_during_a_run_ends_it_for_the_frontend_with_the_audio_and_restarts_the_engine() {
+    let app = App::new("run_crash", &["--mode", "crash_run"]);
+    launch(&app.core, &app.engine, app.options(false)).unwrap();
+    assert!(wait_for(400, || app.names().contains(&"exit".to_string())));
+    let exit = app.last(EXIT_NAME);
     assert_eq!((exit["code"].as_i64().unwrap() != 0, exit["terminal"].as_bool()), (true, Some(false)));
     assert_eq!(exit["audio"], r"C:\fake\aufnahme.flac");
-    assert_eq!(exit["log"], log.to_string_lossy().to_string());
-    let text = std::fs::read_to_string(&log).unwrap();
-    assert!(text.contains("Ursache zeile 1") && text.contains("Ursache zeile 20"));
-    assert!(exit["stderr"].as_str().unwrap().lines().count() <= STDERR_TAIL);
-    let _ = std::fs::remove_dir_all(dir);
+    assert!(exit["stderr"].as_str().unwrap().contains("Ursache zeile 1"));
+    assert_eq!(exit["log"], app.dir.join(LOG_FILE).to_string_lossy().to_string());
+    assert!(wait_for(400, || app.names().contains(&NOTICE_NAME.to_string())));
+    assert_eq!(app.last(NOTICE_NAME)["text"], RESTARTED_RUN);
+    assert!(!app.core.run.lock().unwrap().active);
+    assert!(app.engine.call("ping", json!({})).is_ok());
+    assert!(std::fs::read_to_string(app.dir.join(LOG_FILE)).is_ok());
 }
 
 #[test]
-fn session_state_reports_stage_audio_input_and_warnings_for_a_reloaded_view() {
-    let session = Session::spawn(fake_command("", &["start", "--events", "--stdin-stop"]), Arc::new(|_, _| {}), None).unwrap();
-    assert!(wait_for(200, || session.stage() == Stage::Recording && !session.info().warnings.is_empty()));
-    let state = session.state();
-    assert_eq!((state["active"].as_bool(), state["stage"].as_str(), state["input"].as_str()), (Some(true), Some("recording"), Some("Fake Mikrofon")));
-    assert_eq!(state["audio"], r"C:\fake\aufnahme.flac");
-    assert_eq!(state["warnings"].as_array().unwrap().len(), 1);
-    assert!(state["elapsed_s"].as_u64().is_some());
-    session.stop().unwrap();
-    wait_for(400, || !session.active());
+fn a_crash_while_idle_only_posts_the_plain_notice() {
+    let app = App::new("idle_crash", &[]);
+    let _ = app.engine.call("test.crash", json!({}));
+    assert!(wait_for(400, || app.names().contains(&NOTICE_NAME.to_string())));
+    assert_eq!(app.last(NOTICE_NAME)["text"], RESTARTED);
+    assert!(!app.names().contains(&"exit".to_string()));
 }
 
 #[test]
-fn kill_is_refused_while_recording_but_works_after() {
-    let session = Session::spawn(fake_command("", &["start", "--events", "--stdin-stop"]), Arc::new(|_, _| {}), None).unwrap();
-    wait_for(200, || session.stage() == Stage::Recording);
-    assert!(session.kill().is_err());
-    session.stop().unwrap();
-    wait_for(200, || session.stage() != Stage::Recording);
-    assert!(session.kill().is_ok());
+fn leaving_during_processing_kills_the_engine_tree_and_discards_the_partial_meeting_through_a_fresh_engine() {
+    let app = App::new("leave", &["--mode", "tree"]);
+    launch(&app.core, &app.engine, app.options(true)).unwrap();
+    assert!(wait_for(400, || app.core.run.lock().unwrap().stage == Stage::Processing));
+    let child = app.seen.lock().unwrap().iter().find_map(|(_, v)| v["child_pid"].as_u64()).unwrap();
+    let engine_pid = app.engine.pid().unwrap();
+    assert!(process_alive(child) && process_alive(engine_pid.into()));
+    leave(&app.core, &app.engine).unwrap();
+    assert!(wait_for(200, || !process_alive(child)), "Kindprozess {child} lebt weiter");
+    assert!(wait_for(100, || !process_alive(engine_pid.into())));
+    assert!(!app.core.run.lock().unwrap().active);
+    assert!(!app.names().contains(&"exit".to_string()) && !app.names().contains(&NOTICE_NAME.to_string()));
+    assert!(app.engine.call("ping", json!({})).is_ok());
 }
 
 #[test]
-fn kill_takes_the_whole_process_tree_with_it() {
-    let seen = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
-    let log = seen.clone();
-    let session = Session::spawn(fake_command("tree", &["start", "x.wav", "--events"]), Arc::new(move |n, p| log.lock().unwrap().push((n.to_string(), p))), None).unwrap();
-    assert!(wait_for(400, || session.stage() == Stage::Processing));
-    let child = seen.lock().unwrap().iter().find_map(|(_, v)| v["child_pid"].as_u64()).unwrap();
-    assert!(process_alive(child));
-    session.kill().unwrap();
-    assert!(wait_for(200, || !session.active()));
-    let gone = wait_for(200, || !process_alive(child));
-    if !gone {
-        let _ = Command::new("taskkill").args(["/PID", &child.to_string(), "/F"]).detached().status();
-    }
-    assert!(gone, "Kindprozess {child} lebt nach dem Abbruch weiter");
-    assert_eq!(session.info().meeting_id.as_deref(), Some("fake-1"));
-}
-
-fn app_state(dir: &Path) -> AppState {
-    AppState {
-        settings_path: dir.join(SETTINGS_FILE),
-        pending: PendingStore { path: dir.join(PENDING_FILE) },
-        log_path: dir.join(LOG_FILE),
-        download_log_path: dir.join(DOWNLOAD_LOG_FILE),
-        session: Mutex::new(None),
-        download: Mutex::new(None),
-    }
+fn leaving_is_refused_while_recording_and_the_engine_stays() {
+    let app = App::new("leave_record", &[]);
+    launch(&app.core, &app.engine, app.options(false)).unwrap();
+    assert!(wait_for(400, || app.core.run.lock().unwrap().stage == Stage::Recording));
+    assert_eq!(leave(&app.core, &app.engine).unwrap_err(), RECORDING_KEPT);
+    assert!(app.engine.pid().is_some());
+    app.engine.call("run.stop", json!({})).unwrap();
+    assert!(app.idle());
 }
 
 #[test]
-fn only_one_download_runs_at_a_time_and_none_during_a_session() {
-    let dir = scratch("downloads");
-    let state = Arc::new(app_state(&dir));
-    let spawn = || Session::spawn(fake_command("sleep", &["setup", "--events"]), Arc::new(|_, _| {}), None);
-    let threads: Vec<_> = (0..6)
-        .map(|_| {
-            let state = state.clone();
-            std::thread::spawn(move || state.start_download(spawn))
-        })
-        .collect();
-    let results: Vec<Result<(), String>> = threads.into_iter().map(|h| h.join().unwrap()).collect();
-    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
-    assert!(results.iter().filter_map(|r| r.as_ref().err()).all(|e| e == "Es läuft bereits ein Download."));
-    state.active_download().unwrap().kill().unwrap();
-    assert!(wait_for(200, || state.active_download().is_none()));
-    state.launch(|| Session::spawn(fake_command("sleep", &["start", "--events"]), Arc::new(|_, _| {}), None)).unwrap();
-    let err = state.start_download(spawn).unwrap_err();
-    assert!(err.contains("Während einer Aufnahme oder Verarbeitung"), "{err}");
-    state.active_session().unwrap().kill().unwrap();
-    let _ = std::fs::remove_dir_all(dir);
+fn a_download_streams_progress_then_done_and_reports_failures_with_detail() {
+    let app = App::new("download", &[]);
+    app.core.download.store(true, Ordering::SeqCst);
+    app.engine.call("download.start", download_params("openvino", "small:int8").unwrap()).unwrap();
+    assert!(wait_for(400, || !app.core.download.load(Ordering::SeqCst)));
+    assert_eq!(app.names(), ["download", "done", "exit"]);
+    assert_eq!(app.seen.lock().unwrap()[0].1["total"], 257000000);
+    assert!(app.seen.lock().unwrap()[0].1.get("run").is_none());
+    let failing = App::new("download_fail", &["--mode", "download_fail"]);
+    failing.engine.call("download.start", download_params("openvino", "small").unwrap()).unwrap();
+    assert!(wait_for(400, || failing.names().contains(&"exit".to_string())));
+    assert_eq!(failing.names(), ["download", "error", "exit"]);
+    assert!(failing.seen.lock().unwrap()[1].1["detail"].as_str().unwrap().contains("offline"));
+    assert_eq!(failing.last(DOWNLOAD_EXIT_NAME)["terminal"], true);
 }
 
 #[test]
-fn no_session_starts_during_a_download() {
-    let dir = scratch("session_vs_download");
-    let state = app_state(&dir);
-    state.start_download(|| Session::spawn(fake_command("sleep", &["setup", "--events"]), Arc::new(|_, _| {}), None)).unwrap();
-    let err = state.launch(|| Session::spawn(fake_command("sleep", &["start", "--events"]), Arc::new(|_, _| {}), None)).unwrap_err();
-    assert!(err.contains("Modell-Downloads"), "{err}");
-    assert!(state.active_session().is_none());
-    state.active_download().unwrap().kill().unwrap();
-    assert!(wait_for(200, || state.active_download().is_none()));
-    state.launch(|| Session::spawn(fake_command("sleep", &["start", "--events"]), Arc::new(|_, _| {}), None)).unwrap();
-    state.active_session().unwrap().kill().unwrap();
-    let _ = std::fs::remove_dir_all(dir);
+fn the_tracker_allows_one_session_and_reports_its_state_for_a_reloaded_view() {
+    let mut tracker = Tracker::idle();
+    let options = StartOptions { title: None, audio: None, mic: None, device: "cpu".into(), backend: None, model: None, diarize: true };
+    assert_eq!(tracker.state()["active"], false);
+    tracker.begin(options.clone()).unwrap();
+    assert_eq!(tracker.begin(options.clone()).unwrap_err(), SESSION_BUSY);
+    tracker.absorb(&json!({ "event": "recording", "input": "DJI", "path": r"C:\a.flac" }));
+    assert_eq!((tracker.state()["stage"].as_str(), tracker.state()["audio"].as_str()), (Some("recording"), Some(r"C:\a.flac")));
+    tracker.absorb(&json!({ "event": "transcribing", "audio": r"C:\a.flac", "meeting_id": "m-1" }));
+    assert_eq!(tracker.finish().meeting_id.as_deref(), Some("m-1"));
+    tracker.begin(options).unwrap();
 }
 
-#[test]
-fn concurrent_launches_leave_exactly_one_session() {
-    let dir = scratch("launch");
-    let state = Arc::new(app_state(&dir));
-    let threads: Vec<_> = (0..6)
-        .map(|_| {
-            let state = state.clone();
-            std::thread::spawn(move || state.launch(|| Session::spawn(fake_command("sleep", &["start", "--events"]), Arc::new(|_, _| {}), None)))
-        })
-        .collect();
-    let results: Vec<Result<(), String>> = threads.into_iter().map(|h| h.join().unwrap()).collect();
-    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
-    assert!(results.iter().filter_map(|r| r.as_ref().err()).all(|e| e == "Es läuft bereits eine Sitzung."));
-    state.active_session().unwrap().kill().unwrap();
-    let _ = std::fs::remove_dir_all(dir);
+fn pending_engine(name: &str) -> (Rig, PendingStore, String, PathBuf) {
+    let dir = scratch(name);
+    let audio = dir.join("a.flac");
+    std::fs::write(&audio, b"x").unwrap();
+    (Rig::new(&[], Timeouts::default()), PendingStore { path: dir.join(PENDING_FILE) }, audio.to_string_lossy().to_string(), dir)
 }
 
-#[test]
-fn engine_json_queries_run_through_the_command_line() {
-    let engine = Engine { spec: EngineSpec::direct(fake_engine(), "test") };
-    assert_eq!(engine.json(&["--json", "devices"]).unwrap()["inputs"][0]["name"], "Fake Mikrofon");
-    assert_eq!(engine.json(&["--json", "report", "--", "fake"]).unwrap()["markdown"], "# Fake\n\nProtokoll");
-    assert!(engine.run(&["speakers", "set", "--meeting", "fake", "--", "A", "B"]).is_ok());
-    let broken = Engine { spec: EngineSpec::direct(r"C:\gibt\es\nicht.exe", "test") };
-    assert!(broken.json(&["--json", "meetings"]).unwrap_err().contains("nicht gestartet"));
-}
-
-#[test]
-fn discard_asks_the_engine_to_drop_exactly_that_meeting_and_reports_refusal() {
-    let engine = Engine { spec: EngineSpec::direct(fake_engine(), "test") };
-    assert!(engine.discard("m-teil"));
-    assert!(!engine.discard("m-fail"));
-}
-
-const LISTING: &str = r#"[{"meeting_id":"m-fertig","complete":true},{"meeting_id":"m-teil","complete":false},{"meeting_id":"m-fail","complete":false}]"#;
-
-struct PendingCase {
-    dir: PathBuf,
-    store: PendingStore,
-    audio: String,
-}
-
-impl PendingCase {
-    fn new(name: &str) -> PendingCase {
-        let dir = scratch(name);
-        let audio = dir.join("a.flac");
-        std::fs::write(&audio, b"x").unwrap();
-        PendingCase { store: PendingStore { path: dir.join(PENDING_FILE) }, audio: audio.to_string_lossy().to_string(), dir }
-    }
-
-    fn engine(&self) -> Engine {
-        let file = self.dir.join("meetings.json");
-        std::fs::write(&file, LISTING).unwrap();
-        let args = vec!["--meetings-file".to_string(), file.to_string_lossy().to_string()];
-        Engine { spec: EngineSpec { program: fake_engine(), args, source: "test".into() } }
-    }
-
-    fn remember(&self, meeting_id: Option<&str>) {
-        self.store.write(&Pending { audio: self.audio.clone(), meeting_id: meeting_id.map(String::from), title: None, device: "gpu".into(), backend: None, model: None, diarize: false });
-    }
+fn remember(store: &PendingStore, audio: &str, meeting_id: Option<&str>) {
+    store.write(&Pending { audio: audio.into(), meeting_id: meeting_id.map(String::from), title: None, device: "gpu".into(), backend: None, model: None, diarize: false });
 }
 
 #[test]
 fn meeting_state_tells_absent_partial_and_complete_apart() {
-    let engine = PendingCase::new("state").engine();
-    assert_eq!(engine.meeting_state("m-fertig"), Ok(MeetingState::Complete));
-    assert_eq!(engine.meeting_state("m-teil"), Ok(MeetingState::Partial));
-    assert_eq!(engine.meeting_state("m-weg"), Ok(MeetingState::Absent));
-    let broken = Engine { spec: EngineSpec::direct(r"C:\gibt\es\nicht.exe", "test") };
-    assert!(broken.meeting_state("m-teil").is_err());
+    let rig = Rig::new(&[], Timeouts::default());
+    assert_eq!(meeting_state(&rig.client, "m-fertig"), Ok(MeetingState::Complete));
+    assert_eq!(meeting_state(&rig.client, "m-teil"), Ok(MeetingState::Partial));
+    assert_eq!(meeting_state(&rig.client, "m-weg"), Ok(MeetingState::Absent));
+    assert_eq!(settle_meeting(&rig.client, "m-teil"), Ok(MeetingState::Absent));
+    assert_eq!(settle_meeting(&rig.client, "m-fail"), Err(STILL_RUNNING.to_string()));
 }
 
 #[test]
 fn a_run_that_finished_after_the_window_died_is_not_offered_and_not_started_twice() {
-    let case = PendingCase::new("finished");
-    case.remember(Some("m-fertig"));
-    let err = case.store.reconcile(&case.engine(), &case.audio).unwrap_err();
+    let (rig, store, audio, dir) = pending_engine("finished");
+    remember(&store, &audio, Some("m-fertig"));
+    let err = store.reconcile(&rig.client, &audio).unwrap_err();
     assert!(err.contains("bereits abgeschlossen") && err.contains("m-fertig"));
-    assert!(!case.store.path.exists());
-    case.remember(Some("m-fertig"));
-    assert!(case.store.unfinished(Ok(case.engine())).is_none() && !case.store.path.exists());
-    let _ = std::fs::remove_dir_all(&case.dir);
+    assert!(!store.path.exists());
+    remember(&store, &audio, Some("m-fertig"));
+    assert!(store.unfinished(&rig.client).is_none() && !store.path.exists());
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn a_partial_run_is_discarded_before_the_retry_and_a_run_that_still_holds_it_blocks_the_retry() {
-    let case = PendingCase::new("partial");
-    case.remember(Some("m-teil"));
-    assert_eq!(case.store.unfinished(Ok(case.engine())).unwrap().meeting_id.as_deref(), Some("m-teil"));
-    assert!(case.store.reconcile(&case.engine(), &case.audio).is_ok());
-    case.remember(Some("m-fail"));
-    assert_eq!(case.store.reconcile(&case.engine(), &case.audio).unwrap_err(), STILL_RUNNING);
-    assert!(case.store.path.exists());
-    case.remember(Some("m-teil"));
-    assert!(case.store.reconcile(&case.engine(), r"C:\ein\anderes\audio.flac").is_ok());
-    case.remember(None);
-    assert!(case.store.reconcile(&case.engine(), &case.audio).is_ok() && case.store.path.exists());
-    let _ = std::fs::remove_dir_all(&case.dir);
+    let (rig, store, audio, dir) = pending_engine("partial");
+    remember(&store, &audio, Some("m-teil"));
+    assert_eq!(store.unfinished(&rig.client).unwrap().meeting_id.as_deref(), Some("m-teil"));
+    assert!(store.reconcile(&rig.client, &audio).is_ok());
+    remember(&store, &audio, Some("m-fail"));
+    assert_eq!(store.reconcile(&rig.client, &audio).unwrap_err(), STILL_RUNNING);
+    assert!(store.path.exists());
+    remember(&store, &audio, Some("m-teil"));
+    assert!(store.reconcile(&rig.client, r"C:\ein\anderes\audio.flac").is_ok());
+    remember(&store, &audio, None);
+    assert!(store.reconcile(&rig.client, &audio).is_ok() && store.path.exists());
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn forgetting_removes_the_partial_meeting_but_never_a_complete_one() {
-    let case = PendingCase::new("forget");
-    case.remember(Some("m-fail"));
-    assert_eq!(case.store.forget(Ok(case.engine())).unwrap_err(), STILL_RUNNING);
-    assert!(case.store.path.exists());
+    let (rig, store, audio, dir) = pending_engine("forget");
+    remember(&store, &audio, Some("m-fail"));
+    assert_eq!(store.forget(Some(&rig.client)).unwrap_err(), STILL_RUNNING);
+    assert!(store.path.exists());
     for id in [Some("m-teil"), Some("m-fertig"), Some("m-weg"), None] {
-        case.remember(id);
-        assert!(case.store.forget(Ok(case.engine())).is_ok() && !case.store.path.exists());
+        remember(&store, &audio, id);
+        assert!(store.forget(Some(&rig.client)).is_ok() && !store.path.exists());
     }
-    case.remember(Some("m-teil"));
-    assert!(case.store.forget(Err("keine Engine".into())).is_ok() && !case.store.path.exists());
-    let _ = std::fs::remove_dir_all(&case.dir);
-}
-
-#[test]
-fn heartbeat_events_never_reach_the_frontend() {
-    let (events, _) = run_fake("", &["start", "x.wav", "--events"], None);
-    assert_eq!(names(&events), ["preflight", "transcribing", "done", "exit"]);
-}
-
-#[test]
-fn a_download_session_streams_progress_then_done_and_reports_failures_with_detail() {
-    let (events, session) = run_fake("", &["setup", "--events", "--backend", "openvino", "--model", "small:int8"], None);
-    assert_eq!(names(&events), ["download", "done", "exit"]);
-    assert_eq!(events[0].1["total"], 257000000);
-    assert!(!session.active());
-    let (events, _) = run_fake("download_fail", &["setup", "--events", "--model", "small"], None);
-    assert_eq!(names(&events), ["download", "error", "exit"]);
-    assert!(events[1].1["detail"].as_str().unwrap().contains("offline"));
-    assert_eq!(events[2].1["terminal"], true);
-}
-
-#[test]
-fn engine_models_listing_runs_through_the_command_line() {
-    let engine = Engine { spec: EngineSpec { program: fake_engine(), args: vec![], source: "test".into() } };
-    assert_eq!(engine.json(&["--json", "models"]).unwrap()["default_model"], "large-v3-turbo");
+    remember(&store, &audio, Some("m-teil"));
+    assert!(store.forget(None).is_ok() && !store.path.exists());
+    let _ = std::fs::remove_dir_all(dir);
 }

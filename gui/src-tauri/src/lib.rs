@@ -1,12 +1,14 @@
+mod engine;
+
+use engine::{Detached, EngineClient, Notify, Timeouts};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use std::time::Instant;
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 
 const MOBILE: bool = cfg!(any(target_os = "android", target_os = "ios"));
@@ -21,36 +23,21 @@ const PENDING_FILE: &str = "pending.json";
 const LOG_FILE: &str = "engine.log";
 const HARDWARE: [&str; 5] = ["auto", "npu", "gpu", "igpu", "cpu"];
 const AUTO: &str = "auto";
-const DOWNLOAD_LOG_FILE: &str = "download.log";
 const DOWNLOAD_EVENT_NAME: &str = "download-event";
 const DOWNLOAD_EXIT_NAME: &str = "download-exit";
 const AUDIO_EXTENSIONS: [&str; 9] = ["wav", "flac", "mp3", "m4a", "ogg", "opus", "aac", "mp4", "webm"];
-const STDERR_TAIL: usize = 12;
-const POLL_MS: u64 = 50;
-const DISCARD_TRIES: usize = 4;
-const DISCARD_WAIT_MS: u64 = 300;
 const HEARTBEAT_EVENT: &str = "alive";
 const STILL_RUNNING: &str = "Die frühere Verarbeitung läuft vermutlich noch. Bitte einen Moment warten und es dann erneut versuchen.";
+const SESSION_BUSY: &str = "Es läuft bereits eine Sitzung.";
+const NO_SESSION: &str = "Keine Sitzung aktiv.";
+const RECORDING_KEPT: &str = "Die Aufnahme läuft noch. Erst beenden, damit das Audio gespeichert wird.";
 const EVENT_NAME: &str = "engine-event";
 const EXIT_NAME: &str = "engine-exit";
 const CLOSE_NAME: &str = "close-requested";
-
-trait Detached {
-    fn detached(&mut self) -> &mut Self;
-}
-
-impl Detached for Command {
-    #[cfg(windows)]
-    fn detached(&mut self) -> &mut Self {
-        use std::os::windows::process::CommandExt;
-        self.creation_flags(0x0800_0000)
-    }
-
-    #[cfg(not(windows))]
-    fn detached(&mut self) -> &mut Self {
-        self
-    }
-}
+const NOTICE_NAME: &str = "engine-notice";
+const RESTARTED: &str = "Die Engine war abgestürzt und wurde neu gestartet.";
+const RESTARTED_RUN: &str = "Die Engine war abgestürzt und wurde neu gestartet. Die laufende Verarbeitung wurde abgebrochen, das Audio bleibt erhalten.";
+const NOT_RESTARTED: &str = "Die Engine ist abgestürzt und ließ sich nicht neu starten";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -181,57 +168,6 @@ fn locate_engine(settings: &Settings) -> Result<EngineSpec, String> {
     Locator { settings, exists: &exists, path_var: std::env::var("PATH").unwrap_or_default(), exe_dir, build_repo }.locate()
 }
 
-struct Engine {
-    spec: EngineSpec,
-}
-
-impl Engine {
-    fn command(&self, args: &[String]) -> Command {
-        let mut cmd = Command::new(&self.spec.program);
-        cmd.args(&self.spec.args).args(args).detached();
-        cmd
-    }
-
-    fn run(&self, args: &[&str]) -> Result<String, String> {
-        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-        let output = self
-            .command(&args)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("Engine konnte nicht gestartet werden: {e}"))?;
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).to_string());
-        }
-        let err = String::from_utf8_lossy(&output.stderr);
-        let text = err.trim();
-        Err(if text.is_empty() { format!("Engine endete mit Code {}", output.status.code().unwrap_or(-1)) } else { text.to_string() })
-    }
-
-    fn json(&self, args: &[&str]) -> Result<Value, String> {
-        parse_json_output(&self.run(args)?)
-    }
-
-    fn meeting_state(&self, meeting_id: &str) -> Result<MeetingState, String> {
-        let listing = self.json(&["--json", "meetings"])?;
-        let found = listing.as_array().into_iter().flatten().find(|m| m["meeting_id"] == meeting_id);
-        Ok(match found {
-            None => MeetingState::Absent,
-            Some(m) if m["complete"].as_bool() == Some(false) => MeetingState::Partial,
-            Some(_) => MeetingState::Complete,
-        })
-    }
-
-    fn discard(&self, meeting_id: &str) -> bool {
-        for _ in 0..DISCARD_TRIES {
-            if self.run(&["discard", "--", meeting_id]).is_ok() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(DISCARD_WAIT_MS));
-        }
-        false
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum MeetingState {
     Absent,
@@ -239,27 +175,22 @@ enum MeetingState {
     Complete,
 }
 
-fn parse_json_output(text: &str) -> Result<Value, String> {
-    let trimmed = text.trim();
-    if let Ok(value) = serde_json::from_str(trimmed) {
-        return Ok(value);
+impl MeetingState {
+    fn parse(value: &Value) -> MeetingState {
+        match value["state"].as_str() {
+            Some("complete") => MeetingState::Complete,
+            Some("partial") => MeetingState::Partial,
+            _ => MeetingState::Absent,
+        }
     }
-    trimmed
-        .lines()
-        .rev()
-        .filter(|l| l.starts_with('{') || l.starts_with('['))
-        .find_map(|l| serde_json::from_str(l).ok())
-        .ok_or_else(|| "Antwort der Engine ist kein JSON.".to_string())
 }
 
-fn parse_event(line: &str) -> Option<Value> {
-    let line = line.trim();
-    if !line.starts_with('{') {
-        return None;
-    }
-    let value: Value = serde_json::from_str(line).ok()?;
-    value.get("event")?.as_str()?;
-    Some(value)
+fn meeting_state(engine: &Arc<EngineClient>, meeting_id: &str) -> Result<MeetingState, String> {
+    engine.call("meeting.state", json!({ "meeting_id": meeting_id })).map(|v| MeetingState::parse(&v))
+}
+
+fn settle_meeting(engine: &Arc<EngineClient>, meeting_id: &str) -> Result<MeetingState, String> {
+    engine.call("meeting.settle", json!({ "meeting_id": meeting_id })).map(|v| MeetingState::parse(&v))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -308,139 +239,6 @@ impl RunInfo {
     }
 }
 
-fn kill_tree(child: &mut Child) {
-    if cfg!(windows) {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .detached()
-            .status();
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-type Sink = Arc<dyn Fn(&str, Value) + Send + Sync>;
-
-struct Session {
-    child: Mutex<Child>,
-    stdin: Mutex<Option<ChildStdin>>,
-    stage: Mutex<(Stage, Instant)>,
-    info: Mutex<RunInfo>,
-    finished: AtomicBool,
-}
-
-impl Session {
-    fn spawn(mut cmd: Command, sink: Sink, log: Option<PathBuf>) -> Result<Arc<Session>, String> {
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Engine konnte nicht gestartet werden: {e}"))?;
-        let stdout = child.stdout.take().ok_or("Kein stdout der Engine")?;
-        let stderr = child.stderr.take().ok_or("Kein stderr der Engine")?;
-        let stdin = child.stdin.take();
-        let session = Arc::new(Session {
-            child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
-            stage: Mutex::new((Stage::Preflight, Instant::now())),
-            info: Mutex::new(RunInfo::default()),
-            finished: AtomicBool::new(false),
-        });
-        let tail = Arc::new(Mutex::new(Vec::<String>::new()));
-        let err_tail = tail.clone();
-        let mut log_file = log.as_ref().and_then(|p| std::fs::File::create(p).ok());
-        let err_thread = std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Some(file) = log_file.as_mut() {
-                    let _ = writeln!(file, "{line}");
-                }
-                let mut lines = err_tail.lock().unwrap();
-                lines.push(line);
-                if lines.len() > STDERR_TAIL {
-                    lines.remove(0);
-                }
-            }
-        });
-        let runner = session.clone();
-        std::thread::spawn(move || {
-            let mut terminal = false;
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some(event) = parse_event(&line).filter(|e| e["event"] != HEARTBEAT_EVENT) {
-                    runner.info.lock().unwrap().absorb(&event);
-                    let mut stage = runner.stage.lock().unwrap();
-                    let next = stage.0.after(&event);
-                    if next != stage.0 {
-                        *stage = (next, Instant::now());
-                    }
-                    terminal |= next == Stage::Finished;
-                    drop(stage);
-                    sink(EVENT_NAME, event);
-                }
-            }
-            let code = loop {
-                if let Ok(Some(status)) = runner.child.lock().unwrap().try_wait() {
-                    break status.code();
-                }
-                std::thread::sleep(Duration::from_millis(POLL_MS));
-            };
-            let _ = err_thread.join();
-            *runner.stage.lock().unwrap() = (Stage::Finished, Instant::now());
-            runner.stdin.lock().unwrap().take();
-            runner.finished.store(true, Ordering::SeqCst);
-            let info = runner.info.lock().unwrap().clone();
-            let log = log.map(|p| p.to_string_lossy().to_string());
-            sink(EXIT_NAME, json!({ "code": code, "terminal": terminal, "stderr": tail.lock().unwrap().join("\n"), "audio": info.audio, "log": log }));
-        });
-        Ok(session)
-    }
-
-    fn stage(&self) -> Stage {
-        self.stage.lock().unwrap().0
-    }
-
-    fn info(&self) -> RunInfo {
-        self.info.lock().unwrap().clone()
-    }
-
-    fn active(&self) -> bool {
-        !self.finished.load(Ordering::SeqCst)
-    }
-
-    fn state(&self) -> Value {
-        let (stage, since) = *self.stage.lock().unwrap();
-        let info = self.info();
-        json!({
-            "active": self.active(),
-            "stage": stage,
-            "elapsed_s": since.elapsed().as_secs(),
-            "audio": info.audio,
-            "input": info.input,
-            "warnings": info.warnings,
-        })
-    }
-
-    fn stop(&self) -> Result<(), String> {
-        if self.stage() != Stage::Recording {
-            return Err("Es läuft keine Aufnahme.".into());
-        }
-        let mut guard = self.stdin.lock().unwrap();
-        let stdin = guard.as_mut().ok_or("Die Engine nimmt keine Eingaben mehr an.")?;
-        stdin.write_all(b"\n").and_then(|_| stdin.flush()).map_err(|e| format!("Stopp nicht übermittelt: {e}"))
-    }
-
-    fn kill(&self) -> Result<(), String> {
-        if self.stage() == Stage::Recording {
-            return Err("Die Aufnahme läuft noch. Erst beenden, damit das Audio gespeichert wird.".into());
-        }
-        kill_tree(&mut self.child.lock().unwrap());
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug, Deserialize)]
 struct StartOptions {
     title: Option<String>,
@@ -475,30 +273,22 @@ impl StartOptions {
         }
     }
 
-    fn args(&self) -> Vec<String> {
-        let audio = self.audio();
-        let mut args: Vec<String> = ["start", "--events", "--no-open", "--device", &self.device].map(String::from).to_vec();
-        for (flag, value) in [("--backend", Self::choice(&self.backend)), ("--model", Self::choice(&self.model))] {
-            if value != AUTO {
-                args.extend([flag.into(), value]);
-            }
+    fn params(&self) -> Value {
+        let mut params = json!({ "device": self.device, "diarize": self.diarize });
+        match (self.audio(), Self::clean(&self.mic)) {
+            (Some(audio), _) => params["audio"] = json!(audio),
+            (None, Some(mic)) => params["mic"] = json!(mic),
+            _ => {}
         }
-        if audio.is_none() {
-            args.push("--stdin-stop".into());
-            if let Some(mic) = Self::clean(&self.mic) {
-                args.extend(["--mic".into(), mic]);
+        for (key, value) in [("backend", Self::choice(&self.backend)), ("model", Self::choice(&self.model))] {
+            if value != AUTO {
+                params[key] = json!(value);
             }
         }
         if let Some(title) = Self::clean(&self.title) {
-            args.extend(["--title".into(), title]);
+            params["title"] = json!(title);
         }
-        if !self.diarize {
-            args.push("--no-diarize".into());
-        }
-        if let Some(audio) = audio {
-            args.extend(["--".into(), audio]);
-        }
-        args
+        params
     }
 }
 
@@ -546,28 +336,18 @@ impl PendingStore {
         }
     }
 
-    fn settle(&self, engine: &Engine, meeting_id: &str) -> Result<MeetingState, String> {
-        match engine.meeting_state(meeting_id)? {
-            MeetingState::Partial if !engine.discard(meeting_id) => Err(STILL_RUNNING.into()),
-            state => Ok(state),
-        }
-    }
-
-    fn reconcile(&self, engine: &Engine, audio: &str) -> Result<(), String> {
+    fn reconcile(&self, engine: &Arc<EngineClient>, audio: &str) -> Result<(), String> {
         let Some(id) = self.load().filter(|p| p.audio == audio).and_then(|p| p.meeting_id) else { return Ok(()) };
-        if self.settle(engine, &id)? == MeetingState::Complete {
+        if settle_meeting(engine, &id)? == MeetingState::Complete {
             self.clear();
             return Err(format!("Diese Verarbeitung ist bereits abgeschlossen ({id}). Das Ergebnis steht unter „Besprechungen“."));
         }
         Ok(())
     }
 
-    fn unfinished(&self, engine: Result<Engine, String>) -> Option<Pending> {
+    fn unfinished(&self, engine: &Arc<EngineClient>) -> Option<Pending> {
         let pending = self.load()?;
-        let finished = match (pending.meeting_id.as_deref(), engine) {
-            (Some(id), Ok(engine)) => engine.meeting_state(id) == Ok(MeetingState::Complete),
-            _ => false,
-        };
+        let finished = pending.meeting_id.as_deref().is_some_and(|id| meeting_state(engine, id) == Ok(MeetingState::Complete));
         if finished {
             self.clear();
             return None;
@@ -575,9 +355,13 @@ impl PendingStore {
         Some(pending)
     }
 
-    fn forget(&self, engine: Result<Engine, String>) -> Result<(), String> {
-        if let (Some(id), Ok(engine)) = (self.read().and_then(|p| p.meeting_id), engine) {
-            self.settle(&engine, &id)?;
+    fn forget(&self, engine: Option<&Arc<EngineClient>>) -> Result<(), String> {
+        if let (Some(id), Some(engine)) = (self.read().and_then(|p| p.meeting_id), engine) {
+            if let Err(error) = settle_meeting(engine, &id) {
+                if error == STILL_RUNNING {
+                    return Err(error);
+                }
+            }
         }
         self.clear();
         Ok(())
@@ -612,66 +396,154 @@ struct SpeakerName {
     name: String,
 }
 
-struct AppState {
-    settings_path: PathBuf,
+struct Tracker {
+    active: bool,
+    stage: Stage,
+    since: Instant,
+    info: RunInfo,
+    options: Option<StartOptions>,
+}
+
+impl Tracker {
+    fn idle() -> Tracker {
+        Tracker { active: false, stage: Stage::Finished, since: Instant::now(), info: RunInfo::default(), options: None }
+    }
+
+    fn begin(&mut self, options: StartOptions) -> Result<(), String> {
+        if self.active {
+            return Err(SESSION_BUSY.into());
+        }
+        *self = Tracker { active: true, stage: Stage::Preflight, options: Some(options), ..Tracker::idle() };
+        Ok(())
+    }
+
+    fn absorb(&mut self, event: &Value) {
+        self.info.absorb(event);
+        let next = self.stage.after(event);
+        if next != self.stage {
+            self.stage = next;
+            self.since = Instant::now();
+        }
+    }
+
+    fn finish(&mut self) -> RunInfo {
+        self.active = false;
+        self.stage = Stage::Finished;
+        self.info.clone()
+    }
+
+    fn state(&self) -> Value {
+        if !self.active {
+            return json!({ "active": false, "stage": "finished" });
+        }
+        json!({
+            "active": true,
+            "stage": self.stage,
+            "elapsed_s": self.since.elapsed().as_secs(),
+            "audio": self.info.audio,
+            "input": self.info.input,
+            "warnings": self.info.warnings,
+        })
+    }
+}
+
+type Emit<'a> = &'a dyn Fn(&str, Value);
+
+struct Core {
     pending: PendingStore,
     log_path: PathBuf,
-    download_log_path: PathBuf,
-    session: Mutex<Option<Arc<Session>>>,
-    download: Mutex<Option<Arc<Session>>>,
+    run: Mutex<Tracker>,
+    download: AtomicBool,
+    interrupted: AtomicBool,
+}
+
+impl Core {
+    fn new(dir: &Path) -> Core {
+        Core { pending: PendingStore { path: dir.join(PENDING_FILE) }, log_path: dir.join(LOG_FILE), run: Mutex::new(Tracker::idle()), download: AtomicBool::new(false), interrupted: AtomicBool::new(false) }
+    }
+
+    fn payload(params: &Value) -> Value {
+        let mut event = params.clone();
+        if let Some(map) = event.as_object_mut() {
+            map.remove("run");
+        }
+        event
+    }
+
+    fn exit_payload(&self, params: &Value, info: &RunInfo, terminal: bool, stderr: &str) -> Value {
+        json!({ "code": params["code"], "terminal": terminal, "stderr": stderr, "audio": info.audio, "log": self.log_path.to_string_lossy() })
+    }
+
+    fn route(&self, emit: Emit, method: &str, params: Value) {
+        match method {
+            "run.event" => {
+                let event = Self::payload(&params);
+                if event["event"] == HEARTBEAT_EVENT {
+                    return;
+                }
+                {
+                    let mut run = self.run.lock().unwrap();
+                    run.absorb(&event);
+                    if let Some(options) = run.options.clone() {
+                        self.pending.observe(&event, &options);
+                    }
+                }
+                emit(EVENT_NAME, event);
+            }
+            "run.exit" => {
+                let info = self.run.lock().unwrap().finish();
+                emit(EXIT_NAME, self.exit_payload(&params, &info, params["terminal"].as_bool().unwrap_or(false), ""));
+            }
+            "download.event" => emit(DOWNLOAD_EVENT_NAME, Self::payload(&params)),
+            "download.exit" => {
+                self.download.store(false, Ordering::SeqCst);
+                emit(DOWNLOAD_EXIT_NAME, json!({ "code": params["code"], "terminal": params["terminal"], "stderr": params["stderr"], "audio": null, "log": self.log_path.to_string_lossy() }));
+            }
+            "engine.crashed" => {
+                let stderr = params["stderr"].as_str().unwrap_or("");
+                let mut run = self.run.lock().unwrap();
+                if run.active {
+                    self.interrupted.store(true, Ordering::SeqCst);
+                    let info = run.finish();
+                    emit(EXIT_NAME, self.exit_payload(&params, &info, false, stderr));
+                }
+                drop(run);
+                if self.download.swap(false, Ordering::SeqCst) {
+                    emit(DOWNLOAD_EXIT_NAME, json!({ "code": params["code"], "terminal": false, "stderr": stderr, "audio": null, "log": self.log_path.to_string_lossy() }));
+                }
+            }
+            "engine.restarted" => {
+                let text = if params["ok"] == true {
+                    if self.interrupted.swap(false, Ordering::SeqCst) { RESTARTED_RUN.to_string() } else { RESTARTED.to_string() }
+                } else {
+                    format!("{NOT_RESTARTED}: {}", params["error"].as_str().unwrap_or("unbekannter Grund"))
+                };
+                emit(NOTICE_NAME, json!({ "text": text }));
+            }
+            _ => {}
+        }
+    }
+}
+
+struct AppState {
+    settings_path: PathBuf,
+    core: Arc<Core>,
+    engine: Arc<EngineClient>,
 }
 
 impl AppState {
-    fn launch(&self, spawn: impl FnOnce() -> Result<Arc<Session>, String>) -> Result<(), String> {
-        let mut slot = self.session.lock().unwrap();
-        if slot.as_ref().is_some_and(|s| s.active()) {
-            return Err("Es läuft bereits eine Sitzung.".into());
-        }
-        let download = self.download.lock().unwrap();
-        if download.as_ref().is_some_and(|s| s.active()) {
-            return Err("Während eines Modell-Downloads startet keine Aufnahme oder Verarbeitung.".into());
-        }
-        *slot = Some(spawn()?);
-        Ok(())
-    }
-
     fn settings(&self) -> Settings {
         Settings::load(&self.settings_path)
     }
-
-    fn engine(&self) -> Result<Engine, String> {
-        locate_engine(&self.settings()).map(|spec| Engine { spec })
-    }
-
-    fn active_session(&self) -> Option<Arc<Session>> {
-        self.session.lock().unwrap().clone().filter(|s| s.active())
-    }
-
-    fn active_download(&self) -> Option<Arc<Session>> {
-        self.download.lock().unwrap().clone().filter(|s| s.active())
-    }
-
-    fn start_download(&self, spawn: impl FnOnce() -> Result<Arc<Session>, String>) -> Result<(), String> {
-        let session = self.session.lock().unwrap();
-        if session.as_ref().is_some_and(|s| s.active()) {
-            return Err("Während einer Aufnahme oder Verarbeitung wird nichts heruntergeladen.".into());
-        }
-        let mut slot = self.download.lock().unwrap();
-        if slot.as_ref().is_some_and(|s| s.active()) {
-            return Err("Es läuft bereits ein Download.".into());
-        }
-        *slot = Some(spawn()?);
-        Ok(())
-    }
 }
 
-fn download_args(backend: &str, model: &str) -> Result<Vec<String>, String> {
+fn download_params(backend: &str, model: &str) -> Result<Value, String> {
     for (label, value) in [("Backend", backend), ("Modell", model)] {
         if !safe_choice(value) || value == AUTO {
             return Err(format!("Ungültige Angabe bei {label}: {value}"));
         }
     }
-    Ok(["setup", "--events", "--backend", backend, "--model", model].map(String::from).to_vec())
+    Ok(json!({ "backend": backend, "model": model }))
 }
 
 fn config_dir(app: &tauri::App) -> PathBuf {
@@ -683,6 +555,15 @@ fn config_dir(app: &tauri::App) -> PathBuf {
 
 fn check_row(id: &str, label: &str, ok: bool, fix: Option<String>, detail: Option<String>) -> Value {
     json!({ "id": id, "label": label, "ok": ok, "fix": fix, "detail": detail })
+}
+
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(work).await.map_err(|e| e.to_string())
+}
+
+async fn ask(state: &State<'_, AppState>, method: &'static str, params: Value) -> Result<Value, String> {
+    let engine = state.engine.clone();
+    blocking(move || engine.call(method, params)).await?
 }
 
 #[tauri::command]
@@ -707,7 +588,7 @@ fn engine_info(state: State<'_, AppState>) -> Result<EngineSpec, String> {
 
 #[tauri::command]
 async fn list_meetings(state: State<'_, AppState>) -> Result<Value, String> {
-    state.engine()?.json(&["--json", "meetings"])
+    ask(&state, "meetings", json!({})).await
 }
 
 #[tauri::command]
@@ -715,39 +596,40 @@ async fn search_text(state: State<'_, AppState>, term: String) -> Result<Value, 
     if term.trim().is_empty() {
         return Ok(json!([]));
     }
-    state.engine()?.json(&["--json", "search", "--limit", "50", "--", term.trim()])
+    ask(&state, "search", json!({ "term": term.trim(), "limit": 50 })).await
 }
 
 #[tauri::command]
 async fn get_report(state: State<'_, AppState>, meeting_id: String) -> Result<Value, String> {
-    state.engine()?.json(&["--json", "report", "--", &meeting_id])
+    ask(&state, "report", json!({ "meeting_id": meeting_id })).await
 }
 
 #[tauri::command]
 async fn list_models(state: State<'_, AppState>) -> Result<Value, String> {
-    state.engine()?.json(&["--json", "models"])
+    ask(&state, "models", json!({})).await
 }
 
 #[tauri::command]
-async fn download_model(app: AppHandle, state: State<'_, AppState>, backend: String, model: String) -> Result<(), String> {
-    let args = download_args(&backend, &model)?;
-    let engine = state.engine()?;
-    state.start_download(|| {
-        let sink: Sink = Arc::new(move |name, payload| {
-            let _ = app.emit(if name == EVENT_NAME { DOWNLOAD_EVENT_NAME } else { DOWNLOAD_EXIT_NAME }, payload);
-        });
-        Session::spawn(engine.command(&args), sink, Some(state.download_log_path.clone()))
-    })
+async fn download_model(state: State<'_, AppState>, backend: String, model: String) -> Result<(), String> {
+    let params = download_params(&backend, &model)?;
+    if state.core.download.swap(true, Ordering::SeqCst) {
+        return Err("Es läuft bereits ein Download.".into());
+    }
+    if let Err(error) = ask(&state, "download.start", params).await {
+        state.core.download.store(false, Ordering::SeqCst);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[tauri::command]
 fn download_state(state: State<'_, AppState>) -> Value {
-    json!({ "active": state.active_download().is_some() })
+    json!({ "active": state.core.download.load(Ordering::SeqCst) })
 }
 
 #[tauri::command]
 async fn list_devices(state: State<'_, AppState>) -> Result<Value, String> {
-    state.engine()?.json(&["--json", "devices"])
+    ask(&state, "devices", json!({})).await
 }
 
 #[tauri::command]
@@ -758,7 +640,7 @@ async fn run_checks(state: State<'_, AppState>) -> Result<Value, String> {
         Err(fix) => return Ok(json!([check_row("engine", label, false, Some(fix), None)])),
     };
     let detail = format!("{} ({})", spec.program.display(), spec.source);
-    match (Engine { spec }).json(&["--json", "check"]) {
+    match ask(&state, "check", json!({})).await {
         Ok(Value::Array(items)) => Ok(Value::Array([vec![check_row("engine", label, true, None, Some(detail))], items].concat())),
         Ok(_) => Ok(json!([check_row("engine", label, false, Some("Die Engine antwortet nicht wie erwartet.".into()), Some(detail))])),
         Err(err) => {
@@ -768,59 +650,76 @@ async fn run_checks(state: State<'_, AppState>) -> Result<Value, String> {
     }
 }
 
-#[tauri::command]
-async fn start_session(app: AppHandle, state: State<'_, AppState>, options: StartOptions) -> Result<(), String> {
+fn launch(core: &Core, engine: &Arc<EngineClient>, options: StartOptions) -> Result<(), String> {
     options.validate()?;
-    let engine = state.engine()?;
-    let args = options.args();
-    state.launch(|| {
-        if let Some(audio) = options.audio() {
-            state.pending.reconcile(&engine, &audio)?;
-        }
-        let pending = PendingStore { path: state.pending.path.clone() };
-        let sink: Sink = Arc::new(move |name, payload| {
-            if name == EVENT_NAME {
-                pending.observe(&payload, &options);
-            }
-            let _ = app.emit(name, payload);
-        });
-        Session::spawn(engine.command(&args), sink, Some(state.log_path.clone()))
+    if let Some(audio) = options.audio() {
+        core.pending.reconcile(engine, &audio)?;
+    }
+    core.run.lock().unwrap().begin(options.clone())?;
+    engine.call("run.start", options.params()).map(|_| ()).inspect_err(|_| {
+        core.run.lock().unwrap().finish();
     })
 }
 
+fn leave(core: &Core, engine: &Arc<EngineClient>) -> Result<(), String> {
+    let (active, stage, meeting_id) = {
+        let run = core.run.lock().unwrap();
+        (run.active, run.stage, run.info.meeting_id.clone())
+    };
+    if active && stage == Stage::Recording {
+        return Err(RECORDING_KEPT.to_string());
+    }
+    if active || core.download.load(Ordering::SeqCst) {
+        engine.abort();
+        core.run.lock().unwrap().finish();
+        core.download.store(false, Ordering::SeqCst);
+    }
+    if let Some(id) = meeting_id.filter(|_| active) {
+        let _ = settle_meeting(engine, &id);
+    }
+    Ok(())
+}
+
 #[tauri::command]
-fn stop_session(state: State<'_, AppState>) -> Result<(), String> {
-    state.active_session().ok_or("Keine Sitzung aktiv.")?.stop()
+async fn start_session(state: State<'_, AppState>, options: StartOptions) -> Result<(), String> {
+    let (core, engine) = (state.core.clone(), state.engine.clone());
+    blocking(move || launch(&core, &engine, options)).await?
+}
+
+#[tauri::command]
+async fn stop_session(state: State<'_, AppState>) -> Result<(), String> {
+    if !state.core.run.lock().unwrap().active {
+        return Err(NO_SESSION.into());
+    }
+    ask(&state, "run.stop", json!({})).await.map(|_| ())
 }
 
 #[tauri::command]
 fn session_state(state: State<'_, AppState>) -> Value {
-    match state.active_session() {
-        Some(session) => session.state(),
-        None => json!({ "active": false, "stage": "finished" }),
-    }
+    state.core.run.lock().unwrap().state()
 }
 
 #[tauri::command]
 async fn pending_run(state: State<'_, AppState>) -> Result<Option<Pending>, String> {
-    Ok(state.pending.unfinished(state.engine()))
+    let (core, engine) = (state.core.clone(), state.engine.clone());
+    blocking(move || core.pending.unfinished(&engine)).await
 }
 
 #[tauri::command]
 async fn discard_pending(state: State<'_, AppState>) -> Result<(), String> {
-    state.pending.forget(state.engine())
+    let (core, engine) = (state.core.clone(), state.engine.clone());
+    blocking(move || core.pending.forget(Some(&engine))).await?
 }
 
 #[tauri::command]
 async fn save_speakers(state: State<'_, AppState>, meeting_id: String, report: String, names: Vec<SpeakerName>) -> Result<Value, String> {
-    let engine = state.engine()?;
     if !report.to_lowercase().ends_with(".md") {
         return Err("Protokollpfad muss auf .md enden.".into());
     }
     for item in names.iter().filter(|n| !n.name.trim().is_empty()) {
-        engine.run(&["speakers", "set", "--meeting", &meeting_id, "--", &item.label, item.name.trim()])?;
+        ask(&state, "speakers.set", json!({ "meeting_id": meeting_id, "label": item.label, "name": item.name.trim() })).await?;
     }
-    engine.json(&["--json", "report", "--out", &report, "--", &meeting_id])
+    ask(&state, "report", json!({ "meeting_id": meeting_id, "out": report })).await
 }
 
 #[tauri::command]
@@ -849,42 +748,41 @@ async fn pick_audio(app: AppHandle) -> Option<String> {
 
 #[tauri::command]
 async fn exit_app(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(session) = state.active_session() {
-        session.kill()?;
-        if let (Some(id), Ok(engine)) = (session.info().meeting_id, state.engine()) {
-            engine.discard(&id);
-        }
-    }
-    if let Some(download) = state.active_download() {
-        let _ = download.kill();
-    }
+    let (core, engine) = (state.core.clone(), state.engine.clone());
+    blocking(move || leave(&core, &engine)).await??;
     app.exit(0);
     Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let dir = config_dir(app);
-            app.manage(AppState {
-                settings_path: dir.join(SETTINGS_FILE),
-                pending: PendingStore { path: dir.join(PENDING_FILE) },
-                log_path: dir.join(LOG_FILE),
-                download_log_path: dir.join(DOWNLOAD_LOG_FILE),
-                session: Mutex::new(None),
-                download: Mutex::new(None),
-            });
             let _ = std::fs::create_dir_all(&dir);
+            let core = Arc::new(Core::new(&dir));
+            let (handle, router) = (app.handle().clone(), core.clone());
+            let notify: Notify = Arc::new(move |method, params| router.route(&|name, payload| drop(handle.emit(name, payload)), method, params));
+            let settings_path = dir.join(SETTINGS_FILE);
+            let located = settings_path.clone();
+            let engine = EngineClient::new(Box::new(move || locate_engine(&Settings::load(&located))), notify, Some(dir.join(LOG_FILE)), Timeouts::default());
+            app.manage(AppState { settings_path, core, engine: engine.clone() });
+            if !MOBILE {
+                std::thread::spawn(move || drop(engine.start()));
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.app_handle().state::<AppState>();
-                if let Some(session) = state.active_session() {
+                let (active, stage, audio) = {
+                    let run = state.core.run.lock().unwrap();
+                    (run.active, run.stage, run.info.audio.clone())
+                };
+                if active {
                     api.prevent_close();
-                    let _ = window.emit(CLOSE_NAME, json!({ "stage": session.stage(), "audio": session.info().audio }));
+                    let _ = window.emit(CLOSE_NAME, json!({ "stage": stage, "audio": audio }));
                 }
             }
         })
@@ -911,8 +809,13 @@ pub fn run() {
             pick_audio,
             exit_app
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("Meetscribe konnte nicht gestartet werden");
+    app.run(|handle, event| {
+        if let RunEvent::Exit = event {
+            handle.state::<AppState>().engine.shutdown();
+        }
+    });
 }
 
 #[cfg(test)]

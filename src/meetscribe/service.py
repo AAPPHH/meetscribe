@@ -80,13 +80,14 @@ SPEAKERS_SQL = (
 class LocalPath:
     ANCHOR = re.compile(r"^([A-Za-z]:|\\\\\?\\Volume\{[^}]+\})(.*)$")
     NETWORK_DEVICES = ("lanman", "mup", "webdav", "redirector")
+    RAW_PREFIXES = ("\\\\", "\\??\\")
 
     @classmethod
     def remote(cls, audio):
         if sys.platform != "win32":
             return False
         text = str(audio).replace("/", "\\")
-        return text.startswith("\\\\") or cls.walk(os.path.abspath(text), 0)
+        return text.startswith(cls.RAW_PREFIXES) or cls.walk(os.path.abspath(text), 0)
 
     @classmethod
     def walk(cls, path, depth):

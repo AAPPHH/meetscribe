@@ -742,6 +742,13 @@ def test_local_path_refuses_junctions_to_a_network_target_on_every_component(lin
 
 
 @needs_windows
+@pytest.mark.parametrize("audio", ["\\??\\UNC\\192.0.2.31\\share\\a.wav", "/??/UNC/192.0.2.31/share/a.wav", "\\??\\GLOBALROOT\\Device\\Mup\\x\\a.wav", "\\??\\Z:\\a.wav", "\\\\?\\UNC\\192.0.2.31\\share\\a.wav"])
+def test_local_path_refuses_nt_prefixed_paths_without_touching_them(audio, monkeypatch):
+    monkeypatch.setattr(service.LocalPath, "walk", classmethod(lambda cls, path, depth: pytest.fail("walked")))
+    assert service.LocalPath.remote(audio)
+
+
+@needs_windows
 def test_local_path_follows_a_link_loop_to_a_refusal_not_a_hang(links, tmp_path):
     first = links("eins", "\\??\\" + str(tmp_path / "zwei"))
     links("zwei", "\\??\\" + str(first))

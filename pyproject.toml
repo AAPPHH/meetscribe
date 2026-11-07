@@ -16,6 +16,11 @@ dependencies = [
     "tzdata>=2026.6",
 ]
 
+[project.optional-dependencies]
+faster-whisper = [
+    "faster-whisper>=1.2,<2",
+]
+
 [project.scripts]
 meetscribe = "meetscribe.cli:main"
 

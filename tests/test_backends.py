@@ -342,6 +342,24 @@ def test_targets_pick_the_variants_a_model_needs(models):
             job.targets(*bad)
 
 
+def test_a_model_folder_named_like_an_int8_catalog_model_is_refused_on_the_npu(models):
+    rows = [NPU, IGPU, CPU]
+    plan = select(models, rows, model="whisper-large-v3-turbo-int8-ov")
+    assert [s.hardware for s in plan.steps] == ["igpu", "cpu"] and plan.primary.variant == "custom"
+    with pytest.raises(SelectionError, match="int8 läuft auf der NPU nicht"):
+        select(models, rows, hardware="npu", model="whisper-large-v3-turbo-int8-ov")
+    assert select(models, rows, hardware="npu", model="whisper-large-v3-turbo-fp16-ov").primary.hardware == "npu"
+    fill(models.root, "my-own-whisper")
+    assert select(models, rows, model="my-own-whisper").primary.hardware == "npu"
+
+
+def test_a_ct2_folder_is_skipped_for_openvino_with_a_plain_notice(models):
+    fill_ct2(models.root, "faster-whisper-large-v3-turbo")
+    plan = select(models, [NPU, CPU], model="faster-whisper-large-v3-turbo")
+    assert plan.primary.backend == "faster-whisper"
+    assert plan.notices == ["NPU mit OpenVINO übersprungen: Der Ordner faster-whisper-large-v3-turbo ist kein OpenVINO-Modell."]
+
+
 FAKE_OPENVINO = (
     "import os\n"
     "from pathlib import Path\n"

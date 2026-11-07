@@ -116,6 +116,16 @@ class Catalog:
     def dir_name(entry):
         return entry["repo"].split("/")[-1]
 
+    @classmethod
+    def variant_of(cls, backend, path):
+        name = Path(path).name
+        return next((v for variants in CATALOG["variants"][backend].values() for v, e in variants.items() if cls.dir_name(e) == name), None)
+
+    @classmethod
+    def refused(cls, backend, hardware, variant):
+        spec = cls.spec(backend, hardware)
+        return spec.get("refused", {}).get(variant) or f"Variante {variant} läuft auf {cls.label(hardware)} mit {cls.backend_label(backend)} nicht."
+
     @staticmethod
     def spec(backend, hardware):
         return CATALOG["backends"][backend]["devices"].get(hardware)
@@ -294,12 +304,15 @@ class Selection:
         if row is None:
             return {"status": "refused", "reason": spec.get("absent") or CATALOG["hardware"][hardware]["absent"], "variant": variant}
         if override is not None:
+            inferred = Catalog.variant_of(backend, override)
+            if inferred is not None and inferred not in spec["variants"]:
+                return {"status": "refused", "reason": Catalog.refused(backend, hardware, inferred), "variant": inferred, "row": row}
             return {"status": "ok", "reason": None, "variant": "custom", "row": row}
         variants = Catalog.variants(backend, model)
         if variant is not None and variant not in variants:
             return {"status": "refused", "reason": f"Unbekannte Variante '{variant}' für {model}. Verfügbar: {', '.join(variants)}.", "variant": variant, "row": row}
         if variant is not None and variant not in spec["variants"]:
-            return {"status": "refused", "reason": spec.get("refused", {}).get(variant) or f"Variante {variant} läuft auf {Catalog.label(hardware)} mit {label} nicht.", "variant": variant, "row": row}
+            return {"status": "refused", "reason": Catalog.refused(backend, hardware, variant), "variant": variant, "row": row}
         return {"status": "ok", "reason": None, "variant": variant, "row": row}
 
     def step(self, backend, hardware, model, variant, override):
@@ -358,7 +371,9 @@ class Selection:
         ready = [s for s in found if s.installed]
         primary = (ready or found)[0]
         if ready and primary is not found[0]:
-            notices.append(f"{found[0].label} mit {Catalog.backend_label(found[0].backend)} übersprungen: Modell {name} ({found[0].variant}) ist nicht installiert.")
+            skipped = found[0]
+            why = f"Der Ordner {name} ist kein {Catalog.backend_label(skipped.backend)}-Modell." if override is not None else f"Modell {name} ({skipped.variant}) ist nicht installiert."
+            notices.append(f"{skipped.label} mit {Catalog.backend_label(skipped.backend)} übersprungen: {why}")
         steps = [primary]
         if fallback:
             start = order.index(primary.hardware)

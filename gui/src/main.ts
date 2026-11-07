@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-type Settings = { engine: string; repo: string; device: string; mic: string; diarize: boolean };
+type Settings = { engine: string; repo: string; device: string; backend: string; model: string; mic: string; diarize: boolean };
 type Label = { label: string; sample: string };
 type EngineEvent = {
   event: string;
@@ -16,15 +16,34 @@ type EngineEvent = {
   segments?: number;
   speakers?: number;
   labels?: Label[];
+  backend?: string;
+  device?: string;
+  model?: string;
+  variant?: string;
+  ran?: Ran;
+  from?: string;
+  to?: string;
+  bytes?: number;
+  total?: number;
 };
+type Ran = { backend: string; devices: string[]; model: string; variant: string; requested: string; fallback: boolean; text: string };
 type ExitInfo = { code: number | null; terminal: boolean; stderr: string; audio?: string | null; log?: string | null };
 type SessionState = { active: boolean; stage: string; elapsed_s?: number; audio?: string | null; input?: string | null; warnings?: string[] };
-type Pending = { audio: string; meeting_id: string | null; title: string | null; device: string; diarize: boolean };
+type Pending = { audio: string; meeting_id: string | null; title: string | null; device: string; backend?: string | null; model?: string | null; diarize: boolean };
 type Platform = { mobile: boolean; notice: string | null };
 type Check = { id: string; label: string; ok: boolean; fix: string | null; detail?: string | null; scope?: string | null };
 type Meeting = { meeting_id: string; title: string | null; meeting_date: string; segments: number; speakers: number; duration_s: number; complete?: boolean };
 type Hit = { meeting_id: string; start_s: number; display_name: string; text: string; complete?: boolean };
 type Devices = { inputs: { name: string }[]; inputs_error: string | null; openvino: { device: string; name: string }[] };
+type Resolved = { model: string; backend: string; hardware: string; device: string; variant: string; installed: boolean; status: string; reason: string | null; requested: string; notices: string[] };
+type Choice = { backend: string; hardware: string; model: string; ok: boolean; reason: string | null; resolved: Resolved | null; size_mb: number | null; installed: boolean; status: string; notices: string[] };
+type ModelsInfo = {
+  default_model: string;
+  backends: { id: string; label: string; installed: boolean; reason: string | null }[];
+  hardware: { id: string; label: string; present: boolean; name: string | null; reason: string | null }[];
+  models: { backend: string; model: string; variant: string; size_mb: number; installed: boolean }[];
+  choices: Choice[];
+};
 
 const TEXT = {
   stages: {
@@ -34,7 +53,10 @@ const TEXT = {
     transcribingPlain: "Transkription",
     saving: "Beende Aufnahme",
   } as Record<string, string>,
-  devices: { npu: "NPU", gpu: "GPU", cpu: "CPU" } as Record<string, string>,
+  auto: "Automatisch",
+  hardware: { auto: "Automatisch (NPU, GPU, iGPU, CPU)", npu: "NPU", gpu: "GPU (dedizierte Karte)", igpu: "iGPU (integrierte Grafik)", cpu: "CPU" } as Record<string, string>,
+  hardwareShort: { npu: "NPU", gpu: "GPU", igpu: "iGPU", cpu: "CPU" } as Record<string, string>,
+  backends: { openvino: "OpenVINO", "faster-whisper": "faster-whisper" } as Record<string, string>,
   micFixed: [["", "Automatisch (DJI, sonst Laptop)"], ["dji", "DJI"], ["laptop", "Laptop"], ["both", "Beide Mikrofone"]],
   unknownExit: "Die Engine wurde unerwartet beendet.",
   close: {
@@ -172,8 +194,36 @@ class Tabs {
   }
 }
 
+const size = (mb: number) => (mb >= 1000 ? `${(mb / 1000).toFixed(1).replace(".", ",")} GB` : `${mb} MB`);
+const bytes = (n: number) => size(Math.round(n / 1_000_000));
+
+class ModelCatalog {
+  info: ModelsInfo | null = null;
+
+  async load() {
+    this.info = await call<ModelsInfo>("list_models").catch(() => null);
+  }
+
+  choice(settings: Settings, over: Partial<Settings> = {}) {
+    const s = { ...settings, ...over };
+    return this.info?.choices.find((c) => c.backend === s.backend && c.hardware === s.device && c.model === s.model);
+  }
+
+  backendLabel(id: string) {
+    return this.info?.backends.find((b) => b.id === id)?.label ?? TEXT.backends[id] ?? id;
+  }
+
+  line(settings: Settings) {
+    const choice = this.choice(settings);
+    const r = choice?.resolved;
+    if (!r) return { text: `${TEXT.hardware[settings.device]?.split(" (")[0] ?? settings.device} · ${settings.model === "auto" ? this.info?.default_model ?? TEXT.auto : settings.model} · ${settings.backend === "auto" ? this.backendLabel("openvino") : this.backendLabel(settings.backend)}`, problem: choice && !choice.ok ? choice.reason : null };
+    const text = `${r.device} · ${r.model} · ${this.backendLabel(r.backend)}${choice.installed ? "" : " · nicht installiert"}`;
+    return { text, problem: null };
+  }
+}
+
 class SettingsStore {
-  value: Settings = { engine: "", repo: "", device: "npu", mic: "", diarize: true };
+  value: Settings = { engine: "", repo: "", device: "auto", backend: "auto", model: "auto", mic: "", diarize: true };
 
   async load() {
     this.value = await call<Settings>("get_settings");
@@ -194,8 +244,10 @@ class StartView {
   private ended = false;
   private diarize = true;
   private pending: Pending | null = null;
+  private planned = "";
+  private model = "";
 
-  constructor(private settings: SettingsStore, private tabs: Tabs, private modal: Modal) {
+  constructor(private settings: SettingsStore, private tabs: Tabs, private modal: Modal, private catalog: ModelCatalog) {
     $("start").addEventListener("click", () => this.begin(this.options()));
     $("stop").addEventListener("click", () => this.stop());
     $("pick").addEventListener("click", async () => {
@@ -216,15 +268,16 @@ class StartView {
   }
 
   summary() {
-    const s = this.settings.value;
-    const mic = TEXT.micFixed.find(([v]) => v === s.mic)?.[1] ?? s.mic;
-    $("summary").textContent = `Mikrofon: ${mic} · Gerät: ${TEXT.devices[s.device]} · Sprecher trennen: ${s.diarize ? "ja" : "nein"}`;
+    const { text, problem } = this.catalog.line(this.settings.value);
+    const line = $("summary");
+    line.textContent = problem ? `${text} · ${problem}` : text;
+    line.classList.toggle("warn", Boolean(problem));
   }
 
   options() {
     const s = this.settings.value;
     const audio = $<HTMLInputElement>("audio").value.trim();
-    return { title: $<HTMLInputElement>("title").value.trim() || null, audio: audio || null, mic: s.mic || null, device: s.device, diarize: s.diarize };
+    return { title: $<HTMLInputElement>("title").value.trim() || null, audio: audio || null, mic: s.mic || null, device: s.device, backend: s.backend, model: s.model, diarize: s.diarize };
   }
 
   async restore() {
@@ -249,7 +302,7 @@ class StartView {
 
   retryPending() {
     const p = this.pending;
-    if (p) this.begin({ title: p.title, audio: p.audio, mic: null, device: p.device, diarize: p.diarize });
+    if (p) this.begin({ title: p.title, audio: p.audio, mic: null, device: p.device, backend: p.backend ?? "auto", model: p.model ?? "auto", diarize: p.diarize });
   }
 
   async discardPending() {
@@ -286,6 +339,8 @@ class StartView {
     this.diarize = diarize;
     $("pending").hidden = true;
     $("input-name").textContent = "";
+    $("engine-name").textContent = "";
+    this.planned = "";
     this.showAudio();
     $<HTMLButtonElement>("stop").hidden = true;
     this.show("running");
@@ -348,6 +403,12 @@ class StartView {
     }
   }
 
+  engineName(device: string, suffix: string, backend?: string) {
+    if (!device) return;
+    this.planned = `${device} · ${this.model} · ${this.catalog.backendLabel(backend ?? "openvino")}`;
+    $("engine-name").textContent = `Läuft auf: ${this.planned}${suffix}`;
+  }
+
   warn(message: string) {
     const list = $("warnings");
     list.appendChild(el("li", message));
@@ -361,8 +422,11 @@ class StartView {
       this.startClock();
       this.recording(ev.input ?? "");
     } else if (ev.event === "warning") this.warn(ev.message ?? "");
+    else if (ev.event === "fallback") this.engineName(ev.to ?? "", ` (Rückfall von ${ev.from ?? "?"})`, ev.backend);
     else if (ev.event === "transcribing") {
       this.audio = ev.audio ?? this.audio;
+      this.model = ev.model ?? "";
+      this.engineName(ev.device ?? "", "", ev.backend);
       this.processing();
     } else if (ev.event === "done") this.finish(ev);
     else if (ev.event === "error") this.fail(ev);
@@ -393,6 +457,8 @@ class StartView {
     const labels = ev.labels ?? [];
     $("result-title").textContent = "Fertig";
     $("result-info").textContent = `${ev.segments ?? 0} Abschnitte${labels.length ? `, ${labels.length} Sprecher` : ""}. Protokoll: ${ev.report ?? ""}`;
+    const ran = ev.ran;
+    $("result-ran").textContent = ran ? `Verarbeitet mit: ${ran.text}${ran.fallback ? `. Angefordert war ${ran.requested}, es gab einen Rückfall.` : ""}` : "";
     const box = $("names");
     box.replaceChildren();
     if (!labels.length) box.append(el("p", "Keine Sprecher getrennt. Das Protokoll ist fertig.", "muted"));
@@ -565,13 +631,95 @@ class SearchView {
   }
 }
 
+class DownloadView {
+  private running = false;
+
+  constructor(private settings: SettingsStore, private catalog: ModelCatalog, private changed: () => void) {
+    $("download").addEventListener("click", () => this.start());
+    listen<EngineEvent>("download-event", (e) => this.onEvent(e.payload));
+    listen<ExitInfo>("download-exit", (e) => this.onExit(e.payload));
+  }
+
+  target() {
+    const choice = this.catalog.choice(this.settings.value);
+    const r = choice?.resolved;
+    return choice?.ok && r && !choice.installed ? { choice, r } : null;
+  }
+
+  render() {
+    const target = this.target();
+    $("download-box").hidden = !target && !this.running;
+    if (!target) return;
+    const { choice, r } = target;
+    $("download-text").textContent = `Das Modell ${r.model} (${this.catalog.backendLabel(r.backend)}, ${r.variant}) ist noch nicht installiert. Download: ${size(choice.size_mb ?? 0)}.`;
+    $<HTMLButtonElement>("download").disabled = this.running;
+  }
+
+  async start() {
+    const target = this.target();
+    if (!target) return;
+    const { r } = target;
+    this.running = true;
+    $("download-status").textContent = "Download startet …";
+    $("download-status").classList.remove("warn");
+    $("download-more").hidden = true;
+    $<HTMLProgressElement>("download-bar").value = 0;
+    $("download-bar").hidden = false;
+    this.render();
+    try {
+      await call("download_model", { backend: r.backend, model: `${r.model}:${r.variant}` });
+    } catch (err) {
+      this.failed(text(err), "");
+    }
+  }
+
+  onEvent(ev: EngineEvent) {
+    if (ev.event === "download") {
+      const bar = $<HTMLProgressElement>("download-bar");
+      bar.max = Math.max(ev.total ?? 0, ev.bytes ?? 0, 1);
+      bar.value = ev.bytes ?? 0;
+      $("download-status").textContent = `${bytes(ev.bytes ?? 0)} von etwa ${bytes(ev.total ?? 0)}`;
+    } else if (ev.event === "done") this.finished();
+    else if (ev.event === "error") this.failed(ev.message ?? "Der Download ist fehlgeschlagen.", ev.detail ?? "");
+  }
+
+  onExit(info: ExitInfo) {
+    if (this.running && !info.terminal) this.failed(`Der Download wurde unerwartet beendet (Code ${info.code ?? "?"}).`, info.stderr.trim());
+  }
+
+  finished() {
+    this.running = false;
+    $("download-bar").hidden = true;
+    $("download-status").textContent = "Fertig, das Modell ist installiert.";
+    this.changed();
+  }
+
+  failed(message: string, detail: string) {
+    this.running = false;
+    $("download-bar").hidden = true;
+    const status = $("download-status");
+    status.textContent = `Download fehlgeschlagen: ${message}`;
+    status.classList.add("warn");
+    $("download-detail").textContent = detail;
+    $("download-more").hidden = !detail.trim() || detail.trim() === message.trim();
+    this.render();
+  }
+}
+
 class SettingsView {
-  constructor(private store: SettingsStore, private start: StartView, private checks: ChecksView) {
-    $("set-device").addEventListener("change", () => this.save({ device: $<HTMLSelectElement>("set-device").value }));
+  constructor(private store: SettingsStore, private start: StartView, private checks: ChecksView, private catalog: ModelCatalog, private download: DownloadView) {
+    $("set-backend").addEventListener("change", () => this.choose({ backend: $<HTMLSelectElement>("set-backend").value }));
+    $("set-hardware").addEventListener("change", () => this.choose({ device: $<HTMLSelectElement>("set-hardware").value }));
+    $("set-model").addEventListener("change", () => this.choose({ model: $<HTMLSelectElement>("set-model").value }));
     $("set-mic").addEventListener("change", () => this.save({ mic: $<HTMLSelectElement>("set-mic").value }));
     $("set-diarize").addEventListener("change", () => this.save({ diarize: $<HTMLInputElement>("set-diarize").checked }));
     $("save-engine").addEventListener("click", () => this.saveEngine());
     $("reload-devices").addEventListener("click", () => this.loadDevices());
+  }
+
+  async choose(patch: Partial<Settings>) {
+    await this.save(patch);
+    this.render();
   }
 
   async save(patch: Partial<Settings>) {
@@ -588,7 +736,14 @@ class SettingsView {
   async saveEngine() {
     await this.save({ engine: $<HTMLInputElement>("set-engine").value.trim(), repo: $<HTMLInputElement>("set-repo").value.trim() });
     await this.engineInfo();
+    await this.reloadCatalog();
     this.checks.run();
+  }
+
+  async reloadCatalog() {
+    await this.catalog.load();
+    this.render();
+    this.start.summary();
   }
 
   async engineInfo() {
@@ -602,11 +757,55 @@ class SettingsView {
 
   fill() {
     const s = this.store.value;
-    $<HTMLSelectElement>("set-device").value = s.device;
     $<HTMLInputElement>("set-diarize").checked = s.diarize;
     $<HTMLInputElement>("set-engine").value = s.engine;
     $<HTMLInputElement>("set-repo").value = s.repo;
     this.mics([]);
+    this.render();
+  }
+
+  fillSelect(id: string, options: { value: string; label: string; disabled: boolean; title: string }[], current: string) {
+    const select = $<HTMLSelectElement>(id);
+    select.replaceChildren(...options.map((o) => Object.assign(el("option", o.label), { value: o.value, disabled: o.disabled && o.value !== current, title: o.title })));
+    if (!options.some((o) => o.value === current)) select.append(Object.assign(el("option", current), { value: current }));
+    select.value = current;
+  }
+
+  render() {
+    const s = this.store.value;
+    const info = this.catalog.info;
+    const reasonOf = (c?: Choice) => (c && !c.ok ? c.reason ?? "" : "");
+    const mark = (label: string, reason: string) => (reason ? `${label} – nicht möglich` : label);
+    const backends = ["auto", ...(info?.backends.map((b) => b.id) ?? ["openvino"])];
+    this.fillSelect("set-backend", backends.map((id) => {
+      const reason = reasonOf(this.catalog.choice(s, { backend: id })) || (info?.backends.find((b) => b.id === id)?.reason ?? "");
+      return { value: id, label: mark(id === "auto" ? TEXT.auto : this.catalog.backendLabel(id), reason), disabled: Boolean(reason), title: reason };
+    }), s.backend);
+    const hardware = ["auto", "npu", "gpu", "igpu", "cpu"];
+    this.fillSelect("set-hardware", hardware.map((id) => {
+      const row = info?.hardware.find((h) => h.id === id);
+      const reason = (row && !row.present ? row.reason ?? "Nicht vorhanden." : "") || reasonOf(this.catalog.choice(s, { device: id }));
+      const name = row?.present && row.name ? ` – ${row.name}` : "";
+      return { value: id, label: `${TEXT.hardware[id]}${reason ? " – " + (row && !row.present ? "nicht vorhanden" : "nicht möglich") : name}`, disabled: Boolean(reason), title: reason };
+    }), s.device);
+    const models = ["auto", ...(info ? [...new Set(info.models.map((m) => m.model))] : [s.model])];
+    this.fillSelect("set-model", models.map((id) => {
+      const choice = this.catalog.choice(s, { model: id });
+      const reason = reasonOf(choice);
+      const label = id === "auto" ? `${TEXT.auto} (${info?.default_model ?? ""})` : id;
+      const notes = [choice?.ok && !choice.installed ? `nicht installiert, ${size(choice.size_mb ?? 0)}` : "", choice?.status === "unverified" ? "auf dieser Hardware ungeprüft" : ""].filter(Boolean);
+      return { value: id, label: reason ? mark(label, reason) : notes.length ? `${label} – ${notes.join(", ")}` : label, disabled: Boolean(reason), title: reason || (choice?.resolved?.reason ?? "") };
+    }), s.model);
+    const current = this.catalog.choice(s);
+    const note = $("choice-info");
+    note.classList.toggle("warn", Boolean(current && !current.ok));
+    if (!info) note.textContent = "Die Auswahl lässt sich nicht prüfen, die Engine antwortet nicht.";
+    else if (current && !current.ok) note.textContent = current.reason ?? "";
+    else {
+      const r = current?.resolved;
+      note.textContent = [...(current?.notices ?? []), r ? `Läuft auf ${this.catalog.line(s).text}.` : "", r?.status === "unverified" ? r.reason ?? "" : ""].filter(Boolean).join(" ");
+    }
+    this.download.render();
   }
 
   mics(names: string[]) {
@@ -629,6 +828,7 @@ class SettingsView {
     } catch (err) {
       info.textContent = text(err);
     }
+    await this.reloadCatalog();
   }
 
   async activate() {
@@ -679,11 +879,15 @@ async function main() {
   const modal = new Modal();
   const store = new SettingsStore();
   await store.load().catch(() => undefined);
-  const start = new StartView(store, tabs, modal);
+  const catalog = new ModelCatalog();
+  await catalog.load();
+  const start = new StartView(store, tabs, modal, catalog);
   const meetings = new MeetingsView();
   new SearchView(tabs, meetings);
   const checks = new ChecksView(store);
-  const settings = new SettingsView(store, start, checks);
+  let settings: SettingsView;
+  const download = new DownloadView(store, catalog, () => settings.reloadCatalog());
+  settings = new SettingsView(store, start, checks, catalog, download);
   new CloseGuard(modal, start);
   tabs.on("meetings", () => meetings.load());
   tabs.on("search", () => $("search-term").focus());

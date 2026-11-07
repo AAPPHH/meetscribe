@@ -52,6 +52,7 @@
         <div id="stage" class="stage">Vorbereitung</div>
         <div id="elapsed" class="elapsed">00:00</div>
         <div id="input-name" class="muted"></div>
+        <div id="engine-name" class="muted"></div>
         <div id="audio-path" class="muted"></div>
       </div>
       <button id="stop" class="big stop" hidden>Aufnahme beenden</button>
@@ -60,6 +61,7 @@
     <div id="view-names" hidden>
       <h2 id="result-title">Fertig</h2>
       <p id="result-info" class="muted"></p>
+      <p id="result-ran" class="muted"></p>
       <div id="names"></div>
       <div class="row buttons">
         <button id="save-names" class="primary">Namen speichern</button>
@@ -95,13 +97,25 @@
     <ul id="search-results" class="results"></ul>
   </section>
   <section id="tab-settings" class="panel" hidden>
-    <label class="field">Gerät für die Transkription
-      <select id="set-device">
-        <option value="npu">NPU (Standard)</option>
-        <option value="gpu">GPU</option>
-        <option value="cpu">CPU</option>
-      </select>
+    <h2>Spracherkennung</h2>
+    <label class="field">Backend
+      <select id="set-backend"></select>
     </label>
+    <label class="field">Hardware
+      <select id="set-hardware"></select>
+    </label>
+    <label class="field">Modell
+      <select id="set-model"></select>
+    </label>
+    <p id="choice-info" class="muted"></p>
+    <div id="download-box" class="notice" hidden>
+      <p id="download-text"></p>
+      <progress id="download-bar" max="1" value="0" hidden></progress>
+      <div class="row buttons"><button id="download" class="primary">Herunterladen</button></div>
+      <p id="download-status" class="muted"></p>
+      <details id="download-more" hidden><summary>Einzelheiten</summary><pre id="download-detail"></pre></details>
+    </div>
+    <h2>Aufnahme</h2>
     <label class="field">Mikrofon
       <span class="row">
         <select id="set-mic"></select>

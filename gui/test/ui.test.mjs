@@ -5,7 +5,7 @@ import { JSDOM } from "jsdom";
 
 const HTML = readFileSync(new URL("../src/index.html", import.meta.url), "utf8").replace(/<script[\s\S]*?<\/script>/, "");
 const BUNDLE = new URL("./.build/main.js", import.meta.url).href;
-const SETTINGS = { engine: "", repo: "", device: "npu", mic: "", diarize: true };
+const SETTINGS = { engine: "", repo: "", device: "auto", backend: "auto", model: "auto", mic: "", diarize: true };
 const AUDIO = "C:\\Daten\\aufnahmen\\2026-11-06_101500.flac";
 let runs = 0;
 let dom = null;
@@ -147,7 +147,7 @@ test("eine unfertige Verarbeitung wird beim Start angeboten und lässt sich wied
   assert.equal(ui.$("pending").hidden, false);
   assert.ok(ui.$("pending-audio").textContent.includes(AUDIO));
   await ui.click("pending-retry");
-  assert.deepEqual(ui.called("start_session")[0].args.options, { title: "Runde", audio: AUDIO, mic: null, device: "gpu", diarize: false });
+  assert.deepEqual(ui.called("start_session")[0].args.options, { title: "Runde", audio: AUDIO, mic: null, device: "gpu", backend: "auto", model: "auto", diarize: false });
   await ui.emit("engine-event", { event: "transcribing", audio: AUDIO });
   assert.equal(ui.$("stage").textContent, "Transkription");
   await ui.emit("engine-event", { event: "done", meeting_id: "m-1", report: "C:\\r.md", segments: 2, speakers: 1, labels: [] });
@@ -315,4 +315,183 @@ test("der Hinweis auf die schnelle Lösung erscheint nur, wenn die Sprechertrenn
 test("lange Pfade laufen im Dialog nicht über den Rand", () => {
   const css = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
   for (const rule of [".dialog", ".muted", ".notice"]) assert.match(css, new RegExp(`${rule.replace(".", "\.")} \{[^}]*overflow-wrap: anywhere`));
+});
+
+const HARDWARE = ["auto", "npu", "gpu", "igpu", "cpu"];
+const BACKENDS = ["auto", "openvino", "faster-whisper"];
+const MODEL_IDS = ["auto", "small", "large-v3-turbo"];
+const SIZES = { small: 257, "large-v3-turbo": 1628 };
+
+function modelsInfo(installed = ["large-v3-turbo"]) {
+  const choices = [];
+  for (const b of BACKENDS) {
+    for (const h of HARDWARE) {
+      for (const m of MODEL_IDS) {
+        const backend = b === "auto" ? "openvino" : b;
+        const model = m === "auto" ? "large-v3-turbo" : m;
+        let reason = null;
+        if (backend === "faster-whisper") reason = ["auto", "cpu"].includes(h) ? "faster-whisper ist nicht installiert. Installieren mit: uv sync --extra faster-whisper" : "faster-whisper läuft nur auf der CPU und auf NVIDIA-Karten (CUDA).";
+        const hardware = h === "auto" ? "npu" : h === "gpu" ? "igpu" : h;
+        const variant = hardware === "npu" ? "fp16" : "int8";
+        const ok = !reason;
+        choices.push({
+          backend: b, hardware: h, model: m, ok, reason, size_mb: ok ? SIZES[model] : null, installed: ok && installed.includes(model), status: hardware === "npu" && model !== "large-v3-turbo" ? "unverified" : "ok",
+          notices: h === "gpu" ? ["Hinweis: --device gpu läuft hier auf der iGPU."] : [],
+          resolved: ok ? { model, backend, hardware, device: { npu: "NPU", igpu: "iGPU", cpu: "CPU" }[hardware], variant, installed: installed.includes(model), status: "ok", reason: null, requested: h, notices: [] } : null,
+        });
+      }
+    }
+  }
+  return {
+    default_model: "large-v3-turbo",
+    backends: [{ id: "openvino", label: "OpenVINO", installed: true, reason: null }, { id: "faster-whisper", label: "faster-whisper", installed: false, reason: "faster-whisper ist nicht installiert. Installieren mit: uv sync --extra faster-whisper" }],
+    hardware: [
+      { id: "npu", label: "NPU", present: true, name: "Intel(R) AI Boost", reason: null },
+      { id: "gpu", label: "GPU", present: false, name: null, reason: "Keine dedizierte Grafikkarte gefunden." },
+      { id: "igpu", label: "iGPU", present: true, name: "Intel(R) Arc(TM) 140V", reason: null },
+      { id: "cpu", label: "CPU", present: true, name: "Test CPU", reason: null },
+    ],
+    models: MODEL_IDS.filter((m) => m !== "auto").map((model) => ({ backend: "openvino", model, variant: "int8", size_mb: SIZES[model], installed: installed.includes(model) })),
+    choices,
+  };
+}
+
+const optionStates = (ui, id) => Object.fromEntries([...ui.$(id).options].map((o) => [o.value, o.disabled]));
+const option = (ui, id, value) => [...ui.$(id).options].find((o) => o.value === value);
+const change = async (ui, id, value) => {
+  ui.$(id).value = value;
+  ui.$(id).dispatchEvent(new dom.window.Event("change"));
+  await flush();
+};
+const openSettings = async () => {
+  document.querySelector('[data-tab="settings"]').click();
+  await flush();
+};
+
+test("die erste Seite zeigt eine ruhige Zeile mit der aufgelösten Wahl", async () => {
+  const ui = await boot({ list_models: () => modelsInfo() });
+  assert.equal(ui.$("summary").textContent, "NPU · large-v3-turbo · OpenVINO");
+  assert.equal(ui.$("summary").classList.contains("warn"), false);
+  assert.equal(ui.$("start").textContent, "Aufnahme starten");
+  assert.equal(document.querySelectorAll("#view-idle select").length, 0);
+});
+
+test("ohne Antwort der Engine zeigt die Zeile die gespeicherte Wahl und die Einstellungen sagen es", async () => {
+  const ui = await boot({}, { device: "cpu" });
+  assert.equal(ui.$("summary").textContent, "CPU · Automatisch · OpenVINO");
+  await openSettings();
+  assert.ok(ui.$("choice-info").textContent.includes("Die Auswahl lässt sich nicht prüfen"));
+});
+
+test("die Einstellungen haben drei Auswahlfelder, Standard ist Automatisch und die Wahl wird gespeichert", async () => {
+  const saved = [];
+  const ui = await boot({ list_models: () => modelsInfo(), save_settings: (a) => saved.push(a.settings) });
+  await openSettings();
+  for (const id of ["set-backend", "set-hardware", "set-model"]) assert.equal(ui.$(id).value, "auto");
+  assert.equal(ui.$("set-backend").options[0].textContent, "Automatisch");
+  await change(ui, "set-hardware", "igpu");
+  await change(ui, "set-model", "large-v3-turbo");
+  assert.deepEqual({ d: saved.at(-1).device, b: saved.at(-1).backend, m: saved.at(-1).model }, { d: "igpu", b: "auto", m: "large-v3-turbo" });
+  assert.equal(ui.$("summary").textContent, "iGPU · large-v3-turbo · OpenVINO");
+  await ui.click("start");
+  assert.deepEqual(ui.called("start_session")[0].args.options, { title: null, audio: null, mic: null, device: "igpu", backend: "auto", model: "large-v3-turbo", diarize: true });
+});
+
+test("eine gespeicherte Wahl bleibt nach dem Neustart stehen", async () => {
+  const ui = await boot({ list_models: () => modelsInfo() }, { device: "cpu", backend: "openvino", model: "small" });
+  assert.equal(ui.$("summary").textContent, "CPU · small · OpenVINO · nicht installiert");
+  await openSettings();
+  assert.deepEqual([ui.$("set-backend").value, ui.$("set-hardware").value, ui.$("set-model").value], ["openvino", "cpu", "small"]);
+});
+
+test("nicht vorhandene Hardware und unmögliche Kombinationen sind ausgegraut und nennen den Grund", async () => {
+  const ui = await boot({ list_models: () => modelsInfo() });
+  await openSettings();
+  const hardware = optionStates(ui, "set-hardware");
+  assert.equal(hardware.gpu, true);
+  assert.deepEqual([hardware.auto, hardware.npu, hardware.igpu, hardware.cpu], [false, false, false, false]);
+  const gpu = option(ui, "set-hardware", "gpu");
+  assert.ok(gpu.textContent.includes("nicht vorhanden") && gpu.title.includes("Keine dedizierte Grafikkarte"));
+  assert.equal(optionStates(ui, "set-backend")["faster-whisper"], true);
+  assert.ok(option(ui, "set-backend", "faster-whisper").title.includes("uv sync --extra faster-whisper"));
+  await change(ui, "set-hardware", "npu");
+  const fw = option(ui, "set-backend", "faster-whisper");
+  assert.ok(fw.disabled && fw.title.includes("nur auf der CPU"));
+});
+
+test("eine gespeicherte alte GPU-Wahl bleibt gültig und angezeigt, obwohl die Karte fehlt", async () => {
+  const ui = await boot({ list_models: () => modelsInfo() }, { device: "gpu" });
+  assert.equal(ui.$("summary").textContent, "iGPU · large-v3-turbo · OpenVINO");
+  await openSettings();
+  assert.equal(ui.$("set-hardware").value, "gpu");
+  assert.ok(ui.$("choice-info").textContent.includes("läuft hier auf der iGPU"));
+});
+
+test("ein nicht installiertes Modell zeigt Größe und Download mit Fortschritt und Abschluss", async () => {
+  let installed = ["large-v3-turbo"];
+  const ui = await boot({ list_models: () => modelsInfo(installed), download_model: () => null }, { model: "small", device: "cpu" });
+  await openSettings();
+  assert.equal(ui.$("download-box").hidden, false);
+  assert.ok(ui.$("download-text").textContent.includes("small") && ui.$("download-text").textContent.includes("257 MB"));
+  const small = option(ui, "set-model", "small");
+  assert.ok(small.textContent.includes("nicht installiert") && small.textContent.includes("257 MB"));
+  await ui.click("download");
+  assert.deepEqual(ui.called("download_model")[0].args, { backend: "openvino", model: "small:int8" });
+  assert.equal(ui.$("download").disabled, true);
+  await ui.emit("download-event", { event: "download", repo: "OpenVINO/whisper-small-int8-ov", bytes: 100_000_000, total: 257_000_000 });
+  assert.equal(ui.$("download-bar").hidden, false);
+  assert.equal(ui.$("download-bar").value, 100_000_000);
+  assert.ok(ui.$("download-status").textContent.includes("100 MB") && ui.$("download-status").textContent.includes("257 MB"));
+  installed = ["large-v3-turbo", "small"];
+  await ui.emit("download-event", { event: "done", messages: [] });
+  assert.equal(ui.$("download-box").hidden, true);
+  assert.equal(ui.$("summary").textContent, "CPU · small · OpenVINO");
+  assert.ok(ui.called("list_models").length >= 2);
+});
+
+test("ein fehlgeschlagener Download zeigt Meldung und Einzelheiten und lässt den Knopf wieder zu", async () => {
+  const ui = await boot({ list_models: () => modelsInfo(), download_model: () => null }, { model: "small", device: "cpu" });
+  await openSettings();
+  await ui.click("download");
+  await ui.emit("download-event", { event: "error", message: "Der Download ist fehlgeschlagen.", detail: "whisper OpenVINO/whisper-small-int8-ov: FEHLER OSError: offline" });
+  assert.ok(ui.$("download-status").textContent.includes("Download fehlgeschlagen: Der Download ist fehlgeschlagen."));
+  assert.equal(ui.$("download-status").classList.contains("warn"), true);
+  assert.equal(ui.$("download-more").hidden, false);
+  assert.ok(ui.$("download-detail").textContent.includes("offline"));
+  assert.equal(ui.$("download").disabled, false);
+  assert.equal(ui.$("download-bar").hidden, true);
+  await ui.click("download");
+  await ui.emit("download-exit", { code: -1, terminal: false, stderr: "abgestürzt" });
+  assert.ok(ui.$("download-status").textContent.includes("unerwartet beendet"));
+});
+
+test("ein Fehler beim Starten des Downloads wird angezeigt", async () => {
+  const ui = await boot({ list_models: () => modelsInfo(), download_model: () => Promise.reject("Es läuft bereits ein Download.") }, { model: "small", device: "cpu" });
+  await openSettings();
+  await ui.click("download");
+  assert.ok(ui.$("download-status").textContent.includes("Es läuft bereits ein Download."));
+  assert.equal(ui.$("download").disabled, false);
+});
+
+test("das Ergebnis nennt Hardware, Modell und Backend, die wirklich liefen, und einen Rückfall", async () => {
+  const ui = await boot({ list_models: () => modelsInfo(), start_session: () => null });
+  await startRun(ui);
+  await ui.emit("engine-event", { event: "transcribing", audio: AUDIO, meeting_id: "m-1", backend: "openvino", device: "NPU", model: "large-v3-turbo", variant: "fp16" });
+  assert.equal(ui.$("engine-name").textContent, "Läuft auf: NPU · large-v3-turbo · OpenVINO");
+  await ui.emit("engine-event", { event: "warning", message: "NPU fehlgeschlagen: RuntimeError: DEVICE_LOST. Rückfall auf iGPU (OpenVINO)." });
+  await ui.emit("engine-event", { event: "fallback", from: "NPU", to: "iGPU", backend: "openvino" });
+  assert.equal(ui.$("engine-name").textContent, "Läuft auf: iGPU · large-v3-turbo · OpenVINO (Rückfall von NPU)");
+  assert.ok(ui.$("warnings").textContent.includes("Rückfall auf iGPU") && ui.$("warnings").hidden === false);
+  const ran = { backend: "openvino", devices: ["iGPU"], model: "large-v3-turbo", variant: "int8", requested: "Automatisch", fallback: true, text: "iGPU · large-v3-turbo · OpenVINO" };
+  await ui.emit("engine-event", { event: "done", meeting_id: "m-1", report: "C:\\p.md", audio: AUDIO, segments: 2, speakers: 0, labels: [], ran });
+  assert.ok(ui.$("result-ran").textContent.includes("Verarbeitet mit: iGPU · large-v3-turbo · OpenVINO"));
+  assert.ok(ui.$("result-ran").textContent.includes("Angefordert war Automatisch, es gab einen Rückfall."));
+});
+
+test("ein Lauf ohne Rückfall nennt nur die tatsächliche Wahl", async () => {
+  const ui = await boot({ start_session: () => null });
+  await startRun(ui);
+  const ran = { backend: "openvino", devices: ["NPU"], model: "large-v3-turbo", variant: "fp16", requested: "NPU", fallback: false, text: "NPU · large-v3-turbo · OpenVINO" };
+  await ui.emit("engine-event", { event: "done", meeting_id: "m", report: "C:\\p.md", audio: AUDIO, segments: 1, speakers: 0, labels: [], ran });
+  assert.equal(ui.$("result-ran").textContent, "Verarbeitet mit: NPU · large-v3-turbo · OpenVINO");
 });

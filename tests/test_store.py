@@ -1,12 +1,15 @@
 import os
 import shutil
+import subprocess
+import sys
 import time
 from datetime import date
 
+import duckdb
 import pytest
 
 from meetscribe.store import (
-    CONFIG, DuplicateMeetingError, EOS, HotFile, MeetingNotFound, Query, Report, Store, make_config,
+    CONFIG, DuplicateMeetingError, EOS, FileLock, HotFile, LockBusy, MeetingNotFound, Query, Report, Store, make_config,
 )
 
 ALL_ROWS = "SELECT * FROM segments ORDER BY meeting_id, seg_id"
@@ -486,3 +489,137 @@ def test_only_old_cold_files_still_expose_the_backend_column(store):
     write_old_cold(store, "old-cold", "2026-01-05")
     cols, data = Query(store).execute("SELECT * FROM segments")
     assert "backend" in cols and {row[cols.index("backend")] for row in data} == {None}
+
+
+SANDBOX_REFUSED = [
+    "CREATE TABLE z (a INT)", "INSERT INTO speakers VALUES ('m1', 'x', 'y')", "DROP VIEW segments", "SET threads=1", "COPY segments TO 'x.csv'",
+    "ATTACH ':memory:' AS z", "INSTALL httpfs", "LOAD httpfs", "PRAGMA database_list", "EXPORT DATABASE 'x'", "SELECT 1; SELECT 2", "", "CALL pragma_version()",
+]
+
+
+@pytest.fixture
+def archive(store):
+    write(store, "m1")
+    write(store, "m2", day="2026-03-05")
+    store.rotate(force=True)
+    write(store, "m3", day="2026-03-06")
+    return Query(store, sandbox=True)
+
+
+def test_sandbox_select_reads_hot_and_cold_and_names(archive):
+    store = archive.store
+    store.speakers.set("m1", "SPEAKER_00", "Anna")
+    columns, found, more = archive.select("SELECT meeting_id, display_name FROM segments_named WHERE seg_id = 0 ORDER BY meeting_id")
+    assert columns == ["meeting_id", "display_name"] and not more
+    assert found == [("m1", "Anna"), ("m2", "SPEAKER_00"), ("m3", "SPEAKER_00")]
+    assert archive.select("FROM segments LIMIT 2")[2] is False and archive.select("WITH a AS (SELECT 1 AS x) SELECT * FROM a")[1] == [(1,)]
+
+
+def test_sandbox_limits_rows_and_reports_truncation(archive):
+    _, found, more = archive.select("SELECT * FROM range(5000)", 7)
+    assert len(found) == 7 and more
+    assert len(archive.select("SELECT * FROM range(5000)", 10 ** 9)[1]) == 1000
+    assert len(archive.select("SELECT * FROM range(5000)")[1]) == 200
+    assert archive.select("SELECT * FROM range(3)", 3)[2] is False
+
+
+@pytest.mark.parametrize("sql", SANDBOX_REFUSED)
+def test_sandbox_select_refuses_everything_but_one_select(archive, sql):
+    with pytest.raises(duckdb.Error):
+        archive.select(sql)
+    assert archive.select("SELECT count(*) FROM segments")[1] == [(9,)]
+
+
+def test_duckdb_itself_refuses_writes_settings_and_files_without_the_statement_filter(archive, tmp_path):
+    con = archive.con
+    target = tmp_path / "leak.csv"
+    secret = tmp_path / "secret.csv"
+    secret.write_text("a\n1\n")
+    for sql in (
+        "SET enable_external_access=true", "SET lock_configuration=false", f"COPY (SELECT 1) TO '{target.as_posix()}'",
+        f"SELECT * FROM read_csv('{secret.as_posix()}')", f"ATTACH '{(tmp_path / 'n.db').as_posix()}'", "INSTALL httpfs", "LOAD httpfs",
+        "SELECT * FROM glob('C:/*')",
+    ):
+        with pytest.raises(duckdb.Error):
+            con.execute(sql)
+    assert not target.exists()
+    con.execute("BEGIN TRANSACTION READ ONLY")
+    for sql in ("CREATE TABLE z (a INT)", "CREATE OR REPLACE VIEW segments AS SELECT 1", "INSERT INTO speakers SELECT * FROM speakers"):
+        with pytest.raises(duckdb.Error):
+            con.execute(sql)
+        con.execute("ROLLBACK")
+        con.execute("BEGIN TRANSACTION READ ONLY")
+    con.execute("ROLLBACK")
+    assert con.sql("SELECT count(*) FROM segments").fetchall() == [(9,)]
+
+
+def test_sandbox_file_access_is_limited_to_the_archive(archive, tmp_path):
+    secret = tmp_path / "secret.csv"
+    secret.write_text("a\n1\n")
+    for sql in (f"SELECT * FROM read_csv('{secret.as_posix()}')", f"SELECT * FROM read_text('{secret.as_posix()}')", "SELECT * FROM glob('*')", "SELECT * FROM read_parquet('C:/Windows/*.parquet')"):
+        with pytest.raises(duckdb.Error):
+            archive.select(sql)
+    cold = archive.store.cold_files()[0].as_posix()
+    assert archive.select(f"SELECT count(*) FROM read_parquet('{cold}')")[1] == [(3,)]
+
+
+def test_sandbox_query_is_cancelled_after_the_timeout_and_the_connection_stays_usable(archive):
+    started = time.monotonic()
+    with pytest.raises(duckdb.Error, match="abgebrochen"):
+        archive.select("SELECT count(*) FROM range(100000000000)", timeout_s=0.5)
+    assert time.monotonic() - started < 10
+    assert archive.select("SELECT count(*) FROM segments")[1] == [(9,)]
+
+
+def test_sandbox_sees_changes_from_other_writers(archive):
+    assert archive.select("SELECT count(*) FROM segments")[1] == [(9,)]
+    write(archive.store, "m4", day="2026-03-07")
+    archive.store.speakers.set("m4", "SPEAKER_01", "Bernd")
+    assert archive.select("SELECT count(*) FROM segments")[1] == [(12,)]
+    assert archive.select("SELECT any_value(display_name) FROM segments_named WHERE meeting_id = 'm4' AND speaker = 'SPEAKER_01'")[1] == [("Bernd",)]
+
+
+SPEAKER_WORKER = (
+    "import sys, time\n"
+    "from meetscribe.store import Store, make_config\n"
+    "store = Store(make_config(sys.argv[1]))\n"
+    "name, count, go = sys.argv[2], int(sys.argv[3]), float(sys.argv[4])\n"
+    "while time.time() < go: time.sleep(0.001)\n"
+    "for i in range(count): store.speakers.set('m1', f'{name}_{i}', f'{name}{i}')\n"
+)
+COUNT = 25
+
+
+def test_speaker_writes_from_two_processes_lose_nothing_while_a_third_reads(store):
+    write(store)
+    go = time.time() + 3.0
+    workers = [subprocess.Popen([sys.executable, "-c", SPEAKER_WORKER, str(store.config["data_dir"]), name, str(COUNT), str(go)]) for name in ("A", "B")]
+    reads = 0
+    while any(w.poll() is None for w in workers):
+        assert store.speakers.all().num_rows <= 2 * COUNT
+        Query(store).execute("SELECT count(*) FROM speakers")
+        reads += 1
+    assert [w.wait(60) for w in workers] == [0, 0] and reads
+    mapping = {(r["meeting_id"], r["label"]): r["name"] for r in store.speakers.all().to_pylist()}
+    assert len(mapping) == 2 * COUNT and mapping[("m1", "B_24")] == "B24" and mapping[("m1", "A_0")] == "A0"
+    assert not list(store.config["data_dir"].glob("*.tmp"))
+
+
+def test_speaker_lock_waits_for_the_holder_then_gives_up(store):
+    lock = store.speakers.locked()
+    with lock:
+        short = FileLock(store.speakers.lock_path, 0.2)
+        with pytest.raises(LockBusy):
+            short.__enter__()
+    with FileLock(store.speakers.lock_path, 0.2):
+        pass
+
+
+def test_rotate_from_two_processes_moves_each_meeting_once(store):
+    for i in range(6):
+        write(store, f"m{i}", day=f"2026-03-0{i + 1}")
+    code = "import sys; from meetscribe.store import Store, make_config; print(len(Store(make_config(sys.argv[1])).rotate()['rotated']))"
+    workers = [subprocess.Popen([sys.executable, "-c", code, str(store.config["data_dir"])], stdout=subprocess.PIPE, text=True) for _ in range(2)]
+    counts = [int(w.communicate(timeout=60)[0]) for w in workers]
+    assert sorted(counts) == [0, 6] and not store.hot_files() and len(store.cold_files()) == 6
+    assert Query(store).execute("SELECT count(*) FROM segments")[1] == [(18,)]

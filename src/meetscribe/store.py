@@ -2,6 +2,8 @@ import json
 import math
 import os
 import re
+import sys
+import threading
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -38,7 +40,14 @@ DUCKDB_SETTINGS = {
     "TimeZone": "'UTC'",
     "autoinstall_known_extensions": "false",
     "autoload_known_extensions": "false",
-    "lock_configuration": "true",
+}
+SANDBOX = {"memory_limit": "'1GB'", "threads": "2", "enable_external_access": "false"}
+SQL_LIMITS = {"default_rows": 200, "max_rows": 1000, "timeout_s": 20.0}
+LOCKS = {"speakers_wait_s": 15.0, "rotate_wait_s": 60.0, "poll_s": 0.05, "busy_tries": 40, "busy_wait_s": 0.05}
+TEXT = {
+    "select_only": "Erlaubt ist genau eine lesende SELECT-Abfrage ({kind}).",
+    "timeout": "Die Abfrage wurde nach {seconds:g} s abgebrochen.",
+    "busy": "Die Datei ist gerade gesperrt: {path}",
 }
 
 
@@ -68,6 +77,10 @@ class ExtensionBlocked(duckdb.Error):
     pass
 
 
+class ReadOnlyViolation(duckdb.Error):
+    pass
+
+
 class VerifyError(RuntimeError):
     pass
 
@@ -85,23 +98,77 @@ def conform(table):
     return pa.Table.from_arrays(columns, names=SCHEMA.names).cast(SCHEMA)
 
 
+def retry_busy(action):
+    for attempt in range(LOCKS["busy_tries"]):
+        try:
+            return action()
+        except PermissionError:
+            if attempt == LOCKS["busy_tries"] - 1:
+                raise
+            time.sleep(LOCKS["busy_wait_s"])
+
+
 def read_parquet(path):
-    with open(path, "rb") as handle:
-        return pq.read_table(handle)
+    def read():
+        with open(path, "rb") as handle:
+            return pq.read_table(handle)
+    return retry_busy(read)
 
 
 def atomic_parquet(table, path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     pq.write_table(table, tmp)
     if read_parquet(tmp).num_rows != table.num_rows:
         tmp.unlink()
         raise VerifyError(f"row count mismatch for {path.name}")
-    os.replace(tmp, path)
+    retry_busy(lambda: os.replace(tmp, path))
 
 
 def sql_literal(path):
     return "'" + path.as_posix().replace("'", "''") + "'"
+
+
+class LockBusy(OSError):
+    pass
+
+
+class FileLock:
+    def __init__(self, path, wait_s=0.0):
+        self.path = Path(path)
+        self.wait_s = wait_s
+        self.file = None
+
+    def _lock(self, take):
+        self.file.seek(0)
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK if take else msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(self.file.fileno(), (fcntl.LOCK_EX | fcntl.LOCK_NB) if take else fcntl.LOCK_UN)
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.file = open(self.path, "a+b")
+        deadline = time.monotonic() + self.wait_s
+        while True:
+            try:
+                self._lock(True)
+                return self
+            except OSError:
+                if time.monotonic() >= deadline:
+                    self.file.close()
+                    raise LockBusy(TEXT["busy"].format(path=self.path)) from None
+                time.sleep(LOCKS["poll_s"])
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self._lock(False)
+        except OSError:
+            pass
+        self.file.close()
+        return False
 
 
 class HotFile:
@@ -132,6 +199,10 @@ class HotFile:
 class SpeakerMap:
     def __init__(self, store):
         self.path = store.config["speakers_file"]
+        self.lock_path = store.config["data_dir"] / "speakers.lock"
+
+    def locked(self):
+        return FileLock(self.lock_path, LOCKS["speakers_wait_s"])
 
     def all(self):
         return read_parquet(self.path) if self.path.exists() else SPEAKER_SCHEMA.empty_table()
@@ -147,15 +218,17 @@ class SpeakerMap:
         name = name.strip()
         if not name:
             raise ValueError("name must not be empty")
-        mapping = self._mapping()
-        mapping[(meeting_id, label)] = name
-        self._write(mapping)
+        with self.locked():
+            mapping = self._mapping()
+            mapping[(meeting_id, label)] = name
+            self._write(mapping)
 
     def unset(self, meeting_id, label):
-        mapping = self._mapping()
-        removed = mapping.pop((meeting_id, label), None) is not None
-        if removed:
-            self._write(mapping)
+        with self.locked():
+            mapping = self._mapping()
+            removed = mapping.pop((meeting_id, label), None) is not None
+            if removed:
+                self._write(mapping)
         return removed
 
 
@@ -206,6 +279,10 @@ class Store:
         return self.cold_dir / f"year={day.year:04d}" / f"month={day.month:02d}" / f"{meeting_id}.parquet"
 
     def rotate(self, older_than_days=0, force=False):
+        with FileLock(self.config["data_dir"] / "rotate.lock", LOCKS["rotate_wait_s"]):
+            return self._rotate(older_than_days, force)
+
+    def _rotate(self, older_than_days, force):
         result = {"rotated": [], "skipped": []}
         for tmp in self.cold_dir.glob("**/*.tmp"):
             tmp.unlink(missing_ok=True)
@@ -311,10 +388,14 @@ class TranscriptWriter:
 
 
 class Query:
-    def __init__(self, store=None):
+    def __init__(self, store=None, sandbox=False):
         self.store = store or Store()
         self.con = duckdb.connect(":memory:")
-        for setting, value in DUCKDB_SETTINGS.items():
+        settings = dict(DUCKDB_SETTINGS)
+        if sandbox:
+            settings["allowed_directories"] = f"[{sql_literal(self.store.cold_dir.resolve())}]"
+            settings.update(SANDBOX)
+        for setting, value in {**settings, "lock_configuration": "true"}.items():
             self.con.execute(f"SET {setting}={value}")
         self.con.register("empty_segments", SCHEMA.empty_table())
         self._signature = None
@@ -376,6 +457,35 @@ class Query:
             return [], []
         table = relation.to_arrow_table()
         return table.column_names, list(zip(*(c.to_pylist() for c in table.columns)))
+
+    def select(self, sql, limit=None, timeout_s=None):
+        limit = min(max(int(limit or SQL_LIMITS["default_rows"]), 1), SQL_LIMITS["max_rows"])
+        try:
+            statements = self.con.extract_statements(sql)
+        except duckdb.Error as exc:
+            raise ReadOnlyViolation(str(exc)) from exc
+        kinds = [s.type for s in statements]
+        if kinds != [duckdb.StatementType.SELECT]:
+            raise ReadOnlyViolation(TEXT["select_only"].format(kind=", ".join(k.name for k in kinds) or "leer"))
+        self.refresh()
+        seconds = SQL_LIMITS["timeout_s"] if timeout_s is None else timeout_s
+        cursor = self.con
+        timer = threading.Timer(seconds, cursor.interrupt)
+        try:
+            cursor.execute("BEGIN TRANSACTION READ ONLY")
+            timer.start()
+            table = cursor.sql(sql).limit(limit + 1).to_arrow_table()
+            columns = table.column_names
+            rows = list(zip(*(c.to_pylist() for c in table.columns)))
+        except duckdb.InterruptException as exc:
+            raise duckdb.Error(TEXT["timeout"].format(seconds=seconds)) from exc
+        finally:
+            timer.cancel()
+            try:
+                cursor.execute("ROLLBACK")
+            except duckdb.Error:
+                pass
+        return columns, rows[:limit], len(rows) > limit
 
     def _records(self, sql, params=None):
         columns, rows = self.execute(sql, params)

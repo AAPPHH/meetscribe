@@ -8,7 +8,7 @@ meetscribe ist eine Windows-App für Besprechungen. Ein Klick startet die Aufnah
 
 Das Protokoll enthält Kopfdaten, eine Teilnehmertabelle (Redezeit, Anteil, Wörter) und das Transkript nach Sprechern. Es enthält keine Zusammenfassung und keine Aufgabenliste (siehe Hinweise). Alle Besprechungen landen in einem durchsuchbaren Archiv.
 
-Die App ist eine Hülle um die Engine (ein Python-Programm namens `meetscribe`). Die Engine macht die Aufnahme, die Transkription und das Archiv. Die App startet sie als Kindprozess.
+Die App ist eine Hülle um die Engine (ein Python-Programm namens `meetscribe`). Die Engine macht die Aufnahme, die Transkription und das Archiv. Die App startet sie einmal als Kindprozess, lässt sie laufen und schickt ihr alle Befehle über eine Leitung (JSON-RPC, siehe „Engine-Protokoll“).
 
 ## Installation
 
@@ -99,13 +99,14 @@ Der Reiter „Prüfung“ zeigt, welche Engine läuft, und prüft ffmpeg, die Wh
 ### Schließen, Abbruch und Neustart
 
 - Während der Aufnahme bleibt das Fenster offen, bis sie beendet ist. Ein Dialog („Aufnahme läuft noch“) bietet „Weiter aufnehmen“ oder „Aufnahme beenden und speichern“.
-- In Vorbereitung und Verarbeitung fragt ein Dialog („Weiter warten“ oder „Abbrechen und schließen“). „Abbrechen und schließen“ beendet die Engine samt aller Unterprozesse (auch beim Start über `uv`), entfernt die unfertige Besprechung (`discard`) und merkt sich die Aufnahme.
+- In Vorbereitung und Verarbeitung fragt ein Dialog („Weiter warten“ oder „Abbrechen und schließen“). „Abbrechen und schließen“ beendet die Engine samt aller Unterprozesse (auch beim Start über `uv`), startet kurz eine frische Engine, die die unfertige Besprechung entfernt, und merkt sich die Aufnahme. Das geladene Modell geht dabei verloren.
 - Beim nächsten Start bietet die Startseite unter „Unfertige Verarbeitung gefunden.“ die Knöpfe „Erneut versuchen“ oder „Vergessen“ an. Vorher fragt die App die Engine nach der Besprechung dieses Laufs: Ist sie schon vollständig (der Lauf endete trotz allem), wird nichts mehr angeboten und ein Wiederholen verweigert, damit keine zweite Besprechung entsteht; ist ein Rest da, wird er verworfen; hält ihn noch ein laufender Prozess fest, meldet die App das und startet keinen zweiten. „Vergessen“ entfernt ebenfalls einen solchen Rest (eine vollständige Besprechung bleibt immer erhalten).
-- Stürzt die Engine ab, zeigt die Fehleransicht den Pfad der Aufnahme, den Knopf „Erneut versuchen“ und den Fehlertext samt Pfad der Protokolldatei.
+- Stürzt die Engine ab, zeigt die Fehleransicht den Pfad der Aufnahme, den Knopf „Erneut versuchen“ und den Fehlertext samt Pfad der Protokolldatei. Die App startet die Engine sofort neu und zeigt oben den Hinweis „Die Engine war abgestürzt und wurde neu gestartet.“ (mit „Schließen“). Lesende Abfragen, die gerade liefen, wiederholt die App einmal selbst. Stürzt die Engine dreimal binnen einer Minute ab, startet sie nicht mehr von allein; der nächste Befehl versucht es wieder. Startet die Engine nicht (nicht gefunden, kaputte Installation, falsche Protokollversion, keine Antwort), steht der Grund auf Deutsch dort, wo der Befehl gescheitert ist.
+- Befehle haben Fristen (30 s für Abfragen, 180 s für Geräte, Modelle und Prüfung, 90 s für den Start der Engine, 300 s beim Start über `uv`). Antwortet die Engine nach einer Frist auch auf eine Kontrollanfrage nicht, ersetzt die App sie.
 - Wird das Webview neu geladen (F5), nimmt die Ansicht eine laufende Sitzung wieder auf.
 - Es läuft nur eine Aufnahme oder Verarbeitung zugleich; ein zweiter Start scheitert mit „Es läuft bereits eine Aufnahme oder Verarbeitung“.
 
-Grenzen: Stirbt die App selbst (Absturz, Task-Manager), merkt die Engine das spätestens beim nächsten Schreiben ihrer Ereignisse (höchstens etwa 2 s) und bricht die Verarbeitung ab; eine laufende Aufnahme wird vorher gespeichert (stdin wird geschlossen). Das Audio bleibt erhalten, `pending.json` merkt es sich, die Startseite bietet es beim nächsten Start an. Steckt die Engine gerade in einem langen nativen Aufruf, kann der Abbruch bis zu 30 s dauern; solange verweigert ein neuer Start mit einer Meldung. Bei einem harten Abbruch des Prozesses kann eine unvollständige Besprechung bleiben; „Besprechungen“ zeigt sie als „unvollständig“, die Suche markiert ihre Treffer, „Erneut versuchen“ und „Vergessen“ räumen sie auf. Nicht mit einer echten Aufnahme geprüft (kein Mikrofon): der Abbruch der App während der Aufnahme.
+Grenzen: Stirbt die App selbst (Absturz, Task-Manager), merkt die Engine das sofort am geschlossenen stdin: Eine laufende Aufnahme wird gespeichert und nicht verarbeitet, eine Verarbeitung wird binnen etwa 2 s abgebrochen, ohne Lauf endet die Engine gleich. Das Audio bleibt erhalten, `pending.json` merkt es sich, die Startseite bietet es beim nächsten Start an. Steckt die Engine gerade in einem langen nativen Aufruf, kann der Abbruch bis zu 30 s dauern; solange verweigert ein neuer Start mit einer Meldung. Bei einem harten Abbruch des Prozesses kann eine unvollständige Besprechung bleiben; „Besprechungen“ zeigt sie als „unvollständig“, die Suche markiert ihre Treffer, „Erneut versuchen“ und „Vergessen“ räumen sie auf. Nicht mit einer echten Aufnahme geprüft (kein Mikrofon): der Abbruch der App während der Aufnahme.
 
 ## Einstellungen
 
@@ -171,7 +172,7 @@ Die App sucht die Engine in dieser Reihenfolge:
 
 Auf einem anderen Rechner zuerst die Engine wie unter „Installation“ einrichten und danach in den Einstellungen den Pfad zu `meetscribe.exe` oder den Projektordner eintragen. Daten, Modelle und Protokolle verwaltet die Engine wie beschrieben (`MEETSCRIBE_DATA`, `MEETSCRIBE_MODELS`, `MEETSCRIBE_REPORTS`). Läufe über die App starten die Engine direkt aus der App, nicht über Ray.
 
-Die App legt ihre eigenen Dateien in `%APPDATA%\de.meetscribe.gui` ab (oder in dem Ordner aus `MEETSCRIBE_GUI_CONFIG`): `settings.json`, `pending.json` (eine noch nicht fertig verarbeitete Aufnahme) und `engine.log` (stderr der letzten Sitzung, ungekürzt).
+Die App legt ihre eigenen Dateien in `%APPDATA%\de.meetscribe.gui` ab (oder in dem Ordner aus `MEETSCRIBE_GUI_CONFIG`): `settings.json`, `pending.json` (eine noch nicht fertig verarbeitete Aufnahme) und `engine.log` (stderr der laufenden Engine, ungekürzt; die Datei wird bei jedem Start der Engine neu angelegt).
 
 ### Gemessen
 
@@ -269,6 +270,7 @@ Nicht an echter Hardware oder echten Eingaben geprüft:
 - Messungen nur auf einem Gerät (Core Ultra 7 258V). Andere Core-Ultra-Generationen sind nicht geprüft.
 - Strg+C während der Aufnahme wurde mit einem simulierten Rekorder und einem echten Konsolen-Ereignis geprüft, nicht mit echter Aufnahme.
 - `--events` und `--stdin-stop`: mit simuliertem Rekorder und echten Pipes getestet, nicht mit echter Aufnahme. Die App wurde mit der Ersatz-Engine und mit echten Läufen aus Dateien bedient, eine Aufnahme mit dem echten Mikrofon über die App nicht. Ausgaben nativer Bibliotheken direkt auf den Dateideskriptor 1 werden nicht nach stderr umgeleitet.
+- Die langlebige Engine: Aufnahme vom echten Mikrofon, Sprechertrennung mit echtem Modell und ein Wechsel des Mikrofons im laufenden Betrieb (Neueinlesen der Eingänge) sind nicht geprüft. Der Abbruch einer Verarbeitung durch Schließen der Leitung wurde nur mit Ersatz-Engine gesehen; im echten Lauf gilt die Grenze von bis zu 30 s bei langen nativen Aufrufen. Eine Abfrage mitten im Modellladen kann einige Sekunden warten (2,5 s gemessen). Die Hardware-Abfrage während der App-Läufe lieferte nur eine Probe (25 % CPU, 6,1 GB frei).
 - Android: kein APK gebaut, nichts auf einem Gerät oder Emulator gesehen (siehe „Android“).
 
 ## Für Fortgeschrittene
@@ -344,6 +346,7 @@ meetscribe report 20261105-projektrunde --out C:\temp\protokoll.md
 | `meetscribe models [--json]` | Katalog: Modell, Backend, Variante, Größe, ob installiert, und je NPU, GPU, iGPU, CPU `ok`, `ungeprüft` oder `nein`. JSON: `models` (mit `hardware` je Eintrag samt Grund), `backends`, `hardware` und `choices`, eine Zeile je Kombination aus Backend, Hardware und Modell (auch `auto`) mit `ok`, `reason`, `resolved` (was wirklich laufen würde), `size_mb`, `installed`, `status` und `notices`; daraus füllt die App ihre Auswahlfelder |
 | `meetscribe setup --model NAME [--backend B] [--device D] [--events]` | nur dieses Modell laden (`NAME` optional mit `:Variante`, z. B. `small:int8`); ohne `--device` alle Varianten, die das Modell für das Backend braucht; eine Kombination, die nicht zusammenpasst (etwa `--backend faster-whisper --device npu` oder `small:int8 --device npu`), wird mit Grund abgelehnt (Exit-Code 1, mit `--events` ein `error`), statt still nichts zu laden; mit `--events` Fortschritt als `{"event": "download", "repo", "bytes", "total"}` (`total` ist die Katalogsgröße, ungefähr), am Ende `done` oder `error`. Ohne `--model` unverändert wie unter „Installation“ |
 | `meetscribe check` | ffmpeg, Whisper-Modelle, pyannote-Modell und `HF_TOKEN` prüfen, mit Lösung je fehlendem Punkt (Exit-Code 1, wenn etwas fehlt); mit `--json` eine Liste `{"id", "label", "ok", "fix", "scope"}` (Exit-Code 0); `scope` ist `diarize` bei den Zeilen, die nur mit Sprechertrennung nötig sind, sonst `null`. Ein Whisper-Modell gilt als vorhanden, wenn jede `.xml` nicht leer ist und eine nicht leere `.bin` daneben liegt |
+| `meetscribe serve` | langlebige Engine für die App und spätere Clients: JSON-RPC 2.0 über stdin/stdout (siehe „Engine-Protokoll“); nicht für den Handbetrieb |
 | `meetscribe discard ID` | unvollständige Besprechung (Rest eines harten Abbruchs) entfernen; vollständige lehnt der Befehl ab |
 | `meetscribe record --out datei.flac [--mic ...] [--seconds N]` | nur aufnehmen, Standard-Mikrofon `laptop`; eine vorhandene Zieldatei wird nicht überschrieben, der Befehl bricht ab; gestörte Eingänge werden wie bei `start` sofort gemeldet, danach endet der Befehl mit Exit-Code 1 |
 | `meetscribe transcribe datei [...]` | nur transkribieren und ablegen, ohne Protokoll und ohne Sprecherabfrage |
@@ -423,6 +426,80 @@ Schema von `segments`:
 
 DuckDB-Erweiterungen werden weder automatisch installiert noch automatisch geladen (`autoinstall_known_extensions` und `autoload_known_extensions` sind aus) und die Konfiguration ist gesperrt, `SET` auf diese Einstellungen schlägt also fehl. Ein Aufruf wie `read_parquet('https://...')` bricht deshalb ohne Netzzugriff mit der DuckDB-Fehlermeldung ab (`requires the extension httpfs`, Exit-Code 1, kein Traceback). Lokale Dateien, etwa `read_parquet('C:/pfad/datei.parquet')`, und die Sichten funktionieren weiter. Zusätzlich lehnt `sql` jede Anweisung `INSTALL`, `FORCE INSTALL` und `LOAD` sowie `UPDATE EXTENSIONS` ab (Meldung `... gesperrt`, Exit-Code 1), bevor DuckDB etwas ausführt; ein Test mit lokalem HTTP-Server bestätigt, dass dabei keine Anfrage entsteht. Nicht geprüft ist, ob DuckDB außerhalb dieser Anweisungen Erweiterungen nachladen kann (`load_extension` gibt es in DuckDB 2.0.0 nicht). Schon auf dem Rechner liegende Erweiterungen (`%USERPROFILE%\.duckdb\extensions`) werden von `sql` nicht geladen.
 
+### Engine-Protokoll (JSON-RPC)
+
+`meetscribe serve` ist die langlebige Engine der App. Sie spricht JSON-RPC 2.0 über stdin und stdout, eine Nachricht je Zeile (UTF-8, ein JSON-Objekt, keine Stapel). stdout gehört dem Protokoll: Alles, was Bibliotheken dorthin schreiben, geht nach stderr (die App legt es in `engine.log`). Beim Start setzt die Engine die Offline-Variablen; sie greift nie auf das Netz zu. Nur der Modell-Download läuft in einem Kindprozess (`meetscribe setup --events`), dessen Zeilen sie als Benachrichtigungen weiterreicht. Schließt der Client stdin, beendet sich die Engine: Eine Aufnahme wird gespeichert und nicht verarbeitet, eine Verarbeitung abgebrochen (die unfertige Besprechung entfernt sie dabei, wenn der Abbruch rechtzeitig greift; sonst bleibt sie, und `meeting.settle` räumt sie auf).
+
+Die Logik steckt in einer Dienstschicht (`meetscribe/service.py`, Klasse `Service`), die der RPC-Server, die Kommandozeilenbefehle und ein späterer MCP-Server gemeinsam aufrufen. Die Kommandozeile bleibt als interne und Testschnittstelle erhalten und liefert dieselben Ergebnisse wie bisher.
+
+Handshake: Das Erste ist `initialize`; davor antworten alle Methoden mit Code -32002. Weicht die Protokollversion ab, kommt Code -32001 mit deutschem Text.
+
+```
+-> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol":1,"client":{"name":"meetscribe-gui","version":"0.1.0"}}}
+<- {"jsonrpc":"2.0","id":1,"result":{"protocol":1,"engine":{"name":"meetscribe-engine","version":"0.1.0","pid":21212},"methods":["check","devices",...]}}
+```
+
+Methoden (Parameter in Klammern, `?` = optional; die Ergebnisse entsprechen der `--json`-Ausgabe des gleichnamigen Befehls):
+
+| Methode | Zweck |
+|---|---|
+| `initialize` (`protocol`, `client`) | Handshake, siehe oben |
+| `ping` | `{"pid", "uptime_s", "run_active", "download_active", "models_loaded"}` |
+| `shutdown` | antwortet `{"ok": true}` und beendet die Engine; läuft noch ein Lauf, endet er nach höchstens 5 s |
+| `meetings` | Liste aller Besprechungen |
+| `search` (`term`, `meeting?`, `speaker?`, `limit?`=20) | Treffer |
+| `stats` (`meeting?`) | Redezeit und Wörter je Sprecher |
+| `report` (`meeting_id?`, `out?`) | `{"meeting_id", "path", "markdown"}`; mit `out` wird die Datei geschrieben |
+| `sql` (`query`) | `{"columns", "rows"}` |
+| `speakers.show` (`meeting_id?`), `speakers.set` (`label`, `name`, `meeting_id?`), `speakers.unset` (`label`, `meeting_id?`) | Sprecherzuordnung |
+| `devices`, `models`, `check` | Audioeingänge und Hardware, Modellkatalog mit Auswahlmatrix, Voraussetzungen |
+| `rotate` (`older_than_days?`, `force?`), `discard` (`meeting_id`) | Archiv pflegen |
+| `meeting.state` (`meeting_id`) | `{"meeting_id", "state"}` mit `absent`, `partial` oder `complete` |
+| `meeting.settle` (`meeting_id`) | Abgleich nach einem unterbrochenen Lauf: `partial` wird verworfen (`discarded`), `complete` und `absent` bleiben; hält ein laufender Lauf die Besprechung, Fehler -32010 |
+| `run.start` (`audio?`, `title?`, `mic?`, `device?`, `backend?`, `model?`, `diarize?`, `speakers?`, `fallback?`) | startet aus einer Datei (`audio`) oder vom Mikrofon; antwortet sofort mit `{"run": 1}`, alles Weitere kommt als Benachrichtigung |
+| `run.stop` | beendet eine Aufnahme (Audio wird gespeichert, die Verarbeitung läuft weiter) |
+| `run.state` | `{"active", "stage", "elapsed_s", "audio", "input", "meeting_id", "warnings"}` |
+| `download.start` (`backend`, `model`), `download.state` | Modell laden; Fortschritt als Benachrichtigung |
+
+Benachrichtigungen der Engine (ohne `id`):
+
+```
+<- {"jsonrpc":"2.0","method":"run.event","params":{"run":1,"event":"transcribing","audio":"C:\\...\\long_de.wav","meeting_id":"20261107-long-de","backend":"openvino","device":"NPU","model":"large-v3-turbo","variant":"fp16"}}
+<- {"jsonrpc":"2.0","method":"run.event","params":{"run":1,"event":"alive"}}
+<- {"jsonrpc":"2.0","method":"run.event","params":{"run":1,"event":"fallback","from":"NPU","to":"iGPU","backend":"openvino"}}
+<- {"jsonrpc":"2.0","method":"run.event","params":{"run":1,"event":"done","meeting_id":"...","report":"...","segments":6,"ran":{"text":"NPU · large-v3-turbo · OpenVINO","load_s":0.0,"...":"..."}}}
+<- {"jsonrpc":"2.0","method":"run.exit","params":{"run":1,"code":0,"terminal":true}}
+<- {"jsonrpc":"2.0","method":"download.event","params":{"run":2,"event":"download","repo":"OpenVINO/whisper-small-int8-ov","bytes":1000000,"total":257000000}}
+<- {"jsonrpc":"2.0","method":"download.exit","params":{"run":2,"code":0,"terminal":true,"stderr":""}}
+```
+
+`run.event` trägt die Ereignisse von `meetscribe start --events` unverändert (siehe „Maschinenlesbare Ausgabe“) plus `run`, einschließlich `fallback` und `alive` (alle 2 s während der Verarbeitung); `done.ran` nennt zusätzlich `load_s`, die Sekunden, die das Laden des Whisper-Modells in diesem Lauf gekostet hat (0, wenn die Engine es noch geladen hatte). `run.exit` kommt nach `done` oder `error`; `terminal` sagt, ob ein solches Ereignis kam. Fehler: `{"error": {"code", "message", "data": {"detail", "kind"}}}`; Codes: -32700, -32600, -32601, -32602, -32603 (Standard), -32000 (Fachfehler, `message` ist deutscher Text), -32001 (Protokollversion), -32002 (nicht initialisiert), -32010 (belegt: „Es läuft bereits eine Sitzung.“; Download und Lauf schließen einander aus).
+
+Anfragen laufen nebenläufig und werden über `id` zugeordnet, die Antworten können in anderer Reihenfolge kommen. Abfragen werden auch während einer Transkription beantwortet; Aufnahme und Verarbeitung laufen im Hauptthread der Engine, genau ein Lauf zugleich (zusätzlich die Sperrdatei `start.lock`). Die Archivsicht aktualisiert sich bei jeder Abfrage, wenn sich Dateien geändert haben (neue, wachsende oder rotierte Dateien, Sprecherzuordnung).
+
+Modellcache: Die Engine behält die geladene Whisper-Pipeline (je Backend, Modell und Gerät) zwischen den Läufen und gibt sie nach einer Leerlaufzeit frei. Die Zeit steht im Wörterbuch `SERVICE` in `service.py` (`idle_release_s`, Standard 600 s; 0 heißt: nie behalten). Eine Pipeline, die einen Fehler und damit einen Rückfall ausgelöst hat, fliegt sofort aus dem Cache. Die Diarisierung wird weiter je Lauf geladen. Die Liste der Audioeingänge liest die Engine vor jeder Aufnahme und bei `devices` neu ein (außer während einer Aufnahme), damit ein später eingestecktes Mikrofon erscheint.
+
+Die App-Seite (`gui\src-tauri\src\engine.rs`): ein Kindprozess, der beim App-Start im Hintergrund hochfährt; Befehle gehen mit Fristen durch (siehe „Schließen, Abbruch und Neustart“); bei einem Absturz scheitern alle offenen Befehle mit der Engine-Ausgabe, die App startet neu und meldet es; beim Beenden `shutdown`, nach 3 s Prozessbaum beenden; beim Abbruch einer Verarbeitung sofort den Prozessbaum beenden (`taskkill /T /F`).
+
+Gemessen (Windows 11, Core Ultra 7 258V, `long_de.wav` 80,3 s, Sprechertrennung aus, NPU, Modell-Cache der NPU vorhanden). „Vorher“ ist die Fassung, in der jede App-Aktion die Kommandozeile startet (die zuvor gebaute `meetscribe-gui.exe`), „nachher“ die neue; beide Male durch dieselbe Methode gemessen (CDP, `invoke` im Webview, 12 Aufrufe nach einem Aufwärmaufruf, 2 Besprechungen in den Daten):
+
+| Aufruf über den App-Pfad | vorher (Median, Spanne) | nachher (Median, Spanne) |
+|---|---|---|
+| Besprechungen | 816 ms (801 bis 911) | 20 ms (17 bis 23) |
+| Suche („und“, 50 Treffer) | 809 ms (784 bis 882) | 10 ms (10 bis 14) |
+| Protokoll | 824 ms (803 bis 885) | 32 ms (28 bis 35) |
+| erster Aufruf nach dem App-Start | 940 ms | 26 ms |
+
+| Laden des Whisper-Modells (`load_s`) | vorher | nachher |
+|---|---|---|
+| erster Lauf | 7,65 s (frischer Prozess, erste Messung) | 4,08 s (Engine frisch, Compile-Cache der NPU vorhanden) |
+| zweiter Lauf | 3,30 s (frischer Prozess, Modell erneut geladen) | 0,00 s (Pipeline noch geladen) |
+| dritter Lauf | nicht gemessen | 0,00 s |
+| Gesamtdauer einer Datei, Klick bis Ergebnis | 12 bis 13 s (Kommandozeile, zwei Läufe) | 11,2 s, danach 7,1 s und 7,1 s |
+
+„Vorher“ beim Laden: Ein frischer Python-Prozess baute die Engine genauso, wie ein Lauf es tut (`OpenVinoEngine`), zweimal nacheinander, als Ray-Job mit 2 CPUs und 4 GB. „Nachher“: drei Läufe derselben Datei in einer laufenden App; Läufe über die App starten die Engine direkt aus der App, nicht über Ray. Eine Datei, ein Rechner, keine Wiederholungen für die Streuung. Während der Transkription antwortete die Engine auf Abfragen in 14 bis 28 ms; nur die erste Abfrage im ersten Lauf, mitten im Modellladen, brauchte 2,5 s.
+
+
 ### Technik der Transkription
 
 Spracherkennung läuft über `openvino_genai.WhisperPipeline`. Gründe, die sich aus dem Code ergeben: eine API für NPU, GPU und CPU (nur der Gerätename ändert sich), Wortzeitstempel direkt aus der Pipeline, ein Compile-Cache über `CACHE_DIR`, und fertig konvertierte Modelle aus der Hugging-Face-Organisation `OpenVINO`. Vergleichsmessungen mit whisper.cpp oder optimum-intel wurden nicht gemacht. PyTorch wird nur für die Sprechertrennung (pyannote, immer auf der CPU) gebraucht. Zweites Backend ist faster-whisper (CTranslate2). Entscheidung: whisper.cpp-Bindungen waren nicht nötig, weil faster-whisper 1.2.1 mit ctranslate2 4.8.5, onnxruntime, PyTorch 2.15 (CPU) und openvino-genai 2026.4 in einer Windows-Umgebung zusammen installiert und importiert werden kann (`uv sync --extra faster-whisper`, alle Importe und pyannote funktionieren) und Wortzeitstempel direkt liefert. Der Vergleich der beiden steht in der ersten Tabelle unter „Gemessen“.
@@ -431,7 +508,7 @@ Ablauf bei langem Audio: Das Audio wird in Fenster von etwa 5 min geteilt, gesch
 
 ### App aus dem Quellcode bauen
 
-Die App (`gui\`, Tauri 2 mit einfachem HTML/TypeScript) ist eine Hülle um dieselbe Engine: Sie startet `meetscribe` als Kindprozess und liest dessen `--events` und `--json`. Alles Fachliche (Aufnahme, Transkription, Archiv) bleibt in der Engine.
+Die App (`gui\`, Tauri 2 mit einfachem HTML/TypeScript) ist eine Hülle um dieselbe Engine: Sie startet `meetscribe serve` einmal als Kindprozess und spricht JSON-RPC mit ihm. Alles Fachliche (Aufnahme, Transkription, Archiv) bleibt in der Engine.
 
 Bauen (Windows). Voraussetzungen, die nicht installiert werden: Node.js, Rust mit MSVC-Toolchain samt Visual-Studio-Buildtools, WebView2 und die Engine aus „Installation“.
 
@@ -449,8 +526,8 @@ cargo tauri build
 
 ### Tests
 
-- Engine: `uv run pytest -q` (217 Tests, alle grün; sie prüfen Logik und Abläufe mit Ersatzobjekten, nicht die oben genannten Hardwarefälle).
-- App: `npm test` (Oberflächentests mit jsdom und einem Ersatz für die Tauri-Schnittstelle) und `cargo test` (Rust-Tests mit der Ersatz-Engine `examples\fake_engine`).
+- Engine: `uv run pytest -q` (239 Tests, alle grün; sie prüfen Logik und Abläufe mit Ersatzobjekten, nicht die oben genannten Hardwarefälle).
+- App: `npm test` (38 Oberflächentests mit jsdom und einem Ersatz für die Tauri-Schnittstelle) und `cargo test` (32 Rust-Tests mit der Ersatz-Engine `examples\fake_engine`, die JSON-RPC spricht: Reihenfolge der Antworten, Absturz und Neustart, Fristen, Startfehler, Abbruch mit Prozessbaum).
 
 ### Android
 

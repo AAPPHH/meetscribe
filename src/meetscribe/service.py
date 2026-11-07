@@ -64,13 +64,28 @@ TEXT = {
     "unknown_label": "Unbekanntes Label '{label}'. Vorhanden: {labels}",
     "no_mapping": "Keine Zuordnung fuer {label} in {meeting_id}.",
     "audio_missing": "Die Audiodatei existiert nicht oder ist keine Datei: {audio}",
+    "audio_remote": "Netzwerkpfade und Netzlaufwerke sind gesperrt, weil meetscribe hier keinen Netzzugriff hat. Bitte eine lokale Datei angeben: {audio}",
 }
+DRIVE_REMOTE = 4
 RUN_OPTIONS = ("audio", "title", "mic", "device", "backend", "model", "diarize", "speakers", "fallback")
 TRANSCRIPT = {"default_rows": 200, "max_rows": 1000}
 SPEAKERS_SQL = (
     "SELECT speaker AS label, any_value(display_name) AS name, sum(end_s - start_s) AS talk_s, count(*) AS segments "
     "FROM segments_named WHERE meeting_id = ? GROUP BY speaker ORDER BY speaker"
 )
+
+
+class LocalPath:
+    @staticmethod
+    def remote(audio):
+        text = str(audio).replace("/", "\\")
+        if text.startswith("\\\\"):
+            return True
+        drive = os.path.splitdrive(text)[0]
+        if sys.platform != "win32" or len(drive) != 2:
+            return False
+        import ctypes
+        return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == DRIVE_REMOTE
 
 
 class ServiceError(pipeline.PipelineError):
@@ -543,6 +558,8 @@ class Service:
         return {"run": run.id}
 
     def begin_transcription(self, audio, wire, submit, **options):
+        if LocalPath.remote(audio):
+            raise ServiceError(TEXT["audio_remote"].format(audio=audio))
         path = Path(audio)
         if not path.is_file():
             raise ServiceError(TEXT["audio_missing"].format(audio=audio))

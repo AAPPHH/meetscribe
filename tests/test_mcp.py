@@ -317,3 +317,12 @@ def test_the_socket_guard_really_blocks_and_records(tmp_path):
     done = subprocess.run([sys.executable, "-c", code], env={**os.environ, "MEETSCRIBE_SOCKET_LOG": str(log)}, capture_output=True, text=True, timeout=60)
     assert done.stdout.strip() == "3 b'x'", done.stderr
     assert {line.split()[0] for line in log.read_text().splitlines()} >= {"getaddrinfo", "connect"}
+
+
+def test_transcribe_start_refuses_a_network_path_with_a_german_reason_and_starts_nothing(app, env):
+    async def script(call):
+        refused = await call.fail("transcribe_start", audio=r"\\192.0.2.1\share\x.wav")
+        return refused, await call.fail("transcribe_status", job=1)
+    refused, status = drive(app, script)
+    assert "Netzwerkpfade und Netzlaufwerke sind gesperrt" in refused and "Unbekannte Job-ID" in status
+    assert app.service.run is None

@@ -571,3 +571,25 @@ def test_sandboxed_service_selects_read_only(env):
     with pytest.raises(ServiceError, match="SELECT"):
         svc.select("DROP VIEW segments")
     assert svc.select("SELECT * FROM range(10)", 3)["truncated"] is True
+
+
+@pytest.mark.parametrize("audio", [r"\\192.0.2.1\share\x.wav", "//192.0.2.1/share/x.wav", r"\\?\UNC\192.0.2.1\share\x.wav", r"\\.\pipe\x"])
+def test_transcription_refuses_network_paths_without_touching_them(env, fast, monkeypatch, audio):
+    touched = []
+    for name in ("is_file", "resolve", "exists", "stat"):
+        monkeypatch.setattr(Path, name, lambda self, *a, **k: touched.append(str(self)) or False)
+    svc = Service(env["store"], EngineCache(idle_s=60))
+    with pytest.raises(ServiceError, match="Netzwerkpfade und Netzlaufwerke sind gesperrt"):
+        svc.begin_transcription(audio, CollectWire(), in_thread)
+    monkeypatch.undo()
+    assert svc.run is None and touched == []
+
+
+def test_transcription_refuses_a_mapped_network_drive(env, fast, monkeypatch):
+    import ctypes
+    seen = []
+    monkeypatch.setattr(ctypes.windll.kernel32, "GetDriveTypeW", lambda root: seen.append(root) or 4, raising=False)
+    svc = Service(env["store"], EngineCache(idle_s=60))
+    with pytest.raises(ServiceError, match="Netzlaufwerke"):
+        svc.begin_transcription(r"Z:\meeting.wav", CollectWire(), in_thread)
+    assert seen == ["Z:\\"]

@@ -134,7 +134,7 @@ def test_rotate_equivalence(store):
     assert after == before
     cols = Query(store).execute("SELECT * FROM segments")[0]
     assert cols == ["meeting_id", "title", "meeting_date", "seg_id", "start_s", "end_s", "speaker", "text",
-                    "language", "model", "device", "words", "created_at"]
+                    "language", "model", "device", "backend", "words", "created_at"]
     assert store.rotate() == {"rotated": [], "skipped": []}
 
 
@@ -419,3 +419,70 @@ def test_close_failure_discards_only_when_requested(store, target, discard):
     assert store.hot_path("c1").exists() is not discard
     if discard:
         assert store.incomplete() == [] and not store.exists("c1")
+
+
+def old_table(meeting_id, day):
+    import pyarrow as pa
+    from datetime import datetime, timezone
+    from meetscribe.store import SCHEMA, WORD_TYPE
+    old = pa.schema([f for f in SCHEMA if f.name != "backend"])
+    now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    rows = [
+        {"meeting_id": meeting_id, "title": "Alt", "meeting_date": date.fromisoformat(day), "seg_id": i, "start_s": float(i), "end_s": i + 1.0,
+         "speaker": "SPEAKER_00", "text": f"Altes Wort {i}", "language": "de", "model": "whisper-large-v3-turbo-fp16-ov", "device": "NPU",
+         "words": [{"text": "Altes", "start_s": float(i), "end_s": i + 0.5}], "created_at": now}
+        for i in range(2)
+    ]
+    return pa.Table.from_pylist(rows, schema=old), old
+
+
+def write_old_hot(store, meeting_id, day):
+    import pyarrow.ipc as ipc
+    table, old = old_table(meeting_id, day)
+    store.hot_dir.mkdir(parents=True, exist_ok=True)
+    with open(store.hot_path(meeting_id), "wb") as handle:
+        with ipc.new_stream(handle, old) as stream:
+            stream.write_table(table)
+
+
+def write_old_cold(store, meeting_id, day):
+    import pyarrow.parquet as pq
+    table, _ = old_table(meeting_id, day)
+    path = store.cold_path(meeting_id, date.fromisoformat(day))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, path)
+
+
+def test_files_without_backend_column_still_read_through_every_view(store):
+    write_old_hot(store, "old-hot", "2026-03-04")
+    write_old_cold(store, "old-cold", "2026-01-05")
+    table, complete = HotFile(store.hot_path("old-hot")).read()
+    assert complete and table.column("backend").null_count == 2
+    query = Query(store)
+    assert query.execute("SELECT meeting_id, backend FROM segments ORDER BY meeting_id, seg_id")[1] == [("old-cold", None), ("old-cold", None), ("old-hot", None), ("old-hot", None)]
+    assert query.execute("SELECT count(*) FROM segments_named")[1] == [(4,)]
+    assert [m["meeting_id"] for m in query.meetings()] == ["old-hot", "old-cold"] and all(m["backend"] is None for m in query.meetings())
+    assert {h["meeting_id"] for h in query.search("altes wort")} == {"old-hot", "old-cold"}
+    assert query.speaker_stats("old-hot")[0]["words"] == 2
+    text = Report(query).render("old-hot")
+    assert "Altes Wort 0" in text and "Backend" not in text and "**Gerät:** NPU" in text
+
+
+def test_old_and_new_rows_mix_and_rotate_still_works(store):
+    write_old_hot(store, "old-hot", "2026-03-04")
+    write_old_cold(store, "old-cold", "2026-01-05")
+    write(store, "new", day="2026-03-05", backend="faster-whisper")
+    rows_by_meeting = dict(rows(store, "SELECT meeting_id, any_value(backend) FROM segments GROUP BY meeting_id"))
+    assert rows_by_meeting == {"old-hot": None, "old-cold": None, "new": "faster-whisper"}
+    assert "**Backend:** faster-whisper" in Report(Query(store)).render("new")
+    result = store.rotate()
+    assert sorted(result["rotated"]) == ["new", "old-hot"] and result["skipped"] == []
+    after = dict(rows(store, "SELECT meeting_id, any_value(backend) FROM segments GROUP BY meeting_id"))
+    assert after == rows_by_meeting
+    assert rows(store, "SELECT count(*) FROM segments WHERE text LIKE 'Altes%'") == [(4,)]
+
+
+def test_only_old_cold_files_still_expose_the_backend_column(store):
+    write_old_cold(store, "old-cold", "2026-01-05")
+    cols, data = Query(store).execute("SELECT * FROM segments")
+    assert "backend" in cols and {row[cols.index("backend")] for row in data} == {None}

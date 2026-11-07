@@ -27,6 +27,7 @@ SCHEMA = pa.schema([
     ("language", pa.string()),
     ("model", pa.string()),
     ("device", pa.string()),
+    ("backend", pa.string()),
     ("words", pa.list_(WORD_TYPE)),
     ("created_at", pa.timestamp("us", tz="UTC")),
 ])
@@ -79,6 +80,11 @@ def as_date(value):
     return value if isinstance(value, date) else date.fromisoformat(value)
 
 
+def conform(table):
+    columns = [table.column(n) if n in table.column_names else pa.nulls(table.num_rows) for n in SCHEMA.names]
+    return pa.Table.from_arrays(columns, names=SCHEMA.names).cast(SCHEMA)
+
+
 def read_parquet(path):
     with open(path, "rb") as handle:
         return pq.read_table(handle)
@@ -117,7 +123,7 @@ class HotFile:
         except (pa.ArrowException, OSError):
             pass
         table = pa.Table.from_batches(batches, schema=reader.schema)
-        return table.select(SCHEMA.names).cast(SCHEMA), complete
+        return conform(table), complete
 
     def is_complete(self):
         return self.read()[1]
@@ -233,8 +239,8 @@ class Store:
 
 
 class TranscriptWriter:
-    def __init__(self, meeting_id, title="", meeting_date=None, language=None, model=None, device=None, store=None,
-                 discard_on_error=False):
+    def __init__(self, meeting_id, title="", meeting_date=None, language=None, model=None, device=None, backend=None,
+                 store=None, discard_on_error=False):
         self.store = store or Store()
         self.discard_on_error = discard_on_error
         self.path = self.store.hot_path(meeting_id)
@@ -245,6 +251,7 @@ class TranscriptWriter:
             "language": language,
             "model": model,
             "device": device,
+            "backend": backend,
         }
         self.next_id = 0
         self.file = None
@@ -336,7 +343,7 @@ class Query:
         source = "empty_segments"
         if self.store.cold_files():
             files = ", ".join(sql_literal(f) for f in self.store.cold_files())
-            source = f"read_parquet([{files}], hive_partitioning=true)"
+            source = f"(SELECT * FROM read_parquet([{files}], hive_partitioning=true, union_by_name=true) UNION ALL BY NAME SELECT * FROM empty_segments)"
         for sql in (
             f"CREATE OR REPLACE VIEW cold_raw AS SELECT {COLUMNS} FROM {source}",
             f"CREATE OR REPLACE VIEW segments AS SELECT {COLUMNS} FROM hot_raw h "
@@ -399,6 +406,7 @@ class Query:
             "string_agg(DISTINCT language, ', ' ORDER BY language) AS language, "
             "string_agg(DISTINCT model, ', ' ORDER BY model) AS model, "
             "string_agg(DISTINCT device, ', ' ORDER BY device) AS device, "
+            "string_agg(DISTINCT backend, ', ' ORDER BY backend) AS backend, "
             "meeting_id NOT IN (SELECT meeting_id FROM incomplete_ids) AS complete "
             "FROM segments GROUP BY meeting_id ORDER BY meeting_date DESC, max(created_at) DESC, meeting_id"
         )
@@ -466,7 +474,8 @@ class Report:
             "SELECT any_value(title) AS title, any_value(meeting_date) AS meeting_date, count(*) AS n, "
             "max(end_s) AS duration_s, string_agg(DISTINCT language, ', ' ORDER BY language) AS language, "
             "string_agg(DISTINCT model, ', ' ORDER BY model) AS model, "
-            "string_agg(DISTINCT device, ', ' ORDER BY device) AS device FROM segments WHERE meeting_id = ?",
+            "string_agg(DISTINCT device, ', ' ORDER BY device) AS device, "
+            "string_agg(DISTINCT backend, ', ' ORDER BY backend) AS backend FROM segments WHERE meeting_id = ?",
             [meeting_id],
         )[0]
         if not info["n"]:
@@ -478,6 +487,7 @@ class Report:
             ("Sprache", info["language"]),
             ("Modell", info["model"]),
             ("Gerät", info["device"]),
+            ("Backend", info["backend"]),
         )
         lines += [f"- **{label}:** {value}" for label, value in facts if value]
         if self.query.is_incomplete(meeting_id):

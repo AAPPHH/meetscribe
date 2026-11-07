@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -647,3 +648,120 @@ def test_an_aborted_writer_closes_and_discards_its_file_at_once_and_ignores_late
         w.append(segs(0.0))
     w.abort()
     assert store.hot_path("m8").exists() and HotFile(store.hot_path("m8")).is_complete()
+
+
+HOLD_WORKER = (
+    "import sys, time\n"
+    "from meetscribe.store import Store, make_config\n"
+    "store = Store(make_config(sys.argv[1]))\n"
+    "with store.writer(sys.argv[2], title='Offen', meeting_date='2026-03-04', language='de') as w:\n"
+    "    w.append([{'start_s': 0.0, 'end_s': 1.0, 'speaker': 'UNKNOWN', 'text': 'halb'}])\n"
+    "    print('ready', flush=True)\n"
+    "    sys.stdin.read()\n"
+)
+REAP_WORKER = (
+    "import json, sys\n"
+    "from meetscribe.store import Store, make_config\n"
+    "print(json.dumps(Store(make_config(sys.argv[1])).reap()))\n"
+)
+CHURN_WORKER = (
+    "import sys, time\n"
+    "from meetscribe.store import Store, make_config\n"
+    "store = Store(make_config(sys.argv[1]))\n"
+    "for i in range(int(sys.argv[2])):\n"
+    "    with store.writer(f'w{i}', title='Lauf', meeting_date='2026-03-04', language='de') as w:\n"
+    "        for j in range(5):\n"
+    "            w.append([{'start_s': j, 'end_s': j + 1.0, 'speaker': 'UNKNOWN', 'text': 'x'}])\n"
+    "            time.sleep(0.01)\n"
+)
+REAP_LOOP = (
+    "import pathlib, sys\n"
+    "from meetscribe.store import Store, make_config\n"
+    "store, stop, reaped = Store(make_config(sys.argv[1])), pathlib.Path(sys.argv[2]), []\n"
+    "while not stop.exists(): reaped += store.reap()\n"
+    "print(len(reaped))\n"
+)
+
+
+def start_writer(store, meeting_id="orphan"):
+    proc = subprocess.Popen([sys.executable, "-c", HOLD_WORKER, str(store.config["data_dir"]), meeting_id], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "ready"
+    return proc
+
+
+def make_orphan(store, meeting_id="orphan"):
+    proc = start_writer(store, meeting_id)
+    proc.kill()
+    proc.wait(30)
+    proc.stdin.close()
+    proc.stdout.close()
+    return meeting_id
+
+
+def reap_in_process(store):
+    done = subprocess.run([sys.executable, "-c", REAP_WORKER, str(store.config["data_dir"])], capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+def test_reap_in_a_second_process_leaves_the_file_a_live_writer_holds(store):
+    proc = start_writer(store)
+    try:
+        assert reap_in_process(store) == [] and store.reap() == []
+        assert store.hot_path("orphan").exists() and store.incomplete() == ["orphan"]
+    finally:
+        proc.stdin.close()
+        assert proc.wait(30) == 0
+        proc.stdout.close()
+    assert HotFile(store.hot_path("orphan")).is_complete() and reap_in_process(store) == [] and store.hot_path("orphan").exists()
+    assert not list(store.hot_dir.glob("*.lock"))
+
+
+def test_reap_discards_the_orphan_of_a_hard_killed_process_and_keeps_complete_meetings_and_audio(store, tmp_path):
+    audio = tmp_path / "aufnahme.flac"
+    audio.write_bytes(b"audio")
+    write(store, "done", title="Fertig")
+    make_orphan(store)
+    assert store.hot_path("orphan").exists() and store.incomplete() == ["orphan"]
+    assert reap_in_process(store) == ["orphan"]
+    assert not store.hot_path("orphan").exists() and not store.exists("orphan") and store.incomplete() == []
+    assert store.exists("done") and HotFile(store.hot_path("done")).is_complete() and rows(store, "SELECT count(*) FROM segments")[0][0] == 3
+    assert audio.read_bytes() == b"audio" and not list(store.hot_dir.glob("*.lock"))
+    assert reap_in_process(store) == []
+
+
+def test_reap_removes_a_stale_lock_and_a_legacy_partial_file_without_one(store):
+    store.hot_dir.mkdir(parents=True)
+    store.hold_path("stale").write_bytes(b"")
+    store.hot_path("legacy").write_bytes(b"")
+    assert store.reap() == ["legacy"] and not list(store.hot_dir.iterdir())
+
+
+def test_a_second_writer_for_a_held_meeting_is_a_duplicate_and_the_hold_is_released_after_failure(store):
+    proc = start_writer(store)
+    try:
+        with pytest.raises(DuplicateMeetingError):
+            store.writer("orphan").__enter__()
+    finally:
+        proc.stdin.close()
+        proc.wait(30)
+        proc.stdout.close()
+    with pytest.raises(KeyError):
+        with store.writer("failing", title="x", meeting_date="2026-03-04", language="de"):
+            assert store.hold_path("failing").exists()
+            raise KeyError
+    assert not store.hold_path("failing").exists() and store.incomplete() == ["failing"]
+
+
+def test_a_reaper_looping_in_another_process_never_discards_files_being_written(store, tmp_path):
+    stop = tmp_path / "stop"
+    store.hot_dir.mkdir(parents=True)
+    reaper = subprocess.Popen([sys.executable, "-c", REAP_LOOP, str(store.config["data_dir"]), str(stop)], stdout=subprocess.PIPE, text=True)
+    try:
+        writer = subprocess.run([sys.executable, "-c", CHURN_WORKER, str(store.config["data_dir"]), "25"], capture_output=True, text=True, timeout=300)
+    finally:
+        stop.write_text("x")
+    assert writer.returncode == 0, writer.stderr
+    assert reaper.stdout.readline().strip() == "0" and reaper.wait(60) == 0
+    reaper.stdout.close()
+    assert sorted(p.stem for p in store.hot_files()) == sorted(f"w{i}" for i in range(25)) and store.incomplete() == []

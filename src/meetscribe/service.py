@@ -318,6 +318,11 @@ class Service:
         with suppress(Exception):
             self.meetings()
 
+    def reap(self):
+        with suppress(Exception), self.lock:
+            return self.store.reap()
+        return []
+
     def require(self, meeting_id=None):
         if meeting_id is None:
             with self.reading() as query:
@@ -757,6 +762,7 @@ class RpcServer:
         self.jobs.put(None)
 
     def serve(self):
+        self.service.reap()
         threading.Thread(target=self.read, daemon=True, name="rpc-reader").start()
         threading.Thread(target=self.service.warm, daemon=True, name="warm").start()
         while (job := self.jobs.get()) is not None:

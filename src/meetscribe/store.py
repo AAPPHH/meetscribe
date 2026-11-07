@@ -43,7 +43,7 @@ DUCKDB_SETTINGS = {
 }
 SANDBOX = {"memory_limit": "'1GB'", "threads": "2", "enable_external_access": "false"}
 SQL_LIMITS = {"default_rows": 200, "max_rows": 1000, "timeout_s": 20.0, "cell_chars": 5000, "result_chars": 400000, "list_items": 200}
-LOCKS = {"speakers_wait_s": 15.0, "rotate_wait_s": 60.0, "poll_s": 0.05, "busy_tries": 40, "busy_wait_s": 0.05}
+LOCKS = {"speakers_wait_s": 15.0, "rotate_wait_s": 60.0, "hold_wait_s": 2.0, "reap_wait_s": 0.3, "poll_s": 0.05, "busy_tries": 40, "busy_wait_s": 0.05}
 TEXT = {
     "clipped": " … [gekürzt, {chars} Zeichen insgesamt]",
     "select_only": "Erlaubt ist genau eine lesende SELECT-Abfrage ({kind}).",
@@ -270,8 +270,41 @@ class Store:
     def writer(self, meeting_id, **meta):
         return TranscriptWriter(meeting_id, store=self, **meta)
 
+    def hold_path(self, meeting_id):
+        self.check_id(meeting_id)
+        return self.hot_dir / f"{meeting_id}.lock"
+
     def discard(self, meeting_id):
         self.hot_path(meeting_id).unlink(missing_ok=True)
+
+    @staticmethod
+    def drop(hold):
+        try:
+            hold.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def reap(self):
+        reaped = []
+        for path in self.hot_files():
+            hold = self.hold_path(path.stem)
+            try:
+                with FileLock(hold, LOCKS["reap_wait_s"]):
+                    if not HotFile(path).is_complete():
+                        path.unlink()
+                        reaped.append(path.stem)
+            except (LockBusy, OSError, pa.ArrowException):
+                continue
+            self.drop(hold)
+        for hold in self.hot_dir.glob("*.lock"):
+            if not hold.with_suffix(".arrow").exists():
+                try:
+                    with FileLock(hold):
+                        pass
+                except OSError:
+                    continue
+                self.drop(hold)
+        return reaped
 
     def incomplete(self):
         return [p.stem for p in self.hot_files() if not HotFile(p).is_complete()]
@@ -336,19 +369,35 @@ class TranscriptWriter:
         self.stream = None
         self.guard = threading.Lock()
         self.state = "new"
+        self.hold = FileLock(self.store.hold_path(meeting_id), LOCKS["hold_wait_s"])
+
+    def duplicate(self):
+        return DuplicateMeetingError(f"meeting_id already exists: {self.meta['meeting_id']}")
 
     def __enter__(self):
         if self.store.exists(self.meta["meeting_id"]):
-            raise DuplicateMeetingError(f"meeting_id already exists: {self.meta['meeting_id']}")
+            raise self.duplicate()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.hold.__enter__()
+        except LockBusy:
+            raise self.duplicate() from None
         try:
             self.file = open(self.path, "xb")
         except FileExistsError:
-            raise DuplicateMeetingError(f"meeting_id already exists: {self.meta['meeting_id']}") from None
+            self.release()
+            raise self.duplicate() from None
+        except BaseException:
+            self.release()
+            raise
         self.stream = ipc.new_stream(self.file, SCHEMA)
         self.file.flush()
         self.state = "open"
         return self
+
+    def release(self):
+        self.hold.__exit__(None, None, None)
+        self.store.drop(self.store.hold_path(self.meta["meeting_id"]))
 
     def abort(self):
         with self.guard:
@@ -375,8 +424,11 @@ class TranscriptWriter:
                 failed = True
                 raise
             finally:
-                if failed and self.discard_on_error:
-                    self.store.discard(self.meta["meeting_id"])
+                try:
+                    if failed and self.discard_on_error:
+                        self.store.discard(self.meta["meeting_id"])
+                finally:
+                    self.release()
         return False
 
     def _row(self, seg, now):

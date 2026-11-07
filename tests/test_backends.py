@@ -337,9 +337,24 @@ def test_targets_pick_the_variants_a_model_needs(models):
     assert job.targets("small", "openvino", "npu") == ("openvino", "small", ["fp16"])
     assert job.targets("small:fp16", None, "cpu") == ("openvino", "small", ["fp16"])
     assert job.targets("small", "faster-whisper", None) == ("faster-whisper", "small", ["ct2"])
+    assert job.targets("small:int8", None, None) == ("openvino", "small", ["int8"])
     for bad, text in ((("riesig", None, None), "Unbekanntes Modell"), (("small", "x", None), "Unbekanntes Backend"), (("small:int4", None, None), "Unbekannte Variante")):
         with pytest.raises(SelectionError, match=text):
             job.targets(*bad)
+
+
+def test_targets_refuse_pairs_that_cannot_work_together_instead_of_downloading_nothing(models):
+    job = pipeline.ModelSetup(models)
+    for args, text in (
+        (("small", "faster-whisper", "npu"), "faster-whisper läuft nur auf der CPU und auf NVIDIA-Karten"),
+        (("small", "faster-whisper", "igpu"), "faster-whisper läuft nur auf der CPU"),
+        (("large-v3-turbo:int8", "openvino", "npu"), "int8 läuft auf der NPU nicht"),
+        (("small:ct2", "openvino", None), "Unbekannte Variante"),
+    ):
+        with pytest.raises(SelectionError, match=text) as caught:
+            job.targets(*args)
+        assert caught.value.reason
+    assert job.targets("small", "faster-whisper", "gpu") == ("faster-whisper", "small", ["ct2"])
 
 
 def test_a_model_folder_named_like_an_int8_catalog_model_is_refused_on_the_npu(models):

@@ -196,8 +196,20 @@ class ModelSetup:
         variants = Catalog.variants(backend, name)
         if variant and variant not in variants:
             raise backends.SelectionError(f"Unbekannte Variante '{variant}' für {name}. Verfügbar: {', '.join(variants)}.")
-        kinds = [device] if device and device != "auto" else list(CATALOG["hardware_order"])
-        chosen = [variant] if variant else [spec["default"] for kind in kinds if (spec := Catalog.spec(backend, kind))]
+        device = (device or "auto").lower()
+        if device not in backends.HARDWARE_CHOICES:
+            raise backends.SelectionError(f"Unbekannte Hardware '{device}'. Verfügbar: {', '.join(backends.HARDWARE_CHOICES)}.")
+        chosen, reasons = [], []
+        for kind in [device] if device != "auto" else CATALOG["hardware_order"]:
+            spec = Catalog.spec(backend, kind)
+            if spec is None:
+                reasons.append((kind, backend, CATALOG["backends"][backend].get("unsupported") or f"{Catalog.backend_label(backend)} unterstützt {Catalog.label(kind)} nicht."))
+            elif variant and variant not in spec["variants"]:
+                reasons.append((kind, backend, Catalog.refused(backend, kind, variant)))
+            else:
+                chosen.append(variant or spec["default"])
+        if not chosen:
+            raise Selection.refusal(backend, device, name, reasons)
         return backend, name, list(dict.fromkeys(chosen))
 
     def fetch(self, backend, model, variant):

@@ -1242,6 +1242,19 @@ def test_setup_events_stream_progress_then_done_or_error(env, monkeypatch):
     assert unknown.exit_code == 1 and "Unbekanntes Modell" in events_of(unknown)[-1]["message"]
 
 
+def test_setup_refuses_a_backend_and_device_that_cannot_work_together(env, monkeypatch):
+    seen = []
+    monkeypatch.setattr(pipeline.ModelSetup, "download", fake_download(seen))
+    plain = invoke("setup", "--backend", "faster-whisper", "--device", "npu")
+    assert plain.exit_code == 1 and "Diese Kombination geht nicht" in plain.output and "nur auf der CPU und auf NVIDIA-Karten" in plain.output
+    stream = invoke("setup", "--backend", "faster-whisper", "--device", "igpu", "--events")
+    last = events_of(stream)[-1]
+    assert stream.exit_code == 1 and last["event"] == "error" and "faster-whisper läuft nur auf der CPU" in last["message"]
+    refused = invoke("setup", "--model", "small:int8", "--device", "npu")
+    assert refused.exit_code == 1 and "int8 läuft auf der NPU nicht" in refused.output
+    assert seen == []
+
+
 def test_setup_without_model_does_what_it_did_before(env, monkeypatch):
     seen, warmed = [], []
     monkeypatch.setattr(pipeline.ModelSetup, "download", fake_download(seen))

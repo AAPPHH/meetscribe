@@ -9,7 +9,7 @@ import duckdb
 import pytest
 
 from meetscribe.store import (
-    CONFIG, DuplicateMeetingError, EOS, FileLock, HotFile, LockBusy, MeetingNotFound, Query, Report, Store, make_config,
+    CONFIG, SQL_LIMITS, DuplicateMeetingError, EOS, FileLock, HotFile, LockBusy, MeetingNotFound, Query, Report, Store, make_config,
 )
 
 ALL_ROWS = "SELECT * FROM segments ORDER BY meeting_id, seg_id"
@@ -624,6 +624,16 @@ def test_rotate_from_two_processes_moves_each_meeting_once(store):
     assert sorted(counts) == [0, 6] and not store.hot_files() and len(store.cold_files()) == 6
     assert Query(store).execute("SELECT count(*) FROM segments")[1] == [(18,)]
 
+
+def test_sandbox_select_clips_large_cells_and_caps_the_result_size(archive, monkeypatch):
+    columns, rows, more = archive.select("SELECT repeat('x', 3000000) AS big")
+    cell = rows[0][0]
+    assert len(cell) < 6000 and "3000000 Zeichen" in cell and not more
+    monkeypatch.setitem(SQL_LIMITS, "result_chars", 20000)
+    columns, rows, more = archive.select("SELECT repeat('y', 4000) AS t FROM range(50)", limit=50)
+    assert 1 <= len(rows) <= 6 and more
+    columns, rows, more = archive.select("SELECT [repeat('z', 100000)] AS l")
+    assert len(rows[0][0][0]) < 6000
 
 
 def test_an_aborted_writer_closes_and_discards_its_file_at_once_and_ignores_later_appends(store):

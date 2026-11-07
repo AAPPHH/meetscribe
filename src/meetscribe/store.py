@@ -42,9 +42,10 @@ DUCKDB_SETTINGS = {
     "autoload_known_extensions": "false",
 }
 SANDBOX = {"memory_limit": "'1GB'", "threads": "2", "enable_external_access": "false"}
-SQL_LIMITS = {"default_rows": 200, "max_rows": 1000, "timeout_s": 20.0}
+SQL_LIMITS = {"default_rows": 200, "max_rows": 1000, "timeout_s": 20.0, "cell_chars": 5000, "result_chars": 400000, "list_items": 200}
 LOCKS = {"speakers_wait_s": 15.0, "rotate_wait_s": 60.0, "poll_s": 0.05, "busy_tries": 40, "busy_wait_s": 0.05}
 TEXT = {
+    "clipped": " … [gekürzt, {chars} Zeichen insgesamt]",
     "select_only": "Erlaubt ist genau eine lesende SELECT-Abfrage ({kind}).",
     "timeout": "Die Abfrage wurde nach {seconds:g} s abgebrochen.",
     "busy": "Die Datei ist gerade gesperrt: {path}",
@@ -505,7 +506,25 @@ class Query:
                 cursor.execute("ROLLBACK")
             except duckdb.Error:
                 pass
-        return columns, rows[:limit], len(rows) > limit
+        kept, more, size = [], len(rows) > limit, 0
+        for row in rows[:limit]:
+            row = tuple(self._clamp(cell) for cell in row)
+            size += len(Json.dumps(row))
+            if kept and size > SQL_LIMITS["result_chars"]:
+                more = True
+                break
+            kept.append(row)
+        return columns, kept, more
+
+    @classmethod
+    def _clamp(cls, value):
+        if isinstance(value, str) and len(value) > SQL_LIMITS["cell_chars"]:
+            return value[:SQL_LIMITS["cell_chars"]] + TEXT["clipped"].format(chars=len(value))
+        if isinstance(value, (list, tuple)):
+            return [cls._clamp(v) for v in value[:SQL_LIMITS["list_items"]]]
+        if isinstance(value, dict):
+            return {k: cls._clamp(v) for k, v in list(value.items())[:SQL_LIMITS["list_items"]]}
+        return value
 
     def _records(self, sql, params=None):
         columns, rows = self.execute(sql, params)

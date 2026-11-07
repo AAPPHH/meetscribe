@@ -539,6 +539,16 @@ class StartView {
   }
 }
 
+class EngineNotice {
+  constructor() {
+    $("engine-notice-close").addEventListener("click", () => ($("engine-notice").hidden = true));
+    listen<{ text: string }>("engine-notice", (e) => {
+      $("engine-notice-text").textContent = e.payload.text;
+      $("engine-notice").hidden = false;
+    });
+  }
+}
+
 class CloseGuard {
   constructor(private modal: Modal, private start: StartView) {
     listen<{ stage: string; audio?: string | null }>("close-requested", (e) => this.ask(e.payload.stage, e.payload.audio ?? this.start.audio));
@@ -891,6 +901,7 @@ async function main() {
   let settings: SettingsView;
   const download = new DownloadView(store, catalog, () => settings.reloadCatalog());
   settings = new SettingsView(store, start, checks, catalog, download);
+  new EngineNotice();
   new CloseGuard(modal, start);
   tabs.on("meetings", () => meetings.load());
   tabs.on("search", () => $("search-term").focus());

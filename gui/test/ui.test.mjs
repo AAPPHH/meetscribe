@@ -108,6 +108,16 @@ test("ein Absturz während der Aufnahme nennt die Aufnahmedatei aus dem Ereignis
   assert.equal(ui.$("retry").hidden, false);
 });
 
+test("ein Neustart der Engine nach einem Absturz erscheint als Hinweis, der sich schließen lässt", async () => {
+  const ui = await boot();
+  assert.equal(ui.$("engine-notice").hidden, true);
+  await ui.emit("engine-notice", { text: "Die Engine war abgestürzt und wurde neu gestartet." });
+  assert.equal(ui.$("engine-notice").hidden, false);
+  assert.equal(ui.$("engine-notice-text").textContent, "Die Engine war abgestürzt und wurde neu gestartet.");
+  await ui.click("engine-notice-close");
+  assert.equal(ui.$("engine-notice").hidden, true);
+});
+
 test("Fehlerereignisse zeigen die Einzelheiten ungekürzt", async () => {
   const ui = await boot({ start_session: () => null });
   await startRun(ui);

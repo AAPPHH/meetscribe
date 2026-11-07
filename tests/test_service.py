@@ -595,6 +595,15 @@ def test_transcription_refuses_a_mapped_network_drive(env, fast, monkeypatch):
     assert seen == ["Z:\\"]
 
 
+def test_a_meeting_without_segments_yet_gets_the_same_german_answer_everywhere(env):
+    svc = Service(env["store"])
+    with env["store"].writer("m-lauft", title="T", meeting_date="2026-03-04", language="de"):
+        for call in (svc.transcript, svc.report):
+            with pytest.raises(ServiceError, match="noch keine Segmente"):
+                call("m-lauft")
+        assert svc.stats("m-lauft") == [] and svc.meetings() == []
+
+
 def test_closing_the_service_discards_the_running_meeting_at_once_not_after_the_window(env, fast, monkeypatch):
     monkeypatch.setitem(pipeline.SETTINGS, "window_s", 10.0)
     monkeypatch.setattr(pipeline.AudioLoader, "load", staticmethod(lambda path, rate=None: np.full(16000 * 60, 0.1, dtype="float32")))

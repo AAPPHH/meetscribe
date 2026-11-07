@@ -65,6 +65,7 @@ TEXT = {
     "no_mapping": "Keine Zuordnung fuer {label} in {meeting_id}.",
     "audio_missing": "Die Audiodatei existiert nicht oder ist keine Datei: {audio}",
     "audio_remote": "Netzwerkpfade und Netzlaufwerke sind gesperrt, weil meetscribe hier keinen Netzzugriff hat. Bitte eine lokale Datei angeben: {audio}",
+    "no_segments": "Die Besprechung {meeting_id} hat noch keine Segmente (die Verarbeitung läuft noch oder wurde abgebrochen).",
 }
 DRIVE_REMOTE = 4
 RUN_OPTIONS = ("audio", "title", "mic", "device", "backend", "model", "diarize", "speakers", "fallback")
@@ -365,7 +366,9 @@ class Service:
         limit = min(max(int(limit or TRANSCRIPT["default_rows"]), 1), TRANSCRIPT["max_rows"])
         offset = max(int(offset or 0), 0)
         with self.reading() as query:
-            info = next(m for m in query.meetings() if m["meeting_id"] == meeting_id)
+            info = next((m for m in query.meetings() if m["meeting_id"] == meeting_id), None)
+            if info is None:
+                raise ServiceError(TEXT["no_segments"].format(meeting_id=meeting_id))
             where = "meeting_id = ?" + (" AND (speaker = ? OR display_name = ?)" if speaker else "")
             params = [meeting_id, *([speaker, speaker] if speaker else [])]
             total = query.execute(f"SELECT count(*) FROM segments_named WHERE {where}", params)[1][0][0]
@@ -414,7 +417,7 @@ class Service:
             with self.reading() as query:
                 text = Report(query).render(meeting_id)
         except MeetingNotFound as exc:
-            raise ServiceError(str(exc)) from exc
+            raise ServiceError(TEXT["no_segments"].format(meeting_id=meeting_id)) from exc
         target = Path(out) if out else None
         if target:
             target.parent.mkdir(parents=True, exist_ok=True)

@@ -326,3 +326,26 @@ def test_transcribe_start_refuses_a_network_path_with_a_german_reason_and_starts
     refused, status = drive(app, script)
     assert "Netzwerkpfade und Netzlaufwerke sind gesperrt" in refused and "Unbekannte Job-ID" in status
     assert app.service.run is None
+
+
+def test_reading_a_running_job_before_its_first_window_gives_a_clear_answer_in_every_tool(app, env):
+    SlowEngine.gate = threading.Event()
+
+    async def script(call):
+        started = await call.ok("transcribe_start", audio=str(env["audio"]), diarize=False)
+        meeting_id = None
+        for _ in range(300):
+            meeting_id = (await call.ok("transcribe_status", job=started["job"]))["meeting_id"]
+            if meeting_id and env["store"].hot_path(meeting_id).exists():
+                break
+            await anyio.sleep(0.05)
+        answers = (
+            await call.fail("get_transcript", meeting_id=meeting_id), await call.fail("get_minutes", meeting_id=meeting_id),
+            await call.ok("speaker_stats", meeting_id=meeting_id),
+        )
+        SlowEngine.gate.set()
+        await call.ok("transcribe_status", job=started["job"], wait_s=30)
+        return answers
+    transcript, minutes, stats = drive(app, script)
+    assert "noch keine Segmente" in transcript and "noch keine Segmente" in minutes and stats == {"speakers": []}
+    SlowEngine.gate = None

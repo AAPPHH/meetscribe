@@ -6,6 +6,7 @@ dependencies = [
     "click>=8.5.0",
     "duckdb>=2.0.0",
     "huggingface_hub",
+    "mcp>=2.3,<3",
     "numpy",
     "openvino-genai==2026.4.*",
     "pyannote.audio>=4,<5",

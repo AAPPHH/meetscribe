@@ -337,6 +337,20 @@ class StdinWatcher:
         return self.event.is_set()
 
 
+class StopSignal:
+    def __init__(self):
+        self.event = threading.Event()
+
+    def start(self):
+        return self
+
+    def set(self):
+        self.event.set()
+
+    def is_set(self):
+        return self.event.is_set()
+
+
 class Interrupt:
     def __init__(self):
         self.event = threading.Event()
@@ -475,26 +489,42 @@ class Aligner:
         return segments
 
 
+class FreshEngines:
+    @staticmethod
+    def get(step, models, language):
+        return backends.ENGINES[step.backend](step, models, language)
+
+    @staticmethod
+    def drop(step, models, language):
+        pass
+
+
 class ASRRunner:
-    def __init__(self, steps, factory, fallback=True, reporter=None):
+    def __init__(self, steps, factory, fallback=True, reporter=None, drop=None):
         self.reporter = reporter or Reporter()
         self.steps = list(steps)
         self.factory = factory
+        self.drop = drop
         self.fallback = fallback
         self.index = 0
         self.engine = None
         self.used = []
         self.variants = []
+        self.load_s = 0.0
 
     def transcribe(self, audio):
         while True:
             step = self.steps[self.index]
             try:
                 if self.engine is None:
+                    started = time.monotonic()
                     self.engine = self.factory(step)
+                    self.load_s += time.monotonic() - started
                 result = self.engine.transcribe(audio)
             except Exception as exc:
                 self.engine = None
+                if self.drop:
+                    self.drop(step)
                 gc.collect()
                 self.index += 1
                 if not self.fallback:
@@ -603,8 +633,9 @@ class Naming:
 class TranscribeJob:
     def __init__(self, store, audio, device, language, models=None, model=None, title=None, day=None, meeting_id=None,
                  diarize=True, fallback=True, speakers=None, min_speakers=None, max_speakers=None, reporter=None,
-                 backend="auto", hardware=None):
+                 backend="auto", hardware=None, engines=None):
         self.reporter = reporter or Reporter()
+        self.engines = engines or FreshEngines()
         self.store = store
         self.audio = Path(audio)
         self.device = (device or "auto").lower()
@@ -653,7 +684,7 @@ class TranscribeJob:
         step = self.plan.primary
         return {"backend": step.backend, "device": step.label, "model": self.plan.model, "variant": step.variant}
 
-    def ran(self, summary):
+    def ran(self, summary, load_s=0.0):
         step = self.plan.primary
         used = summary["used"]
         fallback = bool(used) and used[0] != step.label or len(used) > 1
@@ -664,6 +695,7 @@ class TranscribeJob:
         return {
             "backend": step.backend, "backends": backends_used, "devices": used, "model": self.plan.model, "variant": (summary["variants"] or [step.variant])[0], "variants": summary["variants"],
             "stored": [m for _, m in summary["engines"]], "requested": self.plan.requested, "fallback": fallback, "text": text,
+            "load_s": round(load_s, 2),
         }
 
     def run(self):
@@ -678,12 +710,15 @@ class TranscribeJob:
         audio = AudioLoader.load(self.audio)
         turns = Diarizer(self.models).diarize(audio, **self.speaker_options) if self.diarize else []
         gc.collect()
-        runner = ASRRunner(self.plan.chain, lambda step: backends.ENGINES[step.backend](step, self.models, self.language), self.fallback, self.reporter)
+        runner = ASRRunner(
+            self.plan.chain, lambda step: self.engines.get(step, self.models, self.language), self.fallback, self.reporter,
+            drop=lambda step: self.engines.drop(step, self.models, self.language),
+        )
         with self.store.writer(meeting_id, title=self.title, meeting_date=self.day, language=self.language, discard_on_error=True) as writer:
             summary = Transcriber(runner).run(audio, turns, writer)
         if not summary["segments"]:
             self.store.discard(meeting_id)
-        return {**summary, "meeting_id": meeting_id, "requested": self.plan.requested, "ran": self.ran(summary)}
+        return {**summary, "meeting_id": meeting_id, "requested": self.plan.requested, "ran": self.ran(summary, runner.load_s)}
 
 
 class InputPicker:
@@ -1017,8 +1052,9 @@ class Heartbeat:
 class StartFlow:
     def __init__(self, store, audio=None, mic=None, device="auto", title=None, speakers=None, diarize=True,
                  open_report=True, tty=False, models=None, picker=None, reporter=None, stdin_stop=False,
-                 backend="auto", model=None, fallback=True, hardware=None):
+                 backend="auto", model=None, fallback=True, hardware=None, stop=None, engines=None):
         self.reporter = reporter or Reporter()
+        self.engines = engines
         self.store = store
         self.audio = Path(audio) if audio else None
         self.mic = mic
@@ -1034,7 +1070,7 @@ class StartFlow:
         self.tty = tty and not self.reporter.machine
         self.models = models or Models()
         self.picker = picker
-        self.watcher = StdinWatcher() if stdin_stop else None
+        self.watcher = StdinWatcher() if stdin_stop else stop
         self.session = None
         self.job = None
         self.result = None
@@ -1071,7 +1107,7 @@ class StartFlow:
         self.job = TranscribeJob(
             self.store, planned, self.device, SETTINGS["language"], models=self.models, model=self.model, title=self.title,
             diarize=self.diarize, speakers=self.speakers, reporter=self.reporter, backend=self.backend,
-            fallback=self.fallback, hardware=self.hardware,
+            fallback=self.fallback, hardware=self.hardware, engines=self.engines,
         )
         self.job.check()
         if self.audio is not None:

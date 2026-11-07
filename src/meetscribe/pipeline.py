@@ -76,6 +76,23 @@ START = {
     "heartbeat_s": 2.0,
     "abort_grace_s": 30.0,
 }
+SURFACE_HINTS = {
+    "cli": {
+        "diarize_off": "in den Einstellungen „Sprecher trennen“ ausschalten (Kommandozeile: --no-diarize)",
+        "diarize_fix": "{token} setzen und 'meetscribe setup' ausführen",
+        "model_fix": "Bitte 'meetscribe setup --model {model}{variant} --backend {backend}' ausführen.",
+    },
+    "app": {
+        "diarize_off": "in den Einstellungen „Sprecher trennen“ ausschalten",
+        "diarize_fix": "die Sprechertrennung einmalig einrichten (README, „Engine einrichten“)",
+        "model_fix": "Bitte das Modell in den Einstellungen unter „Modell herunterladen“ laden.",
+    },
+    "mcp": {
+        "diarize_off": "diarize=false übergeben",
+        "diarize_fix": "die Sprechertrennung einmalig einrichten (README, „Engine einrichten“)",
+        "model_fix": "Das Modell muss einmalig eingerichtet werden (README, „Engine einrichten“, oder in der App „Modell herunterladen“).",
+    },
+}
 AWAKE_FLAGS = {"continuous": 0x80000000, "system_required": 0x00000001}
 
 
@@ -669,8 +686,9 @@ class Naming:
 class TranscribeJob:
     def __init__(self, store, audio, device, language, models=None, model=None, title=None, day=None, meeting_id=None,
                  diarize=True, fallback=True, speakers=None, min_speakers=None, max_speakers=None, reporter=None,
-                 backend="auto", hardware=None, engines=None, cancel=None):
+                 backend="auto", hardware=None, engines=None, cancel=None, surface="cli"):
         self.reporter = reporter or Reporter()
+        self.hints = SURFACE_HINTS[surface]
         self.engines = engines or FreshEngines()
         self.cancel = cancel or StopSignal()
         self.store = store
@@ -704,17 +722,17 @@ class TranscribeJob:
             diar = SETTINGS["diarization"]
             raise PipelineError(
                 "Diarisierungsmodell fehlt oder ist unvollständig: Die Sprechertrennung ist noch nicht eingerichtet. "
-                "Schnelle Lösung: in den Einstellungen „Sprecher trennen“ ausschalten (Kommandozeile: --no-diarize). "
-                f"Dauerhaft: {diar['token_env']} setzen und 'meetscribe setup' ausführen.",
+                f"Schnelle Lösung: {self.hints['diarize_off']}. "
+                f"Dauerhaft: {self.hints['diarize_fix'].format(token=diar['token_env'])}.",
                 f"Fehlende Dateien: {', '.join(str(p) for p in missing)}\n"
-                f"Für 'meetscribe setup' den Zugriff auf {diar['repo']} bei huggingface.co akzeptieren und {diar['token_env']} setzen.",
+                f"Für die Einrichtung den Zugriff auf {diar['repo']} bei huggingface.co akzeptieren und {diar['token_env']} setzen.",
             )
         step = self.plan.primary
         if not step.installed:
             variant = "" if step.variant == "custom" else f":{step.variant}"
             raise PipelineError(
                 f"Das Modell {self.plan.model} ({Catalog.backend_label(step.backend)}, {step.variant}) fehlt: {step.path}. "
-                f"Bitte 'meetscribe setup --model {self.plan.model}{variant} --backend {step.backend}' ausführen."
+                + self.hints["model_fix"].format(model=self.plan.model, variant=variant, backend=step.backend)
             )
 
     def announce(self):
@@ -1026,8 +1044,8 @@ class RunLock(FileLock):
             return super().__enter__()
         except LockBusy:
             raise PipelineError(
-                "Es läuft bereits eine Aufnahme oder Verarbeitung (nach hartem Beenden der Oberfläche läuft die alte noch kurz weiter). "
-                "Bitte einen Moment warten und dann erneut versuchen."
+                "Es läuft bereits eine Aufnahme oder Verarbeitung (in der App oder über Claude). "
+                "Bitte warten, bis sie fertig ist, und dann erneut versuchen. Läuft nirgends eine, endet eine nach hartem Beenden gleich von selbst."
             ) from None
 
 
@@ -1068,8 +1086,9 @@ class Heartbeat:
 class StartFlow:
     def __init__(self, store, audio=None, mic=None, device="auto", title=None, speakers=None, diarize=True,
                  open_report=True, tty=False, models=None, picker=None, reporter=None, stdin_stop=False,
-                 backend="auto", model=None, fallback=True, hardware=None, stop=None, engines=None, cancel=None):
+                 backend="auto", model=None, fallback=True, hardware=None, stop=None, engines=None, cancel=None, surface="cli"):
         self.reporter = reporter or Reporter()
+        self.surface = surface
         self.cancel = cancel
         self.engines = engines
         self.store = store
@@ -1124,7 +1143,7 @@ class StartFlow:
         self.job = TranscribeJob(
             self.store, planned, self.device, SETTINGS["language"], models=self.models, model=self.model, title=self.title,
             diarize=self.diarize, speakers=self.speakers, reporter=self.reporter, backend=self.backend,
-            fallback=self.fallback, hardware=self.hardware, engines=self.engines, cancel=self.cancel,
+            fallback=self.fallback, hardware=self.hardware, engines=self.engines, cancel=self.cancel, surface=self.surface,
         )
         self.job.check()
         if self.audio is not None:

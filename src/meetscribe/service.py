@@ -294,7 +294,8 @@ class Download:
 
 
 class Service:
-    def __init__(self, store=None, engines=None, sandbox=False):
+    def __init__(self, store=None, engines=None, sandbox=False, surface="cli"):
+        self.surface = surface
         self.sandbox = sandbox
         self.store = store or Store(make_config())
         self.engines = engines or pipeline.FreshEngines()
@@ -493,7 +494,7 @@ class Service:
         return pipeline.SetupCheck().run()
 
     def flow(self, **options):
-        return pipeline.StartFlow(self.store, engines=self.engines, hardware=self.hardware, **options)
+        return pipeline.StartFlow(self.store, engines=self.engines, hardware=self.hardware, surface=self.surface, **options)
 
     @staticmethod
     def choice(label, value):

@@ -635,3 +635,23 @@ def test_closing_the_service_after_some_windows_leaves_no_incomplete_meeting(env
     svc.close()
     assert not env["store"].hot_files() and svc.meetings() == []
     assert svc.run.finished.wait(20) and svc.run.code == 130 and not env["store"].hot_files()
+
+
+@pytest.mark.parametrize("sandbox, wanted, unwanted", [
+    (True, "diarize=false", ("--no-diarize", "Kommandozeile", "meetscribe setup")),
+    (False, "Einstellungen", ("--no-diarize", "Kommandozeile", "meetscribe setup")),
+])
+def test_the_missing_diarization_model_names_the_way_out_of_the_surface_that_asked(env, fast, sandbox, wanted, unwanted):
+    svc, wire = Service(env["store"], EngineCache(idle_s=60), sandbox=sandbox, surface="mcp" if sandbox else "app"), CollectWire()
+    svc.begin_transcription(env["audio"], wire, in_thread, diarize=True)
+    assert svc.run.finished.wait(20)
+    error = wire.events()[-1]
+    assert error["event"] == "error" and wanted in error["message"]
+    assert not [word for word in unwanted if word in error["message"] or word in error["detail"]]
+
+
+def test_the_start_lock_message_names_the_app_and_claude_not_a_hard_kill(tmp_path):
+    with pipeline.RunLock(tmp_path / "start.lock"):
+        with pytest.raises(pipeline.PipelineError) as busy:
+            pipeline.RunLock(tmp_path / "start.lock").__enter__()
+    assert "in der App oder über Claude" in busy.value.message and "nach hartem Beenden der Oberfläche läuft" not in busy.value.message

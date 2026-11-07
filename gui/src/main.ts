@@ -11,7 +11,6 @@ type EngineEvent = {
   path?: string;
   audio?: string | null;
   meeting_id?: string | null;
-  retry?: string | null;
   report?: string;
   segments?: number;
   speakers?: number;
@@ -358,7 +357,7 @@ class StartView {
     try {
       await call("start_session", { options });
     } catch (err) {
-      this.fail({ event: "error", message: text(err), audio: null, meeting_id: null, retry: null });
+      this.fail({ event: "error", message: text(err), audio: null, meeting_id: null });
     }
   }
 
@@ -445,7 +444,6 @@ class StartView {
       detail: lines.join("\n"),
       audio: info.audio ?? this.audio,
       meeting_id: null,
-      retry: null,
     });
   }
 
@@ -514,7 +512,6 @@ class StartView {
     this.failure = ev;
     $("error-message").textContent = ev.message ?? "Unbekannter Fehler.";
     $("error-audio").textContent = ev.audio ? `Das Audio ist erhalten: ${ev.audio}` : "";
-    $("error-retry").textContent = ev.retry ? `Kommandozeile: ${ev.retry}` : "";
     $("error-detail").textContent = ev.detail ?? "";
     const detail = (ev.detail ?? "").trim();
     $("error-more").hidden = !detail || detail === (ev.message ?? "").trim();

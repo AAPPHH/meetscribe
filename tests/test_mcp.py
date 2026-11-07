@@ -64,7 +64,7 @@ def drive(app, script):
 def app(env, fast):
     transcribe(env, "--no-diarize")
     write(env["store"], "m2", title="Planung", day="2026-03-05")
-    return McpApp(Service(env["store"], EngineCache(idle_s=60), sandbox=True))
+    return McpApp(Service(env["store"], EngineCache(idle_s=60), sandbox=True, surface="mcp"))
 
 
 def test_exactly_the_planned_tools_with_german_descriptions_and_typed_inputs(app):
@@ -349,3 +349,11 @@ def test_reading_a_running_job_before_its_first_window_gives_a_clear_answer_in_e
     transcript, minutes, stats = drive(app, script)
     assert "noch keine Segmente" in transcript and "noch keine Segmente" in minutes and stats == {"speakers": []}
     SlowEngine.gate = None
+
+
+def test_a_missing_diarization_model_names_the_tool_argument_not_a_command_line(app, env):
+    async def script(call):
+        started = await call.ok("transcribe_start", audio=str(env["audio"]))
+        return await call.ok("transcribe_status", job=started["job"], wait_s=30)
+    final = drive(app, script)
+    assert final["state"] == "failed" and "diarize=false" in final["message"] and "--no-diarize" not in final["message"] + final["detail"]

@@ -87,7 +87,7 @@ def get_service():
 
 
 def get_service_with_cache():
-    return Service(get_store(), EngineCache())
+    return Service(get_store(), EngineCache(), surface="app")
 
 
 def selection_options(command):

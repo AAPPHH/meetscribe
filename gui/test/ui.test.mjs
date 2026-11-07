@@ -569,3 +569,12 @@ test("fehlt die MCP-Schnittstelle, steht der Grund da und die Blöcke bleiben ve
   assert.ok(ui.$("mcp-status").textContent.includes("uv sync"));
   assert.ok(ui.$("mcp-box").parentElement.textContent.includes("ändert dabei keine Einstellungen von Claude"));
 });
+
+test("ein Fehler zeigt nie eine Kommandozeile, auch wenn die Engine eine mitschickt", async () => {
+  const ui = await boot({ start_session: () => null });
+  await startRun(ui);
+  await ui.emit("engine-event", { event: "error", message: "Verarbeitung fehlgeschlagen: kaputt", audio: AUDIO, meeting_id: null, retry: "meetscribe start x.wav --no-diarize --no-open --events", detail: "" });
+  assert.equal(ui.$("error-retry"), null);
+  assert.ok(!ui.$("view-error").textContent.includes("Kommandozeile") && !ui.$("view-error").textContent.includes("--no-diarize"));
+  assert.ok(ui.$("error-message").textContent.includes("kaputt") && ui.$("error-audio").textContent.includes(AUDIO));
+});

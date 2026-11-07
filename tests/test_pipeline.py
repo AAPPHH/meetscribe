@@ -54,7 +54,7 @@ def small_windows():
 
 
 def step(kind):
-    return Step("openvino", kind, {"device": kind.upper(), "cuda": None}, "fp16", {"mb": 1}, Path("x"), True, "ok")
+    return Step("openvino", kind, {"device": kind.upper(), "cuda": None}, "fp16" if kind == "npu" else "int8", {"mb": 1}, Path("x"), True, "ok")
 
 
 STEPS = [step(kind) for kind in ("npu", "igpu", "cpu")]
@@ -163,7 +163,7 @@ def test_fallback_mid_run_keeps_rows_and_device(store, capfd):
     summary, _ = run_windows(store, factory)
     err = capfd.readouterr().err.strip().splitlines()
     assert len(err) == 1 and "NPU" in err[0] and "DEVICE_LOST" in err[0] and "Rückfall auf iGPU (OpenVINO)" in err[0]
-    assert summary == {"segments": 3, "speakers": 1, "used": ["NPU", "iGPU"], "engines": [("openvino", "fake-npu"), ("openvino", "fake-igpu")]}
+    assert summary == {"segments": 3, "speakers": 1, "used": ["NPU", "iGPU"], "variants": ["fp16", "int8"], "engines": [("openvino", "fake-npu"), ("openvino", "fake-igpu")]}
     assert HotFile(store.hot_path("m1")).is_complete()
     rows = Query(store).execute("SELECT seg_id, start_s, device, model, backend FROM segments ORDER BY seg_id")[1]
     assert [r[2] for r in rows] == ["NPU", "iGPU", "iGPU"]

@@ -472,6 +472,7 @@ class ASRRunner:
         self.index = 0
         self.engine = None
         self.used = []
+        self.variants = []
 
     def transcribe(self, audio):
         while True:
@@ -496,6 +497,7 @@ class ASRRunner:
                 continue
             if step.label not in self.used:
                 self.used.append(step.label)
+                self.variants.append(step.variant)
             return self.engine, result
 
 
@@ -536,7 +538,7 @@ class Transcriber:
             speakers.update(segment["speaker"] for segment in segments)
             if words:
                 floor = words[-1]["start_s"]
-        return {"segments": count, "speakers": len(speakers), "used": list(self.runner.used), "engines": ran}
+        return {"segments": count, "speakers": len(speakers), "used": list(self.runner.used), "variants": list(self.runner.variants), "engines": ran}
 
 
 class Diarizer:
@@ -648,7 +650,7 @@ class TranscribeJob:
             " → ".join(used) or step.label, self.plan.model, " + ".join(Catalog.backend_label(b) for b in backends_used) or Catalog.backend_label(step.backend),
         ])
         return {
-            "backend": step.backend, "backends": backends_used, "devices": used, "model": self.plan.model, "variant": step.variant,
+            "backend": step.backend, "backends": backends_used, "devices": used, "model": self.plan.model, "variant": (summary["variants"] or [step.variant])[0], "variants": summary["variants"],
             "stored": [m for _, m in summary["engines"]], "requested": self.plan.requested, "fallback": fallback, "text": text,
         }
 

@@ -313,7 +313,7 @@ def test_faster_whisper_words_flow_through_the_shared_transcriber(models, monkey
     audio = np.full(16000 * 2, 0.1, dtype="float32")
     with store.writer("m", title="t", meeting_date="2026-01-01", language="de") as writer:
         summary = pipeline.Transcriber(runner).run(audio, [], writer)
-    assert summary["segments"] == 1 and summary["used"] == ["CPU"] and summary["engines"] == [("faster-whisper", "faster-whisper-large-v3-turbo-int8")]
+    assert summary["segments"] == 1 and summary["used"] == ["CPU"] and summary["variants"] == ["ct2"] and summary["engines"] == [("faster-whisper", "faster-whisper-large-v3-turbo-int8")]
     row = Query(store).execute("SELECT text, device, model, backend, words FROM segments")[1][0]
     assert row[0] == "Guten Tag." and row[1:4] == ("CPU", "faster-whisper-large-v3-turbo-int8", "faster-whisper")
     assert [w["text"] for w in row[4]] == ["Guten", "Tag."] and row[4][0]["start_s"] == pytest.approx(0.1)

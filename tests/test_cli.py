@@ -1119,6 +1119,7 @@ def test_start_events_carry_the_plan_and_the_real_hardware(env):
     ran = events[2]["ran"]
     assert ran["devices"] == ["iGPU"] and ran["backend"] == "openvino" and ran["requested"] == "iGPU" and ran["fallback"] is False
     assert ran["text"] == "iGPU · large-v3-turbo · OpenVINO" and ran["stored"] == ["fake-model"]
+    assert ran["variant"] == "int8" and ran["variants"] == ["int8"]
 
 
 def test_start_events_show_a_fallback_as_warning_and_in_the_result(env):
@@ -1131,6 +1132,7 @@ def test_start_events_show_a_fallback_as_warning_and_in_the_result(env):
     ran = events[-1]["ran"]
     assert ran["fallback"] is True and ran["devices"] == ["iGPU"] and ran["requested"] == "Automatisch"
     assert ran["text"].startswith("iGPU · ")
+    assert events[1]["variant"] == "fp16" and ran["variant"] == "int8" and ran["variants"] == ["int8"]
 
 
 def test_start_refuses_impossible_choices_before_recording(env, monkeypatch):

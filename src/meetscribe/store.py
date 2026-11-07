@@ -335,7 +335,12 @@ class Query:
         state = self._state()
         if state == self._signature:
             return
-        reads = [(p.stem, *HotFile(p).read()) for p in self.store.hot_files()]
+        reads = []
+        for path in self.store.hot_files():
+            try:
+                reads.append((path.stem, *HotFile(path).read()))
+            except FileNotFoundError:
+                continue
         tables = [table for _, table, _ in reads]
         self.con.register("hot_raw", pa.concat_tables(tables) if tables else SCHEMA.empty_table())
         self.con.register("incomplete_ids", pa.table({"meeting_id": pa.array([m for m, _, complete in reads if not complete], pa.string())}))

@@ -5,14 +5,10 @@ from pathlib import Path
 
 import click
 
-from meetscribe.backends import BACKEND_CHOICES, CATALOG, HARDWARE_CHOICES, Catalog, Hardware, Selection
-from meetscribe.store import Json, MeetingNotFound, Query, Report, Store, make_config
+from meetscribe.backends import BACKEND_CHOICES, CATALOG, HARDWARE_CHOICES, Catalog, Selection
+from meetscribe.service import OFFLINE_ENV, EngineCache, RpcServer, Service, Wire
+from meetscribe.store import Json, Store, make_config
 
-OFFLINE_ENV = {
-    "HF_HUB_OFFLINE": "1",
-    "TRANSFORMERS_OFFLINE": "1",
-    "PYANNOTE_METRICS_ENABLED": "0",
-}
 TABLE = {"clip": 100, "float_digits": 2}
 STATUS_WORDS = {"ok": "ok", "unverified": "ungeprüft", "refused": "nein"}
 
@@ -86,19 +82,12 @@ def get_store():
     return Store(make_config())
 
 
-def require_meeting(store, meeting_id):
-    if meeting_id is None:
-        meeting_id = Query(store).latest_meeting()
-        if meeting_id is None:
-            raise click.ClickException("Keine Besprechung vorhanden.")
-        return meeting_id
-    try:
-        known = store.exists(meeting_id)
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-    if not known:
-        raise click.ClickException(f"Unbekannte meeting_id: {meeting_id}")
-    return meeting_id
+def get_service():
+    return Service(get_store())
+
+
+def get_service_with_cache():
+    return Service(get_store(), EngineCache())
 
 
 def selection_options(command):
@@ -181,67 +170,31 @@ def setup(model, backend, device, events):
         raise click.ClickException("Whisper-Download fehlgeschlagen.")
 
 
-def hardware_report(hardware):
-    rows = []
-    for kind in CATALOG["hardware_order"]:
-        found = [r for r in hardware.rows if r["id"] == kind]
-        rows.append({
-            "id": kind, "label": Catalog.label(kind), "present": bool(found), "name": found[0]["name"] if found else None,
-            "type": found[0]["type"] if found else None, "devices": [r["device"] for r in found],
-            "backends": sorted({b for r in found for b in r["backends"]}), "reason": None if found else CATALOG["hardware"][kind]["absent"],
-        })
-    return rows
-
-
-def backend_report():
-    return [{"id": b, "label": Catalog.backend_label(b), "installed": Catalog.installed(b), "reason": None if Catalog.installed(b) else Catalog.missing_reason(b)} for b in CATALOG["backend_order"]]
-
-
 @main.command(help="Audio-Eingaenge und erkannte Hardware (NPU, GPU, iGPU, CPU) auflisten.")
 @JSON_FLAG
 def devices(as_json):
     want_json(as_json)
-    from meetscribe import pipeline
-    inputs, error = [], None
-    try:
-        picker = pipeline.AudioDevices.sounddevice_picker()
-        inputs = [
-            {"index": d["index"], "name": d["name"], "api": picker.hostapis[d["hostapi"]], "channels": d["max_input_channels"], "rate": int(d["default_samplerate"])}
-            for d in picker.inputs()
-        ]
-    except Exception as exc:
-        error = f"Audio-Eingaenge nicht lesbar: {pipeline.Reason.of(exc)}"
-    hardware = Hardware()
-    openvino = pipeline.AudioDevices.openvino_devices()
+    report = get_service().devices()
     if out().machine:
-        return out().dump({
-            "inputs": inputs, "inputs_error": error, "openvino": openvino,
-            "hardware": hardware.rows, "kinds": hardware_report(hardware), "backends": backend_report(),
-        })
-    if error:
-        click.echo(error, err=True)
+        return out().dump(report)
+    if report["inputs_error"]:
+        click.echo(report["inputs_error"], err=True)
     else:
-        Table(["index", "name", "api", "kanaele", "rate"], [[d["index"], d["name"], d["api"], d["channels"], d["rate"]] for d in inputs]).echo()
+        Table(["index", "name", "api", "kanaele", "rate"], [[d["index"], d["name"], d["api"], d["channels"], d["rate"]] for d in report["inputs"]]).echo()
     click.echo()
-    Table(["hardware", "geraet", "name", "typ", "backends"], [[Catalog.label(r["id"]), r["device"], r["name"], r["type"], ", ".join(r["backends"]) or "-"] for r in hardware.rows]).echo()
+    Table(["hardware", "geraet", "name", "typ", "backends"], [[Catalog.label(r["id"]), r["device"], r["name"], r["type"], ", ".join(r["backends"]) or "-"] for r in report["hardware"]]).echo()
     click.echo()
-    Table(["backend", "installiert", "hinweis"], [[b["label"], "ja" if b["installed"] else "nein", b["reason"]] for b in backend_report()]).echo()
+    Table(["backend", "installiert", "hinweis"], [[b["label"], "ja" if b["installed"] else "nein", b["reason"]] for b in report["backends"]]).echo()
 
 
 @main.command(name="models", help="Modelle aus dem Katalog mit Installationsstand, Groesse und Eignung je Hardware.")
 @JSON_FLAG
 def models_command(as_json):
     want_json(as_json)
-    from meetscribe import pipeline
-    hardware = Hardware()
-    selection = Selection(pipeline.Models(), hardware)
-    rows = selection.listing()
+    report = get_service().models()
     if out().machine:
-        return out().dump({
-            "default_model": CATALOG["default_model"], "backends": backend_report(), "hardware": hardware_report(hardware),
-            "models": rows, "choices": selection.matrix(),
-        })
-    kinds = CATALOG["hardware_order"]
+        return out().dump(report)
+    rows, kinds = report["models"], CATALOG["hardware_order"]
     Table(
         ["modell", "backend", "variante", "groesse", "installiert", *[Catalog.label(k) for k in kinds]],
         [[r["model"], r["backend"], r["variant"], f"{r['size_mb']} MB", "ja" if r["installed"] else "nein", *[STATUS_WORDS[r["hardware"][k]["status"]] for k in kinds]] for r in rows],
@@ -251,8 +204,7 @@ def models_command(as_json):
 
 @main.command(name="check", help="Voraussetzungen pruefen (ffmpeg, Modelle, HF_TOKEN).")
 def check_setup():
-    from meetscribe import pipeline
-    rows = pipeline.SetupCheck().run()
+    rows = get_service().check()
     if out().machine:
         return out().dump(rows)
     Table(["pruefung", "ok", "loesung"], [[r["label"], "ja" if r["ok"] else "NEIN", r["fix"]] for r in rows]).echo()
@@ -332,8 +284,8 @@ def transcribe(audio, backend, device, model, language, title, day, meeting_id, 
 def start(audio, title, mic, backend, device, model, no_fallback, speakers, no_diarize, no_open, events, stdin_stop):
     from meetscribe import pipeline
     reporter = pipeline.EventReporter() if events else None
-    flow = pipeline.StartFlow(
-        get_store(), audio=audio, mic=mic, device=device, backend=backend, model=model, fallback=not no_fallback, title=title, speakers=speakers,
+    flow = get_service().flow(
+        audio=audio, mic=mic, device=device, backend=backend, model=model, fallback=not no_fallback, title=title, speakers=speakers,
         diarize=not no_diarize, open_report=not no_open, tty=stdin_is_tty(), reporter=reporter, stdin_stop=stdin_stop,
     )
     with contextlib.redirect_stdout(sys.stderr) if events else contextlib.nullcontext(), pipeline.KeepAwake():
@@ -344,7 +296,7 @@ def start(audio, title, mic, backend, device, model, no_fallback, speakers, no_d
 @click.option("--older-than-days", type=float, default=0, show_default=True)
 @click.option("--force", is_flag=True, help="Auch unvollstaendige Dateien rotieren.")
 def rotate(older_than_days, force):
-    result = get_store().rotate(older_than_days=older_than_days, force=force)
+    result = get_service().rotate(older_than_days=older_than_days, force=force)
     click.echo(f"rotiert: {', '.join(result['rotated']) or '-'}")
     for skipped in result["skipped"]:
         click.echo(f"uebersprungen: {skipped['meeting_id']} ({skipped['reason']})")
@@ -353,15 +305,7 @@ def rotate(older_than_days, force):
 @main.command(help="Unvollstaendige Besprechung verwerfen (Rest einer abgebrochenen Verarbeitung).")
 @click.argument("meeting_id")
 def discard(meeting_id):
-    store = get_store()
-    meeting_id = require_meeting(store, meeting_id)
-    if meeting_id not in store.incomplete():
-        raise click.ClickException(f"{meeting_id} ist vollstaendig und wird nicht verworfen.")
-    try:
-        store.discard(meeting_id)
-    except OSError as exc:
-        raise click.ClickException(f"{meeting_id} konnte nicht verworfen werden: {exc}") from exc
-    click.echo(f"{meeting_id} verworfen")
+    click.echo(f"{get_service().discard(meeting_id)['meeting_id']} verworfen")
 
 
 @main.command(help="Teilstring-Suche (ohne Gross-/Kleinschreibung) in den Segmenten.")
@@ -370,19 +314,19 @@ def discard(meeting_id):
 @click.option("--speaker", default=None)
 @click.option("--limit", type=int, default=20, show_default=True)
 def search(term, meeting, speaker, limit):
-    rows = Query(get_store()).search(term, meeting_id=meeting, speaker=speaker, limit=limit)
+    rows = get_service().search(term, meeting=meeting, speaker=speaker, limit=limit)
     out().records(rows, ["meeting_id", "seg_id", "start_s", "display_name", "text"])
 
 
 @main.command(help="Alle Besprechungen auflisten.")
 def meetings():
-    out().records(Query(get_store()).meetings(), ["meeting_id", "title", "meeting_date", "segments", "speakers", "duration_s", "device", "complete"], formats={"complete": lambda v: "ja" if v else "NEIN"})
+    out().records(get_service().meetings(), ["meeting_id", "title", "meeting_date", "segments", "speakers", "duration_s", "device", "complete"], formats={"complete": lambda v: "ja" if v else "NEIN"})
 
 
 @main.command(help="Redezeit und Woerter je Sprecher.")
 @click.option("--meeting", default=None)
 def stats(meeting):
-    rows = Query(get_store()).speaker_stats(meeting)
+    rows = get_service().stats(meeting)
     out().records(rows, ["meeting_id", "speaker", "labels", "talk_s", "share", "segments", "words"], formats={"share": lambda v: f"{v * 100:.1f} %"})
 
 
@@ -397,18 +341,7 @@ MEETING_OPTION = click.option("--meeting", "meeting_id", default=None, help="Bes
 @speakers_group.command(name="show")
 @MEETING_OPTION
 def speakers_show(meeting_id):
-    store = get_store()
-    meeting_id = require_meeting(store, meeting_id)
-    columns, rows = Query(store).execute(
-        "SELECT speaker AS label, any_value(display_name) AS name, sum(end_s - start_s) AS talk_s, count(*) AS segments "
-        "FROM segments_named WHERE meeting_id = ? GROUP BY speaker ORDER BY speaker",
-        [meeting_id],
-    )
-    out().records([dict(zip(columns, row)) for row in rows])
-
-
-def known_labels(store, meeting_id):
-    return [r[0] for r in Query(store).execute("SELECT DISTINCT speaker FROM segments WHERE meeting_id = ? ORDER BY 1", [meeting_id])[1]]
+    out().records(get_service().speakers_show(meeting_id))
 
 
 @speakers_group.command(name="set")
@@ -416,56 +349,39 @@ def known_labels(store, meeting_id):
 @click.argument("name")
 @MEETING_OPTION
 def speakers_set(label, name, meeting_id):
-    store = get_store()
-    meeting_id = require_meeting(store, meeting_id)
-    labels = known_labels(store, meeting_id)
-    if label not in labels:
-        raise click.ClickException(f"Unbekanntes Label '{label}'. Vorhanden: {', '.join(labels)}")
-    try:
-        store.speakers.set(meeting_id, label, name)
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-    click.echo(f"{meeting_id} {label} = {name.strip()}")
+    done = get_service().speakers_set(label, name, meeting_id)
+    click.echo(f"{done['meeting_id']} {label} = {done['name']}")
 
 
 @speakers_group.command(name="unset")
 @click.argument("label")
 @MEETING_OPTION
 def speakers_unset(label, meeting_id):
-    store = get_store()
-    meeting_id = require_meeting(store, meeting_id)
-    if not store.speakers.unset(meeting_id, label):
-        raise click.ClickException(f"Keine Zuordnung fuer {label} in {meeting_id}.")
-    click.echo(f"{meeting_id} {label} entfernt")
+    click.echo(f"{get_service().speakers_unset(label, meeting_id)['meeting_id']} {label} entfernt")
 
 
 @main.command(help="Markdown-Protokoll erzeugen (Standard: letzte Besprechung).")
 @click.argument("meeting_id", required=False)
 @click.option("--out", "target", type=click.Path(dir_okay=False, path_type=Path), default=None, help="Zieldatei statt Ausgabe.")
 def report(meeting_id, target):
-    store = get_store()
-    meeting_id = require_meeting(store, meeting_id)
-    try:
-        text = Report(Query(store)).render(meeting_id)
-    except MeetingNotFound as exc:
-        raise click.ClickException(str(exc)) from exc
-    if target:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
+    done = get_service().report(meeting_id, target)
     if out().machine:
-        return out().dump({"meeting_id": meeting_id, "path": str(target) if target else None, "markdown": text})
+        return out().dump(done)
     if target:
         click.echo(f"geschrieben: {target}")
     else:
-        click.echo(text, nl=False)
+        click.echo(done["markdown"], nl=False)
 
 
 @main.command(name="sql", help="SQL-Abfrage auf segments, segments_named und speakers.")
 @click.argument("query")
 def sql(query):
-    import duckdb
-    try:
-        columns, rows = Query(get_store()).execute(query)
-    except duckdb.Error as exc:
-        raise click.ClickException(str(exc)) from exc
-    out().table(columns, rows, clip=None)
+    result = get_service().sql(query)
+    out().table(result["columns"], result["rows"], clip=None)
+
+
+@main.command(help="Langlebige Engine für die App: JSON-RPC 2.0 über stdin/stdout, eine Nachricht je Zeile.")
+def serve():
+    RpcServer(get_service_with_cache(), Wire.stdio()).serve()
+    sys.stderr.flush()
+    os._exit(0)

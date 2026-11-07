@@ -498,6 +498,18 @@ class FreshEngines:
     def drop(step, models, language):
         pass
 
+    @staticmethod
+    def hold():
+        pass
+
+    @staticmethod
+    def settle():
+        pass
+
+    @staticmethod
+    def release():
+        pass
+
 
 class ASRRunner:
     def __init__(self, steps, factory, fallback=True, reporter=None, drop=None):
@@ -1283,8 +1295,12 @@ class SetupCheck:
 
 class AudioDevices:
     @staticmethod
-    def sounddevice_picker():
+    def sounddevice_picker(refresh=True):
         import sounddevice as sd
+        if refresh:
+            with suppress(Exception):
+                sd._terminate()
+                sd._initialize()
         return InputPicker([dict(d) for d in sd.query_devices()], [dict(h) for h in sd.query_hostapis()])
 
     @staticmethod

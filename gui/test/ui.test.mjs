@@ -518,3 +518,54 @@ test("ein Lauf ohne Rückfall nennt nur die tatsächliche Wahl", async () => {
   await ui.emit("engine-event", { event: "done", meeting_id: "m", report: "C:\\p.md", audio: AUDIO, segments: 1, speakers: 0, labels: [], ran });
   assert.equal(ui.$("result-ran").textContent, "Verarbeitet mit: NPU · large-v3-turbo · OpenVINO");
 });
+
+const MCP = { program: "C:\\Programme Test\\meetscribe\\.venv\\Scripts\\meetscribe-mcp.exe", args: [], env: {} };
+
+async function openMcp(handlers) {
+  const ui = await boot({ list_models: () => modelsInfo(), mcp_info: () => MCP, ...handlers });
+  document.querySelector('[data-tab="settings"]').click();
+  await flush();
+  return ui;
+}
+
+test("Mit Claude verbinden zeigt Befehl für Claude Code und JSON für Claude Desktop mit den echten Pfaden", async () => {
+  const ui = await openMcp();
+  assert.equal(ui.$("mcp-box").hidden, false);
+  assert.equal(ui.$("mcp-code").textContent, `claude mcp add --scope user meetscribe -- "${MCP.program}"`);
+  assert.deepEqual(JSON.parse(ui.$("mcp-json").textContent), { mcpServers: { meetscribe: { command: MCP.program, args: [] } } });
+  assert.ok(ui.$("mcp-json").textContent.includes("\\\\Scripts\\\\meetscribe-mcp.exe"));
+  assert.equal(ui.called("mcp_info").length, 1);
+  assert.deepEqual(ui.harness.calls.filter((c) => /^(save|write)/.test(c.cmd) && c.cmd !== "save_settings"), []);
+});
+
+test("Archivpfade der App und der Rückfall über uv landen in beiden Angaben", async () => {
+  const spec = { program: "C:\\tools\\uv.exe", args: ["run", "--project", "E:\\mein repo", "meetscribe-mcp"], env: { MEETSCRIBE_DATA: "D:\\Archiv Neu" } };
+  const ui = await openMcp({ mcp_info: () => spec });
+  assert.equal(ui.$("mcp-code").textContent, 'claude mcp add --scope user meetscribe -e "MEETSCRIBE_DATA=D:\\Archiv Neu" -- C:\\tools\\uv.exe run --project "E:\\mein repo" meetscribe-mcp');
+  assert.deepEqual(JSON.parse(ui.$("mcp-json").textContent).mcpServers.meetscribe, { command: spec.program, args: spec.args, env: spec.env });
+});
+
+test("Kopieren legt genau den angezeigten Text in die Zwischenablage und sagt es", async () => {
+  const copied = [];
+  Object.defineProperty(globalThis, "navigator", { value: { clipboard: { writeText: async (value) => copied.push(value) } }, configurable: true });
+  const ui = await openMcp();
+  await ui.click("copy-mcp-code");
+  await ui.click("copy-mcp-json");
+  assert.deepEqual(copied, [ui.$("mcp-code").textContent, ui.$("mcp-json").textContent]);
+  assert.equal(ui.$("mcp-status").textContent, "In die Zwischenablage kopiert.");
+});
+
+test("ohne Zwischenablage wird der Text markiert und das Kopieren ehrlich gemeldet", async () => {
+  Object.defineProperty(globalThis, "navigator", { value: { clipboard: { writeText: async () => Promise.reject(new Error("verweigert")) } }, configurable: true });
+  const ui = await openMcp();
+  await ui.click("copy-mcp-json");
+  assert.ok(ui.$("mcp-status").textContent.startsWith("Kopieren nicht möglich"));
+  assert.equal(dom.window.getSelection().toString(), ui.$("mcp-json").textContent);
+});
+
+test("fehlt die MCP-Schnittstelle, steht der Grund da und die Blöcke bleiben verborgen", async () => {
+  const ui = await openMcp({ mcp_info: () => Promise.reject("Die MCP-Schnittstelle fehlt neben der Engine: C:\\x. Im Projektordner 'uv sync' ausführen.") });
+  assert.equal(ui.$("mcp-box").hidden, true);
+  assert.ok(ui.$("mcp-status").textContent.includes("uv sync"));
+  assert.ok(ui.$("mcp-box").parentElement.textContent.includes("ändert dabei keine Einstellungen von Claude"));
+});

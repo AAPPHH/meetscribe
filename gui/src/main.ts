@@ -30,6 +30,7 @@ type Ran = { backend: string; devices: string[]; model: string; variant: string;
 type ExitInfo = { code: number | null; terminal: boolean; stderr: string; audio?: string | null; log?: string | null };
 type SessionState = { active: boolean; stage: string; elapsed_s?: number; audio?: string | null; input?: string | null; warnings?: string[] };
 type Pending = { audio: string; meeting_id: string | null; title: string | null; device: string; backend?: string | null; model?: string | null; diarize: boolean };
+type McpSpec = { program: string; args: string[]; env: Record<string, string> };
 type Platform = { mobile: boolean; notice: string | null };
 type Check = { id: string; label: string; ok: boolean; fix: string | null; detail?: string | null; scope?: string | null };
 type Meeting = { meeting_id: string; title: string | null; meeting_date: string; segments: number; speakers: number; duration_s: number; complete?: boolean };
@@ -850,6 +851,56 @@ class SettingsView {
   }
 }
 
+class McpView {
+  constructor() {
+    $("copy-mcp-code").addEventListener("click", () => this.copy("mcp-code"));
+    $("copy-mcp-json").addEventListener("click", () => this.copy("mcp-json"));
+  }
+
+  static quote(part: string) {
+    return /[\s"]/.test(part) ? `"${part.replaceAll('"', '\\"')}"` : part;
+  }
+
+  static command(spec: McpSpec) {
+    const env = Object.entries(spec.env).flatMap(([key, value]) => ["-e", McpView.quote(`${key}=${value}`)]);
+    return ["claude", "mcp", "add", "--scope", "user", "meetscribe", ...env, "--", McpView.quote(spec.program), ...spec.args.map(McpView.quote)].join(" ");
+  }
+
+  static json(spec: McpSpec) {
+    const entry = { command: spec.program, args: spec.args, ...(Object.keys(spec.env).length ? { env: spec.env } : {}) };
+    return JSON.stringify({ mcpServers: { meetscribe: entry } }, null, 2);
+  }
+
+  async load() {
+    try {
+      const spec = await call<McpSpec>("mcp_info");
+      $("mcp-code").textContent = McpView.command(spec);
+      $("mcp-json").textContent = McpView.json(spec);
+      $("mcp-box").hidden = false;
+      $("mcp-status").textContent = "";
+    } catch (err) {
+      $("mcp-box").hidden = true;
+      $("mcp-status").textContent = text(err);
+    }
+  }
+
+  async copy(id: string) {
+    const value = $(id).textContent ?? "";
+    const status = $("mcp-status");
+    try {
+      await navigator.clipboard.writeText(value);
+      status.textContent = "In die Zwischenablage kopiert.";
+    } catch {
+      const range = document.createRange();
+      range.selectNodeContents($(id));
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      status.textContent = document.execCommand?.("copy") ? "In die Zwischenablage kopiert." : "Kopieren nicht möglich: Der Text ist markiert, bitte mit Strg+C kopieren.";
+    }
+  }
+}
+
 class ChecksView {
   constructor(private settings: SettingsStore) {
     $("reload-checks").addEventListener("click", () => this.run());
@@ -901,11 +952,12 @@ async function main() {
   let settings: SettingsView;
   const download = new DownloadView(store, catalog, () => settings.reloadCatalog());
   settings = new SettingsView(store, start, checks, catalog, download);
+  const mcp = new McpView();
   new EngineNotice();
   new CloseGuard(modal, start);
   tabs.on("meetings", () => meetings.load());
   tabs.on("search", () => $("search-term").focus());
-  tabs.on("settings", () => settings.activate());
+  tabs.on("settings", () => Promise.all([settings.activate(), mcp.load()]));
   tabs.on("checks", () => checks.run());
   start.summary();
   checks.run();

@@ -82,6 +82,27 @@ fn engine_is_searched_in_project_then_path_then_beside_the_app_then_uv() {
 }
 
 #[test]
+fn the_mcp_command_sits_beside_the_engine_carries_the_archive_variables_and_is_never_guessed() {
+    let direct = EngineSpec::direct(r"C:\build\repo\.venv\Scripts\meetscribe.exe", "Projektordner");
+    let present = present_from(&[r"C:\build\repo\.venv\Scripts\meetscribe-mcp.exe"]);
+    let env = |key: &str| match key {
+        "MEETSCRIBE_DATA" => Some(r"D:\Archiv".to_string()),
+        "MEETSCRIBE_MODELS" => Some("  ".to_string()),
+        _ => None,
+    };
+    let spec = direct.mcp(&present, &env).unwrap();
+    assert_eq!(spec.program, PathBuf::from(r"C:\build\repo\.venv\Scripts\meetscribe-mcp.exe"));
+    assert!(spec.args.is_empty());
+    assert_eq!(spec.env, BTreeMap::from([("MEETSCRIBE_DATA".to_string(), r"D:\Archiv".to_string())]));
+    let err = direct.mcp(&|_: &Path| false, &|_: &str| None).unwrap_err();
+    assert!(err.contains("meetscribe-mcp.exe") && err.contains("uv sync"));
+    let via_uv = EngineSpec { program: PathBuf::from(r"C:\tools\uv.exe"), args: ["run", "--project", r"E:\repo", "meetscribe"].map(String::from).to_vec(), source: "uv".into() };
+    let spec = via_uv.mcp(&|_: &Path| false, &|_: &str| None).unwrap();
+    assert_eq!(spec.program, PathBuf::from(r"C:\tools\uv.exe"));
+    assert_eq!(spec.args, ["run", "--project", r"E:\repo", "meetscribe-mcp"]);
+}
+
+#[test]
 fn missing_engine_message_names_no_developer_folder_and_a_bad_saved_project_is_reported() {
     let none = |_: &Path| false;
     let err = locator(&Settings::default(), &none, r"C:\tools").locate().unwrap_err();

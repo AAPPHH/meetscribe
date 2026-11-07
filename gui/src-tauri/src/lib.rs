@@ -3,6 +3,7 @@ mod engine;
 use engine::{Detached, EngineClient, Notify, Timeouts};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +17,8 @@ const EXE: &str = if cfg!(windows) { ".exe" } else { "" };
 const VENV_BIN: &str = if cfg!(windows) { "Scripts" } else { "bin" };
 const ENGINE_NAME: &str = "meetscribe";
 const UV_NAME: &str = "uv";
+const MCP_NAME: &str = "meetscribe-mcp";
+const MCP_ENV: [&str; 3] = ["MEETSCRIBE_DATA", "MEETSCRIBE_MODELS", "MEETSCRIBE_REPORTS"];
 const MOBILE_NOTICE: &str = "Auf diesem Gerät läuft keine Engine. Aufnehmen, Besprechungen und Suche brauchen die Engine auf einem PC.";
 const ENV_CONFIG: &str = "MEETSCRIBE_GUI_CONFIG";
 const SETTINGS_FILE: &str = "settings.json";
@@ -100,6 +103,28 @@ struct EngineSpec {
 impl EngineSpec {
     fn direct(program: impl Into<PathBuf>, source: &str) -> EngineSpec {
         EngineSpec { program: program.into(), args: vec![], source: source.into() }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct McpSpec {
+    program: PathBuf,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+}
+
+impl EngineSpec {
+    fn mcp(&self, exists: &dyn Fn(&Path) -> bool, env: &dyn Fn(&str) -> Option<String>) -> Result<McpSpec, String> {
+        let env = MCP_ENV.iter().filter_map(|key| env(key).filter(|v| !v.trim().is_empty()).map(|v| (key.to_string(), v))).collect();
+        if self.args.is_empty() {
+            let program = self.program.with_file_name(format!("{MCP_NAME}{EXE}"));
+            if !exists(&program) {
+                return Err(format!("Die MCP-Schnittstelle fehlt neben der Engine: {}. Im Projektordner 'uv sync' ausführen.", program.display()));
+            }
+            return Ok(McpSpec { program, args: vec![], env });
+        }
+        let args = self.args.iter().map(|a| if a == ENGINE_NAME { MCP_NAME.to_string() } else { a.clone() }).collect();
+        Ok(McpSpec { program: self.program.clone(), args, env })
     }
 }
 
@@ -587,6 +612,11 @@ fn engine_info(state: State<'_, AppState>) -> Result<EngineSpec, String> {
 }
 
 #[tauri::command]
+fn mcp_info(state: State<'_, AppState>) -> Result<McpSpec, String> {
+    locate_engine(&state.settings())?.mcp(&|p| p.exists(), &|key| std::env::var(key).ok())
+}
+
+#[tauri::command]
 async fn list_meetings(state: State<'_, AppState>) -> Result<Value, String> {
     ask(&state, "meetings", json!({})).await
 }
@@ -791,6 +821,7 @@ pub fn run() {
             get_settings,
             save_settings,
             engine_info,
+            mcp_info,
             list_meetings,
             search_text,
             get_report,

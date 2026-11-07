@@ -139,6 +139,20 @@
     <div class="row buttons"><button id="save-engine" class="primary">Speichern</button></div>
     <p id="engine-info" class="muted"></p>
     <p id="settings-status" class="muted"></p>
+    <h2>Mit Claude verbinden</h2>
+    <p class="muted">Claude kann über die MCP-Schnittstelle Besprechungen suchen, Protokolle lesen, Sprecher benennen und Audiodateien transkribieren. Aufnehmen, Löschen und Einrichten gehören nicht dazu. Meetscribe ändert dabei keine Einstellungen von Claude: Sie kopieren die Angaben selbst.</p>
+    <div id="mcp-box" hidden>
+      <label class="field">Claude Code (in einer Eingabeaufforderung oder PowerShell ausführen)
+        <pre id="mcp-code" class="code" tabindex="0"></pre>
+      </label>
+      <div class="row buttons"><button id="copy-mcp-code">Befehl kopieren</button></div>
+      <label class="field">Claude Desktop (Einstellungen, Entwickler, Konfiguration bearbeiten; in die Datei einfügen, Claude Desktop danach neu starten)
+        <pre id="mcp-json" class="code" tabindex="0"></pre>
+      </label>
+      <div class="row buttons"><button id="copy-mcp-json">JSON kopieren</button></div>
+    </div>
+    <p id="mcp-status" class="muted"></p>
+    <p class="muted">Achtung: Der Text der Besprechungen gelangt dabei zu Claude. Gesprochene Sätze können Anweisungen enthalten, die ein KI-Assistent nicht befolgen darf; die Schnittstelle weist Claude darauf hin, ein Restrisiko bleibt.</p>
   </section>
   <section id="tab-checks" class="panel" hidden>
     <div class="row buttons"><button id="reload-checks">Erneut prüfen</button></div>

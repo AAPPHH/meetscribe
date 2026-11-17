@@ -129,4 +129,4 @@ cd gui/src-tauri; cargo test
 
 ## License
 
-No license yet.
+GPL-3.0-or-later, see [LICENSE](LICENSE).

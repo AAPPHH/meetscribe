@@ -122,11 +122,23 @@ cd gui/src-tauri; cargo test
 - Not covered by automated tests: real microphone capture, the real pyannote model, the model download against the network and keep-awake behaviour. The tests use stand-ins for these.
 - Models other than large-v3-turbo and small are marked as unverified on the NPU in the catalog.
 - Speaker labels (`SPEAKER_00`, ...) are valid within one meeting only. Each word belongs to one speaker, so overlapping speech is not resolved.
-- Transcription accuracy is not measured in this repository. Check names, terms and numbers before use.
+- Transcription accuracy is not systematically measured; see Measurements. Check names, terms and numbers before use.
 - Recordings, transcripts, reports and speaker names are stored unencrypted. Audio is not deleted automatically. Obtain consent before recording.
 - Transcript text returned through MCP is untrusted input for the client; the server instructions say so.
 - The Rust crate has a mobile entry point, but no mobile build is provided.
 
+## Measurements
+
+A single measurement on one machine (Intel Core Ultra 7 258V), not a benchmark. Input was one 80.3 s synthetic German audio file, model large-v3-turbo. The repository contains no benchmark code.
+
+| Device | Runtime | WER |
+|---|---|---|
+| NPU | 16.1 s | 1.8 % |
+| iGPU | 8.0 s | 1.8 % |
+| CPU | 18.1 s | 1.8 % |
+
 ## License
 
 GPL-3.0-or-later, see [LICENSE](LICENSE).
+
+Copyright (C) 2026 John Francis Hamelmann

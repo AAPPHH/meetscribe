@@ -1,6 +1,7 @@
 [project]
 name = "meetscribe"
 version = "0.1.0"
+license = "GPL-3.0-or-later"
 requires-python = ">=3.12"
 dependencies = [
     "click>=8.5.0",
